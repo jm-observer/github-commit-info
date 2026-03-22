@@ -73,18 +73,6 @@ jobs:
       - name: Display structure of downloaded files
         run: ls -la dist
 
-      - name: Create tarballs (Linux)
-        shell: bash
-        run: |
-          cd dist
-          for f in github-commit-info_*; do
-            if [[ "$f" != *.exe ]]; then
-              tar -czvf "${f}.tar.gz" "$f"
-              rm "$f"
-            fi
-          done
-          ls -la
-
       - name: Create Release
         uses: softprops/action-gh-release@v2
         with:
