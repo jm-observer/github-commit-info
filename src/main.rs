@@ -34,9 +34,9 @@ fn main() {
     )
     .build();
 
-    let _ = std::env::var("GITHUB_TOKEN").expect("请设置 GITHUB_TOKEN 环境变量");
-
     let args = Args::parse();
+
+    let _ = std::env::var("GITHUB_TOKEN").expect("请设置 GITHUB_TOKEN 环境变量");
 
     let start_date = args.start_date.unwrap_or_else(|| {
         let yesterday = chrono::Utc::now() - chrono::Duration::days(1);
