@@ -1,6 +1,6 @@
 [package]
 name = "github_commit_info"
-version = "0.1.0"
+version = "0.1.1"
 edition = "2021"
 
 [dependencies]
@@ -20,3 +20,7 @@ path = "src/main.rs"
 [profile.release]
 strip = true
 lto = true
+
+[features]
+default = []
+prod = ["custom-utils/prod"]
