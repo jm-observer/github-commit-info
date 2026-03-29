@@ -6,6 +6,7 @@ use log::LevelFilter::Info;
 #[command(
     name = "github-commit-info",
     about = "获取GitHub仓库指定时间范围内的commit信息",
+    version,
     long_about = None
 )]
 struct Args {
