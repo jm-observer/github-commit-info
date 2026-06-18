@@ -5,6 +5,13 @@ import { listen } from '@tauri-apps/api/event';
 
 export type AppStatus = 'idle' | 'initializing' | 'recording' | 'processing' | 'error' | 'finished';
 
+/// 客户端兜底超时：某段的优化/翻译停在 running/pending 超过此时长仍无结果，
+/// 就本地判为 failed，避免 orchestrator 卡死时 UI 永久转圈（治本在上游 streaming-speech，
+/// 见其 docs/todo-2026-06-18-optimize-hang-no-trace.md）。取宽松值，不误伤正常 LLM 延迟。
+const STAGE_TIMEOUT_MS = 30_000;
+/// 兜底超时扫描间隔。
+const STAGE_SWEEP_MS = 2_000;
+
 /// Stable ordering for the segment list. Backend assigns a monotonic
 /// `revision` (orchestrator's segment id), so prefer that — it keeps
 /// preloaded history and live segments in chronological order even if
@@ -42,6 +49,12 @@ export const useAppStore = (options: UseAppStoreOptions = {}) => {
   onOptimizedTextRef.current = options.onOptimizedText;
   // 已就绪触发过的 revision，避免重复触发（优化稿可能多次写入）。
   const optimizedFiredRef = useRef<Set<number>>(new Set());
+
+  // 兜底超时用：每个 revision 首次出现的时刻 + 已判超时的阶段集合。
+  // 判超时后钉死 failed，防 orchestrator 因其它子事件重发把该阶段刷回 running。
+  const firstSeenAtRef = useRef<Map<number, number>>(new Map());
+  const optTimedOutRef = useRef<Set<number>>(new Set());
+  const trTimedOutRef = useRef<Set<number>>(new Set());
 
   const mapDbSegment = useCallback((row: Record<string, unknown>): Segment => ({
     id: typeof row.id === 'number' ? row.id : null,
@@ -195,6 +208,15 @@ export const useAppStore = (options: UseAppStoreOptions = {}) => {
       if (next.revision === undefined) return;
       console.debug('[segment_updated]', { revision: next.revision, segmentId: next.segment_id });
 
+      const rev = next.revision;
+      if (!firstSeenAtRef.current.has(rev)) firstSeenAtRef.current.set(rev, Date.now());
+      // 成功 → 清超时标记（迟到结果可恢复）；已判超时 → 钉死 failed，
+      // 防 orchestrator 因其它子事件（translated/secondary）重发把该阶段刷回 running。
+      if (next.optimize_status === 'success') optTimedOutRef.current.delete(rev);
+      else if (optTimedOutRef.current.has(rev)) next.optimize_status = 'failed';
+      if (next.translate_status === 'success') trTimedOutRef.current.delete(rev);
+      else if (trTimedOutRef.current.has(rev)) next.translate_status = 'failed';
+
       // 优化稿就绪 → 触发回调（每 revision 一次，供语音门控）。
       if (next.optimize_status === 'success') {
         const text = (next.text_optimized ?? '').trim();
@@ -228,6 +250,37 @@ export const useAppStore = (options: UseAppStoreOptions = {}) => {
       if (typeof unsubscribeSegmentUpdated === 'function') unsubscribeSegmentUpdated();
     };
   }, [mapDbSegment, mapServerHistory]);
+
+  // 兜底超时扫描：把停在 running/pending 超时仍无结果的阶段判为 failed，
+  // 让卡死的段不再无限转圈（翻译卡死同样会停掉卡片右上的 spinner）。
+  useEffect(() => {
+    const timer = window.setInterval(() => {
+      const now = Date.now();
+      setSegments((prev) => {
+        let mutated = false;
+        const out = prev.map((seg) => {
+          const rev = seg.revision;
+          if (rev === undefined) return seg;
+          const since = firstSeenAtRef.current.get(rev);
+          if (since === undefined || now - since < STAGE_TIMEOUT_MS) return seg;
+          let s = seg;
+          if (seg.optimize_status === 'running' || seg.optimize_status === 'pending') {
+            optTimedOutRef.current.add(rev);
+            s = { ...s, optimize_status: 'failed' };
+            mutated = true;
+          }
+          if (seg.translate_status === 'running' || seg.translate_status === 'pending') {
+            trTimedOutRef.current.add(rev);
+            s = { ...s, translate_status: 'failed' };
+            mutated = true;
+          }
+          return s;
+        });
+        return mutated ? out : prev;
+      });
+    }, STAGE_SWEEP_MS);
+    return () => window.clearInterval(timer);
+  }, []);
 
   return {
     status, setStatus,
