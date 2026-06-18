@@ -61,6 +61,7 @@ windows-sys = { version = "0.59", features = [
     "Win32_UI_WindowsAndMessaging",
     "Win32_UI_Input_KeyboardAndMouse",
     "Win32_System_Diagnostics_Debug",
+    "Win32_System_Threading",
 ] }
 wasapi = "0.23"
 

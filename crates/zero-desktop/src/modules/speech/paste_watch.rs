@@ -31,6 +31,26 @@ pub fn start_paste_watcher() {
     }
 }
 
+/// 把 `text` 作为 Unicode 键盘事件直接「打字」进当前前台窗口的焦点控件（自动粘贴）。
+///
+/// 走 `SendInput` 的 `KEYEVENTF_UNICODE`，等同模拟键盘逐字输入：**不碰剪贴板**，
+/// 因此与自动复制那条「写完整拼接文本进剪贴板供手动 Ctrl+V 兜底」的链路彻底解耦。
+/// 若前台窗口属于本进程（用户正看着 Zero Desktop 自己），则不输入并返回 false，
+/// 把内容留给剪贴板兜底——用户回头点别处的输入框再 Ctrl+V 即可。
+///
+/// 返回是否实际向外部窗口输入了文本。非 Windows 平台恒为 no-op。
+pub fn type_text_to_foreground(text: &str) -> bool {
+    #[cfg(windows)]
+    {
+        win::type_text(text)
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = text;
+        false
+    }
+}
+
 #[cfg(windows)]
 mod win {
     use super::PASTE_SIGNAL;
@@ -61,6 +81,68 @@ mod win {
         }
         // 始终放行，绝不吞 Ctrl+V。
         CallNextHookEx(ptr::null_mut(), code, wparam, lparam)
+    }
+
+    use windows_sys::Win32::System::Threading::GetCurrentProcessId;
+    use windows_sys::Win32::UI::Input::KeyboardAndMouse::{
+        SendInput, INPUT, INPUT_0, INPUT_KEYBOARD, KEYBDINPUT, KEYEVENTF_KEYUP, KEYEVENTF_UNICODE,
+    };
+    use windows_sys::Win32::UI::WindowsAndMessaging::{
+        GetForegroundWindow, GetWindowThreadProcessId,
+    };
+
+    /// 构造一个「Unicode 码元」键盘事件（按下或抬起）。`wVk=0` + `KEYEVENTF_UNICODE`
+    /// 表示这是字符注入而非虚拟键，`wScan` 携带 UTF-16 码元。
+    fn unicode_input(unit: u16, key_up: bool) -> INPUT {
+        let mut flags = KEYEVENTF_UNICODE;
+        if key_up {
+            flags |= KEYEVENTF_KEYUP;
+        }
+        INPUT {
+            r#type: INPUT_KEYBOARD,
+            Anonymous: INPUT_0 {
+                ki: KEYBDINPUT {
+                    wVk: 0,
+                    wScan: unit,
+                    dwFlags: flags,
+                    time: 0,
+                    dwExtraInfo: 0,
+                },
+            },
+        }
+    }
+
+    pub fn type_text(text: &str) -> bool {
+        if text.is_empty() {
+            return false;
+        }
+        unsafe {
+            let fg = GetForegroundWindow();
+            if fg.is_null() {
+                return false;
+            }
+            // 前台是本应用自己的窗口时不自动输入，避免打进自己的界面。
+            let mut pid: u32 = 0;
+            GetWindowThreadProcessId(fg, &mut pid);
+            if pid == GetCurrentProcessId() {
+                return false;
+            }
+            // 每个 UTF-16 码元发「按下 + 抬起」两个事件；代理对（emoji 等）按序发亦可。
+            let mut inputs: Vec<INPUT> = Vec::with_capacity(text.len() * 2);
+            for unit in text.encode_utf16() {
+                inputs.push(unicode_input(unit, false));
+                inputs.push(unicode_input(unit, true));
+            }
+            if inputs.is_empty() {
+                return false;
+            }
+            let sent = SendInput(
+                inputs.len() as u32,
+                inputs.as_ptr(),
+                std::mem::size_of::<INPUT>() as i32,
+            );
+            sent as usize == inputs.len()
+        }
     }
 
     pub fn start() {

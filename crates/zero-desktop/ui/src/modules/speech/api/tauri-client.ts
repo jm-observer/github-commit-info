@@ -43,6 +43,7 @@ export interface AppSettings {
   remote_url_presets: string[];
   want_secondary: boolean;
   notify_sound: boolean;
+  auto_paste: boolean;
 }
 
 export const DEFAULT_REMOTE_URL = 'ws://192.168.0.68:8090/stream';

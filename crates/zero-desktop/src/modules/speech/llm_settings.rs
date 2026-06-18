@@ -33,6 +33,10 @@ pub struct LlmSettings {
     pub want_secondary: bool,
     #[serde(default = "default_notify_sound")]
     pub notify_sound: bool,
+    /// 识别结果出来后，除写剪贴板外，是否直接「打字」进当前焦点输入框（自动粘贴）。
+    /// 仅在 `auto_copy_mode` 选了具体内容（中文优化/英文翻译）时才有意义。
+    #[serde(default)]
+    pub auto_paste: bool,
 }
 
 impl Default for LlmSettings {
@@ -42,6 +46,7 @@ impl Default for LlmSettings {
             merge_window_ms: DEFAULT_MERGE_WINDOW_MS,
             want_secondary: false,
             notify_sound: true,
+            auto_paste: false,
         }
     }
 }

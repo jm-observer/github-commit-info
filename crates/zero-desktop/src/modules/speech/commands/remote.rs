@@ -40,6 +40,50 @@ struct AutoCopyAccum {
     prefix: String,
 }
 
+/// 自动粘贴（直接打字进焦点框）的极简状态。与自动复制的累加器相互独立：
+/// 复制走「完整拼接文本进剪贴板」供手动 Ctrl+V 兜底，粘贴走「逐段增量直接输入」。
+#[derive(Default)]
+struct AutoPasteState {
+    /// 已自动输入过的段落 id，保证同一段只输入一次（再次优化只更新剪贴板，不重复打字，也不覆盖）。
+    typed_ids: std::collections::HashSet<i64>,
+    /// 上一段自动输入的结束时刻，用于判定续接（决定英文模式是否补分隔空格）。
+    last_t_end: Option<f64>,
+}
+
+/// 把一段识别结果直接打字进当前焦点输入框。同段去重、续接时英文补空格。
+fn auto_paste_segment(
+    ap: &mut AutoPasteState,
+    text: &str,
+    ref_id: i64,
+    t_start: f64,
+    t_end: f64,
+    window: Duration,
+    space_separator: bool,
+) {
+    if text.is_empty() {
+        return;
+    }
+    // 同一段落只输入一次：再次优化不重复打字，也不做（已商定放弃的）覆盖。
+    if !ap.typed_ids.insert(ref_id) {
+        return;
+    }
+    let continues = ap
+        .last_t_end
+        .is_some_and(|prev_end| (t_start - prev_end) < window.as_secs_f64());
+    ap.last_t_end = Some(t_end);
+    let payload = if continues && space_separator {
+        format!(" {text}")
+    } else {
+        text.to_string()
+    };
+    let typed = crate::modules::speech::paste_watch::type_text_to_foreground(&payload);
+    info!(
+        target: "speech",
+        "[remote] auto paste ref={ref_id} typed={typed} chars={}",
+        payload.chars().count()
+    );
+}
+
 fn strip_overlap_prefix(head: &str, tail: &str) -> String {
     const MAX_OVERLAP_CHARS: usize = 200;
     const MIN_OVERLAP_CHARS: usize = 2;
@@ -465,6 +509,7 @@ async fn run_one_connection(
     let mut reader = tokio::spawn(async move {
         let mut segs: HashMap<i64, SegState> = HashMap::new();
         let mut copy_acc: Option<AutoCopyAccum> = None;
+        let mut paste_state = AutoPasteState::default();
         while let Some(Ok(msg)) = rd.next().await {
             let Message::Text(t) = msg else { continue };
             let Ok(v) = serde_json::from_str::<serde_json::Value>(&t) else {
@@ -541,6 +586,26 @@ async fn run_one_connection(
                             }
                         }
                     }
+                    // 自动粘贴（中文优化）：逐段直接打字进焦点框；中文不补分隔空格。
+                    let (do_paste, paste_window_ms) = {
+                        let s = read_lock(&llm_settings_r);
+                        (
+                            s.auto_paste
+                                && matches!(s.auto_copy_mode, AutoCopyMode::OptimizedZh),
+                            s.merge_window_ms,
+                        )
+                    };
+                    if do_paste {
+                        auto_paste_segment(
+                            &mut paste_state,
+                            &text,
+                            id,
+                            st.t0,
+                            st.t1,
+                            Duration::from_millis(paste_window_ms),
+                            false,
+                        );
+                    }
                 }
                 Some("translated") => {
                     let id = v.get("ref").and_then(|x| x.as_i64()).unwrap_or(0);
@@ -587,6 +652,25 @@ async fn run_one_connection(
                                 error!(target: "speech", "[remote] clipboard 英文 failed: {e}")
                             }
                         }
+                    }
+                    // 自动粘贴（英文翻译）：逐段直接打字进焦点框；续接段补一个分隔空格。
+                    let (do_paste, paste_window_ms) = {
+                        let s = read_lock(&llm_settings_r);
+                        (
+                            s.auto_paste && matches!(s.auto_copy_mode, AutoCopyMode::English),
+                            s.merge_window_ms,
+                        )
+                    };
+                    if do_paste {
+                        auto_paste_segment(
+                            &mut paste_state,
+                            &text,
+                            id,
+                            st.t0,
+                            st.t1,
+                            Duration::from_millis(paste_window_ms),
+                            true,
+                        );
                     }
                 }
                 Some("secondary") => {

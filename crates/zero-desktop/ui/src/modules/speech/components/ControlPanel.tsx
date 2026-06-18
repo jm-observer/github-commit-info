@@ -25,6 +25,8 @@ interface ControlPanelProps {
   onAsrLanguageChange: (val: AsrLanguage) => void;
   autoCopyMode: AutoCopyMode;
   onAutoCopyModeChange: (val: AutoCopyMode) => void;
+  autoPaste: boolean;
+  onAutoPasteChange: (val: boolean) => void;
   mergeWindowMs: number;
   onMergeWindowMsChange: (val: number) => void;
   remoteUrl: string;
@@ -74,6 +76,8 @@ export const ControlPanel: React.FC<ControlPanelProps> = ({
   onAsrLanguageChange,
   autoCopyMode,
   onAutoCopyModeChange,
+  autoPaste,
+  onAutoPasteChange,
   mergeWindowMs,
   onMergeWindowMsChange,
   remoteUrl,
@@ -155,6 +159,20 @@ export const ControlPanel: React.FC<ControlPanelProps> = ({
         <p className="mt-1.5 ml-1 text-[11px] leading-relaxed text-[var(--ink-4)]">
           相邻句子间隔在此时间内时，自动复制会拼接为一次粘贴；设为 0 则关闭合并。
         </p>
+      </div>
+
+      <div className="flex items-center justify-between">
+        <div className="flex flex-col">
+          <span className="text-[13px] font-medium text-[var(--ink-2)]">自动粘贴到焦点</span>
+          <span className="text-[11px] text-[var(--ink-4)]">
+            识别完成后逐段直接输入到当前光标处（按上方“自动复制”选中的内容）；焦点不在输入框时不打扰，仍可回头 Ctrl+V
+          </span>
+        </div>
+        <Switch
+          checked={autoPaste}
+          onCheckedChange={onAutoPasteChange}
+          disabled={disabled || autoCopyMode === 'off'}
+        />
       </div>
 
       <RecordCard
