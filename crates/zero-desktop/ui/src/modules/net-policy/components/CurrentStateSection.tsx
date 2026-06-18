@@ -286,11 +286,25 @@ export function CurrentStateSection({
           ) : (
             <ul className="divide-y divide-gray-100 text-sm dark:divide-gray-800">
               {candidates.map((c) => (
-                <li key={c.pid} className="flex items-center gap-2 py-1.5">
-                  <span className="flex-1 truncate" title={c.path}>
+                <li key={c.pid} className="flex flex-col gap-1 py-1.5">
+                  <span className="truncate" title={c.path || c.name}>
                     {c.name || `pid ${c.pid}`}{' '}
-                    <span className="text-xs text-gray-400">({c.remotes.length} 连接)</span>
+                    <span className="text-xs text-gray-400">
+                      pid {c.pid} · {c.remotes.length} 个远端
+                    </span>
                   </span>
+                  {c.remotes.length > 0 && (
+                    <div className="flex flex-wrap gap-1 pl-1">
+                      {c.remotes.map((r) => (
+                        <span
+                          key={r}
+                          className="rounded bg-gray-100 px-1.5 py-0.5 font-mono text-[11px] text-gray-600 dark:bg-gray-800 dark:text-gray-300"
+                        >
+                          {r}
+                        </span>
+                      ))}
+                    </div>
+                  )}
                 </li>
               ))}
             </ul>

@@ -31,7 +31,9 @@ $rows = Get-NetTCPConnection -State Established -ErrorAction SilentlyContinue |
     [pscustomobject]@{
       pid     = $procId
       name    = if($p){ $p.ProcessName + '.exe' } else { '' }
-      path    = if($p){ try { $p.Path } catch { '' } } else { '' }
+      # 受保护进程取不到 Path 时为 $null；强制成 '' 避免 JSON 出现 null（Rust 侧 path 是非 Option String，
+      # null 会反序列化失败 → 整批 scan 报错）。
+      path    = if($p){ try { [string]$p.Path } catch { '' } } else { '' }
       remotes = @($_.Group | ForEach-Object { $_.RemoteAddress } | Select-Object -Unique -First 5)
     }
   }

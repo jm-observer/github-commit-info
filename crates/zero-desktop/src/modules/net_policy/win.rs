@@ -1,7 +1,10 @@
 //! Windows PowerShell 调用助手。
 //!
-//! 通过 stdin 把脚本喂给 `powershell -Command -`，避开 SSH→cmd→PS 多层转义坑
-//! （验证阶段的血泪教训，见 docs/net-policy-validation-report.md §0.2.1）。
+//! 通过 `-EncodedCommand`（base64 of UTF-16LE）把脚本整体传给 powershell，避开两类坑：
+//! ① SSH→cmd→PS 多层转义（验证阶段的血泪教训，见 docs/net-policy-validation-report.md §0.2.1）；
+//! ② 早期用 `-Command -` 经重定向 stdin 读**多行脚本块**时被增量解析吞掉输出——实测
+//!    `... | ForEach-Object { 多行 }` 整块零输出，导致进程枚举永远空（"未发现近期有公网连接的进程"）。
+//! `-EncodedCommand` 把同一段脚本一次性交给解析器，多行块不再被拆。
 //! 脚本顶部强制 UTF-8 输出编码，stdout 以 UTF-8 读回。
 
 use anyhow::{bail, Context, Result};
@@ -14,12 +17,18 @@ const FIREWALL_POLICY_KEY: &str =
 /// 非 Windows 平台返回错误（net-policy 仅承诺 Windows，见设计 §14.0）。
 #[cfg(windows)]
 pub fn run_ps(script: &str) -> Result<String> {
-    use std::io::Write;
+    use base64::Engine;
     use std::process::{Command, Stdio};
 
     let wrapped = format!(
         "[Console]::OutputEncoding=[Text.Encoding]::UTF8\n$ErrorActionPreference='Stop'\n{script}"
     );
+    // -EncodedCommand 要 base64(UTF-16LE)。一次性交给解析器，多行脚本块不再被 stdin 增量解析吞掉。
+    let utf16: Vec<u8> = wrapped
+        .encode_utf16()
+        .flat_map(|u| u.to_le_bytes())
+        .collect();
+    let encoded = base64::engine::general_purpose::STANDARD.encode(utf16);
 
     let mut cmd = Command::new("powershell");
     cmd.args([
@@ -27,23 +36,14 @@ pub fn run_ps(script: &str) -> Result<String> {
         "-NonInteractive",
         "-ExecutionPolicy",
         "Bypass",
-        "-Command",
-        "-",
+        "-EncodedCommand",
+        &encoded,
     ])
-    .stdin(Stdio::piped())
+    .stdin(Stdio::null())
     .stdout(Stdio::piped())
     .stderr(Stdio::piped());
     crate::shared::proc::hide_console(&mut cmd); // 不弹控制台窗口
-    let mut child = cmd.spawn().context("spawn powershell")?;
-
-    child
-        .stdin
-        .take()
-        .context("powershell stdin")?
-        .write_all(wrapped.as_bytes())
-        .context("write powershell script")?;
-
-    let out = child.wait_with_output().context("wait powershell")?;
+    let out = cmd.output().context("run powershell")?;
     if !out.status.success() {
         let stderr = String::from_utf8_lossy(&out.stderr);
         bail!("powershell failed ({}): {}", out.status, stderr.trim());
