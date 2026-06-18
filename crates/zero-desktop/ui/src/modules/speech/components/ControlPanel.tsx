@@ -27,6 +27,8 @@ interface ControlPanelProps {
   onAutoCopyModeChange: (val: AutoCopyMode) => void;
   autoPaste: boolean;
   onAutoPasteChange: (val: boolean) => void;
+  autoStart: boolean;
+  onAutoStartChange: (val: boolean) => void;
   mergeWindowMs: number;
   onMergeWindowMsChange: (val: number) => void;
   remoteUrl: string;
@@ -78,6 +80,8 @@ export const ControlPanel: React.FC<ControlPanelProps> = ({
   onAutoCopyModeChange,
   autoPaste,
   onAutoPasteChange,
+  autoStart,
+  onAutoStartChange,
   mergeWindowMs,
   onMergeWindowMsChange,
   remoteUrl,
@@ -185,6 +189,13 @@ export const ControlPanel: React.FC<ControlPanelProps> = ({
       />
 
       <div className="flex flex-col gap-4 mt-1">
+        <div className="flex items-center justify-between">
+          <div className="flex flex-col">
+            <span className="text-[13px] font-medium text-[var(--ink-2)]">启动时自动识别</span>
+            <span className="text-[11px] text-[var(--ink-4)]">打开本页/程序启动且设备就绪后，自动开始录音识别，无需手动点开始</span>
+          </div>
+          <Switch checked={autoStart} onCheckedChange={onAutoStartChange} disabled={disabled} />
+        </div>
         <div className="flex items-center justify-between">
           <div className="flex flex-col">
             <span className="text-[13px] font-medium text-[var(--ink-2)]">显示英文翻译</span>

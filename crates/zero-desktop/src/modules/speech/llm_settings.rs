@@ -37,6 +37,9 @@ pub struct LlmSettings {
     /// 仅在 `auto_copy_mode` 选了具体内容（中文优化/英文翻译）时才有意义。
     #[serde(default)]
     pub auto_paste: bool,
+    /// 程序启动（语音页就绪）时是否自动开始识别录音。
+    #[serde(default)]
+    pub auto_start: bool,
 }
 
 impl Default for LlmSettings {
@@ -47,6 +50,7 @@ impl Default for LlmSettings {
             want_secondary: false,
             notify_sound: true,
             auto_paste: false,
+            auto_start: false,
         }
     }
 }

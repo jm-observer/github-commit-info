@@ -39,6 +39,8 @@ pub(crate) struct CombinedSettings {
     pub(crate) notify_sound: bool,
     #[serde(default)]
     pub(crate) auto_paste: bool,
+    #[serde(default)]
+    pub(crate) auto_start: bool,
 }
 
 fn default_notify_sound_dto() -> bool {
@@ -60,6 +62,7 @@ pub(crate) fn get_settings_from_state(state: &SpeechState) -> Result<CombinedSet
         want_secondary: llm.want_secondary,
         notify_sound: llm.notify_sound,
         auto_paste: llm.auto_paste,
+        auto_start: llm.auto_start,
     })
 }
 
@@ -113,6 +116,7 @@ pub(crate) async fn apply_settings_to_state(
         want_secondary: new_settings.want_secondary,
         notify_sound: new_settings.notify_sound,
         auto_paste: new_settings.auto_paste,
+        auto_start: new_settings.auto_start,
     };
     let new_url = new_settings.remote_url.trim().to_string();
 
@@ -181,6 +185,16 @@ pub(crate) async fn apply_settings_to_state(
     )
     .await
     .map_err(|e| e.to_string())?;
+    db.upsert_setting(
+        "ui.auto_start".to_string(),
+        if new_llm.auto_start {
+            "1".into()
+        } else {
+            "0".into()
+        },
+    )
+    .await
+    .map_err(|e| e.to_string())?;
     db.upsert_setting("remote.url".to_string(), new_url)
         .await
         .map_err(|e| e.to_string())?;
@@ -223,6 +237,9 @@ pub(crate) async fn load_llm_settings_from_db(db: &db::SpeechDatabase) -> LlmSet
     }
     if let Ok(Some(v)) = db.get_setting("llm.auto_paste".to_string()).await {
         s.auto_paste = matches!(v.as_str(), "1" | "on" | "true");
+    }
+    if let Ok(Some(v)) = db.get_setting("ui.auto_start".to_string()).await {
+        s.auto_start = matches!(v.as_str(), "1" | "on" | "true");
     }
     s
 }

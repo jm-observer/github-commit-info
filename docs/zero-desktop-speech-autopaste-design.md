@@ -230,3 +230,18 @@ struct AutoPasteState {
 - **快捷键 / 热字串触发**:目前为「识别即贴」,未来可加「按下某键才把缓冲贴出」的半自动模式。
 - **目标可编辑性探测**:当前仅判断「前台是否本进程」,无法识别前台窗口里焦点控件是否可编辑;
   靠用户自行在需要时开启开关来规避。
+
+---
+
+## 8. 附:启动时自动识别开关
+
+与自动粘贴一同加入的一个独立小开关,**与自动粘贴无耦合**,只是共用同一条设置链路。
+
+- **行为**:打开后,语音页就绪(`getSettings` 加载完 + `store.isInitialized` + 设备列表非空)
+  且当前未在录音时,**自动调用 `startRecording`**,省去手动点「开始」。靠 `autoStartFiredRef`
+  保证一次会话只触发一次;若进程已在录音则跳过。
+- **配置**:`LlmSettings.auto_start`(默认 `false`)→ SQLite key `ui.auto_start`;DTO /
+  get / apply / load 与既有字段对齐。
+- **UI**:`ControlPanel` 底部开关组「启动时自动识别」,不随「自动复制」联动禁用。
+- **受影响文件**:后端 `llm_settings.rs` / `settings.rs`;前端 `tauri-client.ts`(`AppSettings.auto_start`)、
+  `ControlPanel.tsx`(开关)、`SpeechPage.tsx`(状态 / 加载 / `handleAutoStartChange` / 自动启动 effect)。

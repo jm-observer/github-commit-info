@@ -78,6 +78,9 @@ export default function SpeechPage() {
   const [wantSecondary, setWantSecondary] = useState(false);
   const [notifySound, setNotifySound] = useState(true);
   const [autoPaste, setAutoPaste] = useState(false);
+  const [autoStart, setAutoStart] = useState(false);
+  const [settingsLoaded, setSettingsLoaded] = useState(false);
+  const autoStartFiredRef = useRef(false);
 
   // Load persisted settings from the local DB on mount.
   useEffect(() => {
@@ -91,8 +94,10 @@ export default function SpeechPage() {
         setWantSecondary(!!s.want_secondary);
         setNotifySound(s.notify_sound !== false);
         setAutoPaste(!!s.auto_paste);
+        setAutoStart(!!s.auto_start);
       })
-      .catch((err) => console.warn('Load settings failed', err));
+      .catch((err) => console.warn('Load settings failed', err))
+      .finally(() => setSettingsLoaded(true));
   }, []);
 
   const showTranslationNotification = useCallback(async (segment: Segment) => {
@@ -266,6 +271,25 @@ export default function SpeechPage() {
     }
   };
 
+  // 启动时自动开始识别：设置加载完 + 设备就绪 + 开关打开 + 未在录音时触发，仅一次。
+  useEffect(() => {
+    if (autoStartFiredRef.current) return;
+    if (!settingsLoaded || !store.isInitialized || !autoStart) return;
+    if (store.devices.length === 0) return;
+    autoStartFiredRef.current = true;
+    (async () => {
+      try {
+        const st = await SpeechAPI.getRecordingState();
+        if (st.recording) return;
+        await startRecording();
+      } catch (err) {
+        console.error('auto start recording failed', err);
+      }
+    })();
+    // startRecording 为每次渲染重建的普通函数，靠 autoStartFiredRef 保证只触发一次。
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [settingsLoaded, store.isInitialized, autoStart, store.devices.length]);
+
   const retryRecording = () => {
     store.setErrorMessage('');
     store.setStatus('idle');
@@ -341,6 +365,7 @@ export default function SpeechPage() {
       want_secondary: wantSecondary,
       notify_sound: notifySound,
       auto_paste: autoPaste,
+      auto_start: autoStart,
     };
     persistAndMaybeReconnect(next, true);
   };
@@ -363,6 +388,7 @@ export default function SpeechPage() {
       want_secondary: wantSecondary,
       notify_sound: notifySound,
       auto_paste: autoPaste,
+      auto_start: autoStart,
     };
     persistAndMaybeReconnect(next, urlChanged);
   };
@@ -379,6 +405,7 @@ export default function SpeechPage() {
       want_secondary: wantSecondary,
       notify_sound: val,
       auto_paste: autoPaste,
+      auto_start: autoStart,
     };
     SpeechAPI.applySettings(next).catch((err) =>
       console.error('apply notify_sound failed', err)
@@ -397,9 +424,29 @@ export default function SpeechPage() {
       want_secondary: wantSecondary,
       notify_sound: notifySound,
       auto_paste: val,
+      auto_start: autoStart,
     };
     SpeechAPI.applySettings(next).catch((err) =>
       console.error('apply auto_paste failed', err)
+    );
+  };
+
+  const handleAutoStartChange = (val: boolean) => {
+    if (val === autoStart) return;
+    setAutoStart(val);
+    const next: AppSettings = {
+      asr_language: asrLanguage,
+      auto_copy_mode: autoCopyMode,
+      merge_window_ms: mergeWindowMs,
+      remote_url: remoteUrl,
+      remote_url_presets: remoteUrlPresets,
+      want_secondary: wantSecondary,
+      notify_sound: notifySound,
+      auto_paste: autoPaste,
+      auto_start: val,
+    };
+    SpeechAPI.applySettings(next).catch((err) =>
+      console.error('apply auto_start failed', err)
     );
   };
 
@@ -415,6 +462,7 @@ export default function SpeechPage() {
       want_secondary: val,
       notify_sound: notifySound,
       auto_paste: autoPaste,
+      auto_start: autoStart,
     };
     persistAndMaybeReconnect(next, true);
   };
@@ -434,6 +482,7 @@ export default function SpeechPage() {
       want_secondary: wantSecondary,
       notify_sound: notifySound,
       auto_paste: autoPaste,
+      auto_start: autoStart,
     };
     persistAndMaybeReconnect(next, urlChanged);
   };
@@ -505,6 +554,7 @@ export default function SpeechPage() {
               want_secondary: wantSecondary,
               notify_sound: notifySound,
               auto_paste: autoPaste,
+              auto_start: autoStart,
             };
             SpeechAPI.applySettings(next).catch((err) => console.error('apply asr_language failed', err));
           }}
@@ -520,11 +570,14 @@ export default function SpeechPage() {
               want_secondary: wantSecondary,
               notify_sound: notifySound,
               auto_paste: autoPaste,
+              auto_start: autoStart,
             };
             SpeechAPI.applySettings(next).catch((err) => console.error('apply auto_copy_mode failed', err));
           }}
           autoPaste={autoPaste}
           onAutoPasteChange={handleAutoPasteChange}
+          autoStart={autoStart}
+          onAutoStartChange={handleAutoStartChange}
           mergeWindowMs={mergeWindowMs}
           onMergeWindowMsChange={(v) => {
             setMergeWindowMs(v);
@@ -537,6 +590,7 @@ export default function SpeechPage() {
               want_secondary: wantSecondary,
               notify_sound: notifySound,
               auto_paste: autoPaste,
+              auto_start: autoStart,
             };
             SpeechAPI.applySettings(next).catch((err) => console.error('apply merge_window_ms failed', err));
           }}
