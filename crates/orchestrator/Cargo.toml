@@ -1,0 +1,37 @@
+[package]
+name = "orchestrator"
+version.workspace = true
+edition.workspace = true
+
+# StreamSpeech 编排层：对桌面客户端的 WebSocket(/stream)+ 串内部 ASR(127.0.0.1:9100)
+# + vLLM(127.0.0.1:8085)。纯业务胶水,不做推理。原 streaming-speech 仓 server/orchestrator,
+# 2026-06 迁入 toolkit,改走 deploy-g10 部署面板(systemd 二进制 + 自更新),不再 Docker。
+
+[dependencies]
+tokio = { workspace = true, features = ["rt", "rt-multi-thread", "macros", "signal", "net", "time"] }
+# axum 显式 0.7:本 crate 是独立 binary,与 workspace 的 axum 0.8 互不影响(WS Message
+# 类型在 0.8 有破坏性变更,迁移期保持 0.7 降低风险)。
+axum = { version = "0.7", features = ["ws"] }
+tokio-tungstenite = "0.24"
+futures-util = "0.3"
+serde = { workspace = true }
+serde_json = { workspace = true }
+chrono = { workspace = true }
+reqwest = { workspace = true }
+anyhow = { workspace = true }
+clap = { workspace = true, features = ["env"] }
+log = { workspace = true }
+tracing = "0.1"
+tracing-subscriber = "0.3"
+# 与 toolkit 全员对齐:rusqlite 走 workspace(0.31)。原仓用 0.38 是为与 src-tauri 的
+# deadpool-sqlite 对齐,迁出后该约束消失。
+rusqlite = { workspace = true, features = ["bundled"] }
+custom-utils = { workspace = true, features = ["updater", "trace"] }
+
+[[bin]]
+name = "orchestrator"
+path = "src/main.rs"
+
+[features]
+default = []
+prod = ["custom-utils/prod"]

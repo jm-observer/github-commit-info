@@ -20,8 +20,9 @@
     跳过交叉编译，直接复制已有产物（调试部署用）。
 
 .PARAMETER Service
-    部署后要重启的 systemd 用户服务名，默认 toolkit-server（$Bins 里唯一的 daemon；
-    其余是 CLI 工具，无需重启）。
+    部署后要 install + 重启的 systemd 用户服务名,默认 toolkit-server。daemon 见 $DaemonBins
+    (toolkit-server / orchestrator);二进制名即服务名。其余 $Bins 是 CLI 工具,无需重启。
+    部署面板按各服务分别调用本脚本(每次一个 -Service)。
 
 .PARAMETER SkipRestart
     跳过部署后重启（仅换二进制，下次服务自然重启时生效）。
@@ -32,8 +33,8 @@
     G10 部署面板会把该服务 registry 主端口拼成 `0.0.0.0:<port>` 传进来。
 
 .PARAMETER Workspace
-    toolkit-server 的 workspace 根目录（远端路径），默认 ~/.config/toolkit-server
-    （与 install 默认一致）。install 时显式传给 `--workspace`。
+    daemon 的 workspace 根目录（远端路径）。留空则按服务名取 `~/.config/<Service>`
+    （与各 daemon install 默认一致）。install 时显式传给 `--workspace`。
 
 .PARAMETER Env
     额外注入 systemd unit 的环境变量，`KEY=VAL` 数组（逗号分隔）。install 时逐条转发为
@@ -47,13 +48,15 @@
     pwsh ./deploy-g10.ps1 -SkipRestart
     pwsh ./deploy-g10.ps1 -Bind 0.0.0.0:8790
     pwsh ./deploy-g10.ps1 -Env TTS_BASE_URL=http://127.0.0.1:8095,LLM_MODEL=qwen
+    pwsh ./deploy-g10.ps1 -Service orchestrator -Bind 0.0.0.0:8090
 #>
 param(
     [string]$G10Host = "fengqi@192.168.0.68",
     [string]$DestDir = "~/.local/bin",
     [string]$Service = "toolkit-server",
     [string]$Bind = "0.0.0.0:8788",
-    [string]$Workspace = "~/.config/toolkit-server",
+    # 远端 workspace 根目录;留空则按服务名取 `~/.config/<Service>`(与各 daemon install 默认一致)。
+    [string]$Workspace = "",
     [string[]]$Env = @(),
     [switch]$SkipBuild,
     [switch]$SkipRestart
@@ -69,8 +72,13 @@ $Bins = @(
     @{ Crate = "github_commit_info"; Bin = "github-commit-info" },
     @{ Crate = "hf_watcher";         Bin = "hf-watcher" },
     @{ Crate = "douyin";             Bin = "douyin" },
-    @{ Crate = "toolkit-server";     Bin = "toolkit-server" }
+    @{ Crate = "toolkit-server";     Bin = "toolkit-server" },
+    @{ Crate = "orchestrator";       Bin = "orchestrator" }
 )
+
+# 哪些 $Bins 是 daemon（有 `install`/systemd unit、需重装+重启）；其余是 CLI 工具。
+# 二进制名即 unit/服务名。新增 daemon 时在此追加。
+$DaemonBins = @("toolkit-server", "orchestrator")
 
 if (-not $SkipBuild) {
     Write-Host "==> 交叉编译 $Target（Docker: $Image）" -ForegroundColor Cyan
@@ -132,20 +140,24 @@ foreach ($b in $Bins) {
     ssh $G10Host "$DestDir/$($b.Bin) --version"
 }
 
-# 重装 toolkit-server unit：把 -Bind 写进 unit 的 Environment=TOOLKIT_BIND=<Bind>，
-# 使新端口生效（install 幂等：重写 unit + daemon-reload）。仅 toolkit-server 是 daemon
-# 且支持该 install，其余 $Bins 是 CLI 工具，无 unit、跳过。
-if ($Service -eq "toolkit-server") {
-    Write-Host "==> 重装 toolkit-server unit（TOOLKIT_BIND=$Bind, workspace=$Workspace）" -ForegroundColor Cyan
+# 重装 daemon unit：把 -Bind 写进 unit 的 Environment=<BIN>_BIND=<Bind>（各 daemon 的
+# install 子命令各自决定 env 名），使新端口生效（install 幂等：重写 unit + daemon-reload）。
+# 仅 $DaemonBins 里的服务支持 install,其余 $Bins 是 CLI 工具、无 unit、跳过。
+# toolkit-server 与 orchestrator 的 install CLI 一致(`install --workspace --bind --env`),
+# 故此处按 $Service 通用处理,二进制名即服务名。
+if ($DaemonBins -contains $Service) {
+    # workspace 留空则按服务名取默认,与各 daemon install 的 `~/.config/<Service>` 一致。
+    $ws = if ($Workspace) { $Workspace } else { "~/.config/$Service" }
+    Write-Host "==> 重装 $Service unit（bind=$Bind, workspace=$ws）" -ForegroundColor Cyan
     # 把每条 KEY=VAL 拼成 `--env 'KEY=VAL'`（单引号防远端 shell 二次解析），追加进 install 命令。
     $envArgs = ($Env | Where-Object { $_ -and $_.Trim() -ne "" } | ForEach-Object { "--env '$($_.Trim())'" }) -join " "
     if ($envArgs) {
         Write-Host "    注入环境变量：$($Env -join ', ')" -ForegroundColor DarkGray
     }
     $installCmd = 'export XDG_RUNTIME_DIR=/run/user/$(id -u); ' `
-        + "$DestDir/toolkit-server install --workspace $Workspace --bind $Bind $envArgs"
+        + "$DestDir/$Service install --workspace $ws --bind $Bind $envArgs"
     ssh $G10Host $installCmd
-    if ($LASTEXITCODE -ne 0) { throw "toolkit-server install 失败（重装 unit）" }
+    if ($LASTEXITCODE -ne 0) { throw "$Service install 失败（重装 unit）" }
 }
 
 # 重启 daemon 用户服务（CLI 工具无服务、不涉及；换二进制后服务需重启才加载新版）。
