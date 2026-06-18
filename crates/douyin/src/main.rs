@@ -345,6 +345,9 @@ enum Command {
         /// 显式 workspace 路径，覆盖 ~/.config/douyin 默认。
         #[arg(long, short = 'w')]
         workspace: Option<String>,
+        /// 额外注入 unit 的环境变量，`KEY=VAL`，可重复。追加在内置 `.env()` 之后，键冲突时此处生效。
+        #[arg(long, short = 'e', value_name = "KEY=VAL")]
+        env: Vec<String>,
     },
     /// 从 GitHub Release 自更新当前可执行文件（指向安装目录 ~/.local/bin）。
     Update {
@@ -399,11 +402,16 @@ async fn main() -> Result<()> {
             .await?;
             return Ok(());
         }
-        Command::Install { dry_run, workspace } => {
+        Command::Install {
+            dry_run,
+            workspace,
+            env,
+        } => {
             match linux_service()
                 .dispatch(DeployCommand::Install {
                     dry_run: *dry_run,
                     workspace: workspace.clone(),
+                    env: env.clone(),
                 })
                 .await
                 .context("安装失败")?

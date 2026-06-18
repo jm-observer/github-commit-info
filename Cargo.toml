@@ -29,7 +29,7 @@ chrono = { version = "0.4", features = ["serde"] }
 tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
 log = "0.4"
 clap = { version = "4.5", features = ["derive"] }
-custom-utils = { version = "0.15.2", features = ["updater", "trace"] }
+custom-utils = { version = "0.16.0", features = ["updater", "trace"] }
 anyhow = "1"
 sm3 = "0.4"
 axum = "0.8"

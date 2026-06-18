@@ -58,6 +58,10 @@ enum Command {
         /// 监听地址，写进 unit 的 `Environment=TOOLKIT_BIND=<addr>` 决定服务端口。
         #[arg(long, default_value = DEFAULT_BIND)]
         bind: String,
+        /// 额外注入 unit 的环境变量，`KEY=VAL`，可重复（如 `-e TTS_BASE_URL=http://127.0.0.1:8095`）。
+        /// 追加在内置 `.env()` 之后，键冲突时此处的值生效（覆盖含 `--bind` 的 `TOOLKIT_BIND`）。
+        #[arg(long, short = 'e', value_name = "KEY=VAL")]
+        env: Vec<String>,
     },
     /// 从 GitHub Release 自更新当前可执行文件。
     Update {
@@ -142,9 +146,14 @@ async fn main() -> Result<()> {
             dry_run,
             workspace,
             bind,
+            env,
         } => {
             match linux_service(&bind)
-                .dispatch(DeployCommand::Install { dry_run, workspace })
+                .dispatch(DeployCommand::Install {
+                    dry_run,
+                    workspace,
+                    env,
+                })
                 .await
                 .context("安装失败")?
             {

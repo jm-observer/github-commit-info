@@ -99,6 +99,11 @@ export default function G10DeployPage() {
   const [draftPorts, setDraftPorts] = useState<{ port: string; note: string }[]>([])
   const [savingPorts, setSavingPorts] = useState(false)
 
+  // 环境变量编辑：editingEnvName = 正在编辑环境变量的服务，draftEnv = 草稿 KEY=VAL 列表
+  const [editingEnvName, setEditingEnvName] = useState<string | null>(null)
+  const [draftEnv, setDraftEnv] = useState<{ key: string; value: string }[]>([])
+  const [savingEnv, setSavingEnv] = useState(false)
+
   // 部署日志面板
   const [deployingName, setDeployingName] = useState<string | null>(null)
   const [logLines, setLogLines] = useState<DeployLog[]>([])
@@ -230,6 +235,60 @@ export default function G10DeployPage() {
       window.alert(`保存端口失败：${String(e)}`)
     } finally {
       setSavingPorts(false)
+    }
+  }
+
+  // ── 环境变量编辑 ──────────────────────────────────────────────────────────
+  const startEditEnv = (def: ServiceDef) => {
+    setEditingEnvName(def.name)
+    setDraftEnv(def.env.map(e => ({ key: e.key, value: e.value })))
+  }
+  const cancelEditEnv = () => {
+    setEditingEnvName(null)
+    setDraftEnv([])
+  }
+  const updateDraftEnv = (i: number, field: 'key' | 'value', value: string) => {
+    setDraftEnv(prev => prev.map((e, idx) => (idx === i ? { ...e, [field]: value } : e)))
+  }
+  const addDraftEnv = () => setDraftEnv(prev => [...prev, { key: '', value: '' }])
+  const removeDraftEnv = (i: number) =>
+    setDraftEnv(prev => prev.filter((_, idx) => idx !== i))
+
+  const saveEnv = async (name: string) => {
+    // 校验：key 非空、形如环境变量名；value 不含逗号（部署链路用逗号分隔多条 -Env）。
+    const parsed: { key: string; value: string }[] = []
+    const seen = new Set<string>()
+    for (const e of draftEnv) {
+      const key = e.key.trim()
+      if (key === '') continue // 空行忽略
+      if (!/^[A-Za-z_][A-Za-z0-9_]*$/.test(key)) {
+        window.alert(`环境变量名 "${e.key}" 非法（需字母/下划线开头，仅含字母数字下划线）`)
+        return
+      }
+      if (seen.has(key)) {
+        window.alert(`环境变量名 "${key}" 重复`)
+        return
+      }
+      if (e.value.includes(',')) {
+        window.alert(`环境变量 "${key}" 的值不能含逗号（部署链路以逗号分隔多条）`)
+        return
+      }
+      seen.add(key)
+      parsed.push({ key, value: e.value.trim() })
+    }
+    // 以当前 rows 的完整清单为基础，仅替换目标服务的 env，整体写回覆盖文件。
+    const services = rows.map(r =>
+      r.def.name === name ? { ...r.def, env: parsed } : r.def,
+    )
+    setSavingEnv(true)
+    try {
+      await G10DeployAPI.saveServices(services)
+      cancelEditEnv()
+      await loadAll()
+    } catch (e) {
+      window.alert(`保存环境变量失败：${String(e)}`)
+    } finally {
+      setSavingEnv(false)
     }
   }
 
@@ -380,6 +439,97 @@ export default function G10DeployPage() {
                           type="button"
                           onClick={() => startEditPorts(def)}
                           title="编辑端口"
+                          className="rounded p-1 text-gray-400 hover:bg-gray-100 hover:text-gray-600 dark:hover:bg-gray-800"
+                        >
+                          <Pencil size={12} />
+                        </button>
+                      </div>
+                    )}
+                  </div>
+
+                  {/* 环境变量（安装时注入 systemd unit 的 Environment=；仅 deploy 脚本支持 -Env 时生效） */}
+                  <div className="mt-2 flex items-start gap-2">
+                    <span className="pt-0.5 text-xs text-gray-400">环境变量</span>
+                    {editingEnvName === def.name ? (
+                      <div className="flex flex-col gap-1.5">
+                        {draftEnv.map((e, i) => (
+                          <div key={i} className="flex items-center gap-1.5">
+                            <input
+                              type="text"
+                              value={e.key}
+                              onChange={ev => updateDraftEnv(i, 'key', ev.target.value)}
+                              placeholder="KEY"
+                              className="w-40 rounded border border-gray-300 px-1.5 py-0.5 font-mono text-xs dark:border-gray-600 dark:bg-gray-800"
+                            />
+                            <span className="text-xs text-gray-400">=</span>
+                            <input
+                              type="text"
+                              value={e.value}
+                              onChange={ev => updateDraftEnv(i, 'value', ev.target.value)}
+                              placeholder="值（不含逗号）"
+                              className="w-56 rounded border border-gray-300 px-1.5 py-0.5 font-mono text-xs dark:border-gray-600 dark:bg-gray-800"
+                            />
+                            <button
+                              type="button"
+                              onClick={() => removeDraftEnv(i)}
+                              title="删除该变量"
+                              className="rounded p-1 text-gray-400 hover:bg-gray-100 hover:text-red-500 dark:hover:bg-gray-800"
+                            >
+                              <X size={12} />
+                            </button>
+                          </div>
+                        ))}
+                        <div className="flex items-center gap-2">
+                          <button
+                            type="button"
+                            onClick={addDraftEnv}
+                            className="rounded border border-dashed border-gray-300 px-2 py-0.5 text-xs text-gray-500 hover:bg-gray-50 dark:border-gray-600 dark:hover:bg-gray-800"
+                          >
+                            + 添加变量
+                          </button>
+                          <button
+                            type="button"
+                            disabled={savingEnv}
+                            onClick={() => void saveEnv(def.name)}
+                            className="flex items-center gap-1 rounded bg-blue-500 px-2 py-0.5 text-xs font-medium text-white hover:bg-blue-600 disabled:opacity-50"
+                          >
+                            <Save size={12} /> {savingEnv ? '保存中…' : '保存'}
+                          </button>
+                          <button
+                            type="button"
+                            onClick={cancelEditEnv}
+                            className="rounded px-2 py-0.5 text-xs text-gray-500 hover:bg-gray-100 dark:hover:bg-gray-800"
+                          >
+                            取消
+                          </button>
+                        </div>
+                      </div>
+                    ) : (
+                      <div className="flex flex-wrap items-center gap-1.5">
+                        {def.env.length === 0 ? (
+                          <span className="text-xs text-gray-400">未配置</span>
+                        ) : (
+                          def.env.map(e => (
+                            <span
+                              key={e.key}
+                              title={`${e.key}=${e.value}`}
+                              className="inline-flex items-center gap-1 rounded border border-gray-200 bg-gray-50 px-1.5 py-0.5 font-mono text-xs dark:border-gray-700 dark:bg-gray-800"
+                            >
+                              <span className="text-gray-700 dark:text-gray-200">{e.key}</span>
+                              <span className="text-gray-400">=</span>
+                              <span className="max-w-[12rem] truncate text-gray-500">{e.value}</span>
+                            </span>
+                          ))
+                        )}
+                        {!canDeploy && def.env.length > 0 && (
+                          <span className="text-xs text-amber-500" title="该服务未接入一键部署，环境变量不会被注入">
+                            （未接入部署，不生效）
+                          </span>
+                        )}
+                        <button
+                          type="button"
+                          onClick={() => startEditEnv(def)}
+                          title="编辑环境变量"
                           className="rounded p-1 text-gray-400 hover:bg-gray-100 hover:text-gray-600 dark:hover:bg-gray-800"
                         >
                           <Pencil size={12} />

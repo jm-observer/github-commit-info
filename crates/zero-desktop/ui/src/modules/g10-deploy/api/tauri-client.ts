@@ -13,6 +13,12 @@ export interface PortInfo {
   note: string
 }
 
+/** 安装时注入 systemd unit 的环境变量（KEY=VAL）。value 不应含逗号（部署链路用逗号分隔多条）。 */
+export interface EnvVar {
+  key: string
+  value: string
+}
+
 export interface ServiceDef {
   name: string
   label: string
@@ -26,6 +32,8 @@ export interface ServiceDef {
   host: string
   /** 该服务监听/占用的端口清单。 */
   ports: PortInfo[]
+  /** 安装时动态注入 systemd unit 的环境变量；部署时拼成 `-Env KEY=VAL,...` 传给脚本。 */
+  env: EnvVar[]
   deploy: DeployDef | null
 }
 

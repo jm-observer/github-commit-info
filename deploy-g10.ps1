@@ -35,11 +35,18 @@
     toolkit-server 的 workspace 根目录（远端路径），默认 ~/.config/toolkit-server
     （与 install 默认一致）。install 时显式传给 `--workspace`。
 
+.PARAMETER Env
+    额外注入 systemd unit 的环境变量，`KEY=VAL` 数组（逗号分隔）。install 时逐条转发为
+    `--env KEY=VAL`（custom-utils 0.16 写进 unit 的 `Environment=`），键冲突时覆盖内置默认
+    （含 `--bind` 的 `TOOLKIT_BIND`）。G10 部署面板按各服务配置的环境变量传入。
+    例：`-Env TTS_BASE_URL=http://127.0.0.1:8095,LLM_BASE_URL=http://127.0.0.1:8000/v1`。
+
 .EXAMPLE
     pwsh ./deploy-g10.ps1
     pwsh ./deploy-g10.ps1 -SkipBuild
     pwsh ./deploy-g10.ps1 -SkipRestart
     pwsh ./deploy-g10.ps1 -Bind 0.0.0.0:8790
+    pwsh ./deploy-g10.ps1 -Env TTS_BASE_URL=http://127.0.0.1:8095,LLM_MODEL=qwen
 #>
 param(
     [string]$G10Host = "fengqi@192.168.0.68",
@@ -47,6 +54,7 @@ param(
     [string]$Service = "toolkit-server",
     [string]$Bind = "0.0.0.0:8788",
     [string]$Workspace = "~/.config/toolkit-server",
+    [string[]]$Env = @(),
     [switch]$SkipBuild,
     [switch]$SkipRestart
 )
@@ -129,8 +137,13 @@ foreach ($b in $Bins) {
 # 且支持该 install，其余 $Bins 是 CLI 工具，无 unit、跳过。
 if ($Service -eq "toolkit-server") {
     Write-Host "==> 重装 toolkit-server unit（TOOLKIT_BIND=$Bind, workspace=$Workspace）" -ForegroundColor Cyan
+    # 把每条 KEY=VAL 拼成 `--env 'KEY=VAL'`（单引号防远端 shell 二次解析），追加进 install 命令。
+    $envArgs = ($Env | Where-Object { $_ -and $_.Trim() -ne "" } | ForEach-Object { "--env '$($_.Trim())'" }) -join " "
+    if ($envArgs) {
+        Write-Host "    注入环境变量：$($Env -join ', ')" -ForegroundColor DarkGray
+    }
     $installCmd = 'export XDG_RUNTIME_DIR=/run/user/$(id -u); ' `
-        + "$DestDir/toolkit-server install --workspace $Workspace --bind $Bind"
+        + "$DestDir/toolkit-server install --workspace $Workspace --bind $Bind $envArgs"
     ssh $G10Host $installCmd
     if ($LASTEXITCODE -ne 0) { throw "toolkit-server install 失败（重装 unit）" }
 }

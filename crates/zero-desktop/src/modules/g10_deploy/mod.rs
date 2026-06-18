@@ -362,6 +362,24 @@ pub async fn g10_deploy(
         }
     }
 
+    // 动态环境变量注入：把 registry 的 env 拼成 `-Env KEY=VAL,KEY2=VAL2` 单参追加，脚本据此
+    // 逐条转发为 `install --env KEY=VAL`（custom-utils 0.16 注入 unit 的 `Environment=`）。
+    // 用逗号分隔（PowerShell `[string[]]` 数组的 `-File` 传参约定），故 value 不应含逗号。
+    // 脚本已显式带 `-Env` 时不重复追加（registry args 优先）。
+    if !svc.env.is_empty() {
+        let has_env = deploy_args.iter().any(|a| a.eq_ignore_ascii_case("-Env"));
+        if !has_env {
+            let joined = svc
+                .env
+                .iter()
+                .map(|e| format!("{}={}", e.key, e.value))
+                .collect::<Vec<_>>()
+                .join(",");
+            deploy_args.push("-Env".into());
+            deploy_args.push(joined);
+        }
+    }
+
     // 抢占部署锁（compare_exchange 保证只有一个能拿到）。
     if gs
         .deploying

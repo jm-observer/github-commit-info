@@ -40,9 +40,23 @@ pub struct ServiceDef {
     /// 该服务监听/占用的端口清单（展示 + TCP 连通性探测）。空 = 未登记端口。
     #[serde(default)]
     pub ports: Vec<PortInfo>,
+    /// 安装时动态注入 systemd unit 的环境变量（`KEY=VAL`）。部署时拼成 `-Env KEY=VAL,...`
+    /// 传给部署脚本，由脚本转发为 `install --env KEY=VAL`（custom-utils 0.16 注入 `Environment=`）。
+    /// 仅在该服务 `deploy` 脚本支持 `-Env` 时生效（当前 toolkit-server）。空 = 不注入额外变量。
+    #[serde(default)]
+    pub env: Vec<EnvVar>,
     /// 一键部署定义。`None` → 该服务暂不支持一键部署（仅观测）。
     #[serde(default)]
     pub deploy: Option<DeployDef>,
+}
+
+/// 一条注入 systemd unit 的环境变量。`value` 允许含 `=`，但**不应含逗号**
+/// （部署链路用逗号分隔多条 `-Env`）。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct EnvVar {
+    pub key: String,
+    #[serde(default)]
+    pub value: String,
 }
 
 /// 一个服务监听的端口 + 用途说明。
@@ -86,6 +100,7 @@ pub fn builtin() -> Vec<ServiceDef> {
                 port: 8788,
                 note: "HTTP API / Web 控制台".into(),
             }],
+            env: vec![],
             deploy: Some(DeployDef {
                 script: "deploy-g10.ps1".into(),
                 // 部署后重启 toolkit-server 用户服务（脚本默认即此 service，显式写出更清晰）。
@@ -102,7 +117,8 @@ pub fn builtin() -> Vec<ServiceDef> {
             web_url: String::new(),
             host: default_host(),
             ports: vec![], // 网关端口待确认
-            deploy: None,  // 待接入：脚本在 scripts/ 下、远端编译形态，需单独适配
+            env: vec![],
+            deploy: None, // 待接入：脚本在 scripts/ 下、远端编译形态，需单独适配
         },
         ServiceDef {
             name: "english".into(),
@@ -117,6 +133,7 @@ pub fn builtin() -> Vec<ServiceDef> {
                 port: 28080,
                 note: "HTTP API".into(),
             }],
+            env: vec![],
             // 面板按 ports[0] 自动追加 `-Bind 0.0.0.0:28080`，脚本据此
             // `english install -e ENGLISH_BIND=<bind>` 注入端口。
             deploy: Some(DeployDef {
@@ -137,6 +154,7 @@ pub fn builtin() -> Vec<ServiceDef> {
                 port: 9100,
                 note: "HTTP / 追踪后端".into(),
             }],
+            env: vec![],
             deploy: None, // 待接入：暂无 deploy-g10.ps1
         },
         ServiceDef {
@@ -158,6 +176,7 @@ pub fn builtin() -> Vec<ServiceDef> {
                     note: "路由 / HTTP".into(),
                 },
             ],
+            env: vec![],
             deploy: None, // 待接入：暂无 deploy-g10.ps1
         },
         ServiceDef {
@@ -170,6 +189,7 @@ pub fn builtin() -> Vec<ServiceDef> {
             web_url: String::new(),
             host: default_host(),
             ports: vec![], // HTTP 端口待确认
+            env: vec![],
             deploy: None,
         },
     ]
