@@ -6,9 +6,11 @@
 //! 清单解析顺序：**workspace 下 `g10-services.json` 覆盖 > 内置默认**（`builtin()`）。
 //! 删除该文件即恢复内置默认；新增/改服务时编辑该文件，无需重编译。
 //!
-//! D:\git 下 6 个服务（toolkit-server / english / trace-hub / system-prompt-show / alarm-server /
-//! zero）均已接入一键部署（`deploy` 字段非空）：各仓根目录有 deploy-g10.ps1（本机 Docker 交叉
-//! 编译 → scp → install 注入端口 → 重启），健康端点返回 `{status,version,commit}`。
+//! 7 个服务（toolkit-server / english / trace-hub / system-prompt-show / alarm-server / zero /
+//! orchestrator）均已接入一键部署（`deploy` 字段非空）：各仓根目录有 deploy-g10.ps1（本机 Docker
+//! 交叉编译 → scp → install 注入端口 → 重启），健康端点返回 `{status,version,commit}`。
+//! orchestrator 2026-06 迁入本仓 crates/orchestrator,与 toolkit-server 共用本仓 deploy-g10.ps1
+//! (-Service 区分),故其 repo_dir 指向 D:\git\toolkit。
 //!
 //! **端口即环境变量**：服务端口由 `<SERVICE>_BIND` 环境变量（值为完整 `host:port`）控制，故面板
 //! 不再单列「端口」，而是把它作为 env 清单里的一条（带备注）。部署时整份 env 拼成
@@ -200,20 +202,38 @@ pub fn builtin() -> Vec<ServiceDef> {
         ServiceDef {
             name: "orchestrator".into(),
             label: "orchestrator（语音编排）".into(),
-            note: "streaming-speech 语音编排（WebSocket + ASR + vLLM 串联）；Docker 部署，面板仅观测 + 打开后台".into(),
-            repo_dir: r"D:\git\streaming-speech".into(),
+            note: "streaming-speech 语音编排（WebSocket + ASR + vLLM 串联）；2026-06 迁入本仓 \
+                   crates/orchestrator，宿主 systemd 服务，deploy-g10.ps1 交叉编译一键部署".into(),
+            // 已迁入 toolkit 本仓：复用本仓 deploy-g10.ps1（与 toolkit-server 同脚本，-Service 区分）。
+            repo_dir: r"D:\git\toolkit".into(),
             health_url: "http://192.168.0.68:8090/health".into(),
-            // Docker 容器部署，非 systemd --user unit。
-            remote_service: None,
+            remote_service: Some("orchestrator".into()),
             // 控制台挂根路径（实时流 + 历史分段 + 说话人管理）。
             web_url: "http://192.168.0.68:8090".into(),
-            env: vec![EnvVar {
-                key: "ORCH_BIND".into(),
-                value: "0.0.0.0:8090".into(),
-                note: "监听地址（由 Docker/compose 设置，此处仅展示）".into(),
-            }],
-            // Docker 部署形态，不走 deploy-g10.ps1 交叉编译链路；面板仅观测连通性/打开后台。
-            deploy: None,
+            // 端口经 ORCH_BIND 注入；另注入 asr/trace 连接地址（orchestrator 是宿主进程，走回环：
+            // 宿主 9100 被 trace-hub 占用 → asr 容器发布到 9110；trace-hub 在宿主 9100）。
+            // vLLM 地址不在此（权威值在 orchestrator SQLite 的 vllm.base = 127.0.0.1:12340）。
+            env: vec![
+                EnvVar {
+                    key: "ORCH_BIND".into(),
+                    value: "0.0.0.0:8090".into(),
+                    note: bind_note(),
+                },
+                EnvVar {
+                    key: "ASR_WS".into(),
+                    value: "ws://127.0.0.1:9110".into(),
+                    note: "asr 内部 WS（容器发布到宿主 9110；宿主 9100 被 trace-hub 占用）".into(),
+                },
+                EnvVar {
+                    key: "TRACE_HUB_ENDPOINT".into(),
+                    value: "http://127.0.0.1:9100/v1/spans".into(),
+                    note: "trace-hub 宿主端点（未设则零追踪）".into(),
+                },
+            ],
+            deploy: Some(DeployDef {
+                script: "deploy-g10.ps1".into(),
+                args: vec!["-Service".into(), "orchestrator".into()],
+            }),
         },
     ]
 }
