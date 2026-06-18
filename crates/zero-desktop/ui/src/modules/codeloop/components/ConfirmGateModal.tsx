@@ -1,3 +1,4 @@
+import { useState } from 'react'
 import { ArrowRight } from 'lucide-react'
 
 interface Props {
@@ -7,7 +8,8 @@ interface Props {
   title?: string
   /** 即将传递的文本全文。 */
   content?: string
-  onApprove: () => void
+  /** 确认放行；`auto=true` 表示用户勾选了「确认后转全自动」，后续不再逐步确认。 */
+  onApprove: (auto: boolean) => void
   onReject: () => void
 }
 
@@ -23,6 +25,7 @@ function flow(direction?: string): { from: string; to: string } {
  */
 export function ConfirmGateModal({ seq, direction, title, content, onApprove, onReject }: Props) {
   const { from, to } = flow(direction)
+  const [auto, setAuto] = useState(false)
   return (
     <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/40">
       <div className="flex max-h-[80vh] w-[640px] max-w-[92vw] flex-col rounded-lg bg-white p-5 shadow-xl dark:bg-gray-900">
@@ -43,6 +46,16 @@ export function ConfirmGateModal({ seq, direction, title, content, onApprove, on
           {content || '（无内容）'}
         </pre>
 
+        <label className="mb-3 flex cursor-pointer items-center gap-2 text-xs text-gray-600 dark:text-gray-300">
+          <input
+            type="checkbox"
+            checked={auto}
+            onChange={e => setAuto(e.target.checked)}
+            className="h-3.5 w-3.5"
+          />
+          确认后自动继续，不再逐步确认（撞到 ASK_USER 仍会停下问你）
+        </label>
+
         <div className="flex justify-end gap-2">
           <button
             onClick={onReject}
@@ -51,10 +64,10 @@ export function ConfirmGateModal({ seq, direction, title, content, onApprove, on
             不同意（停止）
           </button>
           <button
-            onClick={onApprove}
+            onClick={() => onApprove(auto)}
             className="rounded-md bg-blue-600 px-4 py-1.5 text-sm text-white hover:bg-blue-700"
           >
-            确认发送
+            {auto ? '确认并转自动' : '确认发送'}
           </button>
         </div>
       </div>

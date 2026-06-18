@@ -180,19 +180,31 @@ fn tail(s: &str) -> String {
 ///
 /// **会真实调用 codex / claude CLI 并消耗额度**——不要在单测中调用。
 pub async fn send(s: &SessionRef, prompt: &str) -> Result<TurnResult> {
-    match s.provider {
+    let turn = match s.provider {
         Provider::Codex => {
             let argv = codex_argv(&s.cwd, &s.session_id, prompt);
             let stdout = run_capture("codex", &argv, None).await?;
-            Ok(parse_codex_stdout(&stdout))
+            parse_codex_stdout(&stdout)
         }
         Provider::Claude => {
             let argv = claude_argv(&s.session_id, prompt);
             // Claude resume 必须在会话原始 cwd 下执行。
             let stdout = run_capture("claude", &argv, Some(&s.cwd)).await?;
-            Ok(parse_claude_stdout(&stdout))
+            parse_claude_stdout(&stdout)
         }
+    };
+    // 空回复 = 显式错误，不静默返回空串让上层当正常回复继续空转。
+    // 子进程退出 0 却没解析出任何已知 schema 的回复文本，最可能是 CLI 版本变更导致
+    // 输出格式不兼容（见 docs/codeloop-cli-resilience-design.md §3）。带 raw_tail 末段
+    // 冒泡到上层 → 循环 emit error → 前端直接显示原始片段，便于判断契约是否破裂。
+    if turn.reply_text.trim().is_empty() {
+        return Err(anyhow!(
+            "{} CLI 退出 0 但未解析出任何回复文本（可能 CLI 版本变更导致 stdout 格式不兼容）。原始输出末段：\n{}",
+            s.provider.as_str(),
+            turn.raw_tail.trim()
+        ));
     }
+    Ok(turn)
 }
 
 /// 新建一个 Codex 会话：在 `cwd` 下跑一轮 `codex exec`（无 resume），返回新会话 id。
@@ -207,6 +219,62 @@ pub async fn create_codex_session(cwd: &Path, prompt: &str) -> Result<String> {
             tail(&stdout)
         )
     })
+}
+
+/// 探针：取 CLI 版本号（`<program> --version`）。验证命令在 PATH、Windows npm shim 解析、
+/// 可正常 spawn（即 C4/C5）。返回 stdout 首行（去空白）。
+pub async fn probe_version(program: &str) -> Result<String> {
+    let argv = vec!["--version".to_string()];
+    let stdout = run_capture(program, &argv, None).await?;
+    Ok(stdout.lines().next().unwrap_or("").trim().to_string())
+}
+
+/// 构造 Codex 合成探针的 argv：`codex exec --json -s read-only`（新建会话，只读沙箱）。
+///
+/// 与 [`codex_create_argv`] 同形但沙箱降为 `read-only`——探针只验链路，不应改文件。
+pub fn codex_probe_argv(repo_root: &Path, prompt: &str) -> Vec<String> {
+    vec![
+        "exec".to_string(),
+        "-s".to_string(),
+        "read-only".to_string(),
+        "-c".to_string(),
+        "approval_policy=\"never\"".to_string(),
+        "--cd".to_string(),
+        repo_root.to_string_lossy().to_string(),
+        "--json".to_string(),
+        prompt.to_string(),
+    ]
+}
+
+/// 构造 Claude 合成探针的 argv：`claude -p <prompt> --permission-mode plan`（**不带 resume**，
+/// 新建临时会话；plan 为只读权限模式，探针不应改文件）。
+pub fn claude_probe_argv(prompt: &str) -> Vec<String> {
+    vec![
+        "-p".to_string(),
+        prompt.to_string(),
+        "--permission-mode".to_string(),
+        "plan".to_string(),
+    ]
+}
+
+/// 实发合成探针（Codex 端，**新建一次性会话 + 只读沙箱**，不污染真实会话）。
+///
+/// 用 [`codex_probe_argv`] 跑一轮 `prompt`，返回解析出的回复文本。覆盖新建路径 argv +
+/// `item.completed` 输出解析（C3/O3/O1），**不**覆盖 resume 路径 C1。**会真实调用 codex CLI 并消耗额度。**
+pub async fn probe_codex_synthetic(cwd: &Path, prompt: &str) -> Result<String> {
+    let argv = codex_probe_argv(cwd, prompt);
+    let stdout = run_capture("codex", &argv, Some(cwd)).await?;
+    Ok(parse_codex_stdout(&stdout).reply_text)
+}
+
+/// 实发合成探针（Claude 端，**不带 `--resume` 的一次性会话 + plan 只读权限**，不污染真实会话）。
+///
+/// 用 `claude -p <prompt> --permission-mode plan` 跑一轮，返回纯文本回复。覆盖新建调用 + 纯文本
+/// 输出解析（O4），**不**覆盖 resume argv C2 与原 cwd 约束 C6。**会真实调用 claude CLI 并消耗额度。**
+pub async fn probe_claude_synthetic(cwd: &Path, prompt: &str) -> Result<String> {
+    let argv = claude_probe_argv(prompt);
+    let stdout = run_capture("claude", &argv, Some(cwd)).await?;
+    Ok(parse_claude_stdout(&stdout).reply_text)
 }
 
 /// 起子进程并捕获 stdout；非零退出码视为基础设施错误（`Err`）。
@@ -432,6 +500,40 @@ mod tests {
             ]
         );
         assert!(!argv.iter().any(|a| a == "resume"));
+    }
+
+    /// 合成探针（Codex）：新建会话 + 只读沙箱，绝不带 resume，绝不 workspace-write。
+    #[test]
+    fn codex_probe_argv_is_readonly_and_no_resume() {
+        let argv = codex_probe_argv(&PathBuf::from("D:/git/repo"), "只回复 PROBE_OK");
+        assert_eq!(
+            argv,
+            vec![
+                "exec",
+                "-s",
+                "read-only",
+                "-c",
+                "approval_policy=\"never\"",
+                "--cd",
+                "D:/git/repo",
+                "--json",
+                "只回复 PROBE_OK",
+            ]
+        );
+        assert!(!argv.iter().any(|a| a == "resume"));
+        assert!(!argv.iter().any(|a| a == "workspace-write"));
+    }
+
+    /// 合成探针（Claude）：不带 --resume（新建临时会话）+ plan 只读权限，绝不 acceptEdits。
+    #[test]
+    fn claude_probe_argv_is_plan_and_no_resume() {
+        let argv = claude_probe_argv("只回复 PROBE_OK");
+        assert_eq!(
+            argv,
+            vec!["-p", "只回复 PROBE_OK", "--permission-mode", "plan"]
+        );
+        assert!(!argv.iter().any(|a| a == "--resume"));
+        assert!(!argv.iter().any(|a| a == "acceptEdits"));
     }
 
     #[test]

@@ -3,6 +3,7 @@ import type { UnlistenFn } from '@tauri-apps/api/event'
 import {
   CodeloopAPI,
   onProgress,
+  type LoopMessageRow,
   type LoopRow,
   type Progress,
   type Provider,
@@ -15,7 +16,12 @@ import { LoopStatusBar } from './components/LoopStatusBar'
 import { AskUserModal } from './components/AskUserModal'
 import { ConfirmGateModal } from './components/ConfirmGateModal'
 import { LoopList } from './components/LoopList'
+import { LoopDetail } from './components/LoopDetail'
 import { TrackModal } from './components/TrackModal'
+import { PreflightModal } from './components/PreflightModal'
+import { PreviewModal } from './components/PreviewModal'
+import { ImplementationModal } from './components/ImplementationModal'
+import type { StartInput } from './api/tauri-client'
 
 const POLL_MS = 1500
 
@@ -39,6 +45,9 @@ export default function CodeloopPage() {
   const [waitIdle, setWaitIdle] = useState(false)
   const [stepConfirm, setStepConfirm] = useState(true)
   const [useWorktree, setUseWorktree] = useState(false)
+  // 首轮预热：哪些端已在预览台外部建立（按 provider 分开）。
+  const [estCodex, setEstCodex] = useState(false)
+  const [estClaude, setEstClaude] = useState(false)
 
   // 循环
   const [running, setRunning] = useState(false)
@@ -46,13 +55,37 @@ export default function CodeloopPage() {
   const [startErr, setStartErr] = useState<string | null>(null)
   const [answeredSeq, setAnsweredSeq] = useState(0)
   const [decidedSeq, setDecidedSeq] = useState(0)
+  // 运行中是否已转全自动（= !step_confirm）；由 status 初始化、确认弹窗/状态条开关翻转。
+  const [liveAuto, setLiveAuto] = useState(false)
 
   // 记录列表
   const [loops, setLoops] = useState<LoopRow[]>([])
   const [loadingLoops, setLoadingLoops] = useState(false)
   const [selectedLoopId, setSelectedLoopId] = useState<number | null>(null)
+  // 选中记录的往返消息（详情面板）。
+  const [loopMsgs, setLoopMsgs] = useState<LoopMessageRow[]>([])
+  const [loadingLoopMsgs, setLoadingLoopMsgs] = useState(false)
   // 跟踪弹窗：展示所选两个会话的消息记录。
   const [showTrack, setShowTrack] = useState(false)
+  // 环境自检弹窗。
+  const [showPreflight, setShowPreflight] = useState(false)
+  // 预览 / 手动驱动台弹窗。
+  const [showPreview, setShowPreview] = useState(false)
+  // 「开始实现」配置确认窗的源记录（非 null = 弹窗开启）。
+  const [implSource, setImplSource] = useState<LoopRow | null>(null)
+
+  // 由表单组装 StartInput（启动 / 自检共用）。
+  const buildInput = (): StartInput => ({
+    claude: { session_id: claudeId },
+    codex: { session_id: codexId },
+    target_path: targetPath.trim(),
+    mode,
+    max_rounds: maxRounds,
+    wait_for_claude_idle: waitIdle,
+    step_confirm: stepConfirm,
+    use_worktree: useWorktree,
+    established: { codex: estCodex, claude: estClaude },
+  })
 
   // ── 会话清单 ──────────────────────────────────────────────────────────────
   const refreshSessions = () => {
@@ -90,12 +123,20 @@ export default function CodeloopPage() {
     refreshLoops()
   }
 
-  // 点击记录：选中 + 把该记录的配置回填到上方（两个会话 / 目标 / 模式 / 各开关），
-  // 同时把消息轮询切到该记录的两个会话（供「跟踪」弹窗展示）。
+  // 点击记录：选中 + 加载该记录往返消息到右侧只读详情面板。**不再回填新建表单**
+  // （避免「看历史」污染「配新循环」）；需要复用配置时用详情面板的「用此配置新建」。
   const handleSelectLoop = (id: number) => {
     setSelectedLoopId(id)
-    const rec = loops.find(l => l.id === id)
-    if (!rec) return
+    setLoadingLoopMsgs(true)
+    setLoopMsgs([])
+    CodeloopAPI.loopMessages(id)
+      .then(setLoopMsgs)
+      .catch(() => {})
+      .finally(() => setLoadingLoopMsgs(false))
+  }
+
+  // 显式把某记录配置复制进新建表单（详情面板触发；与选中解耦）。
+  const handleCopyConfig = (rec: LoopRow) => {
     cursors.current.claude = 0
     cursors.current.codex = 0
     setMessages({ codex: [], claude: [] })
@@ -185,6 +226,7 @@ export default function CodeloopPage() {
       .then(s => {
         setRunning(s.running)
         if (s.progress) setProgress(s.progress)
+        setLiveAuto(!s.step_confirm)
       })
       .catch(() => {})
     return () => un?.()
@@ -192,25 +234,23 @@ export default function CodeloopPage() {
 
   // ── 启动 / 应答 ──────────────────────────────────────────────────────────
   const canStart = !!claudeId && !!codexId && !!targetPath.trim() && !running
-  const handleStart = async () => {
+  const startWith = async (input: StartInput) => {
     setStartErr(null)
     try {
-      await CodeloopAPI.start({
-        claude: { session_id: claudeId },
-        codex: { session_id: codexId },
-        target_path: targetPath.trim(),
-        mode,
-        max_rounds: maxRounds,
-        wait_for_claude_idle: waitIdle,
-        step_confirm: stepConfirm,
-        use_worktree: useWorktree,
-      })
+      await CodeloopAPI.start(input)
       setRunning(true)
       setProgress({ phase: 'starting' })
+      setLiveAuto(!input.step_confirm)
       refreshLoops()
     } catch (e) {
       setStartErr(String(e))
     }
+  }
+  const handleStart = () => startWith(buildInput())
+  // 「开始实现」：弹配置确认窗 → 确认后以 implementation 模式启动并关联血缘。
+  const handleStartImplementation = async (input: StartInput) => {
+    setImplSource(null)
+    await startWith(input)
   }
   const handleStop = async () => {
     try {
@@ -231,13 +271,29 @@ export default function CodeloopPage() {
     }
   }
 
-  const handleDecide = async (approve: boolean) => {
+  const handleDecide = async (approve: boolean, auto = false) => {
     const seq = progress?.seq
     if (seq == null) return
     setDecidedSeq(seq) // 乐观关窗，避免重复点击
     try {
       await CodeloopAPI.confirm(seq, approve)
+      // 勾选「确认后转自动」：放行当前步后关掉逐步确认。
+      if (approve && auto) {
+        await CodeloopAPI.setAutoConfirm(true)
+        setLiveAuto(true)
+      }
     } catch (e) {
+      setStartErr(String(e))
+    }
+  }
+
+  // 运行中随时翻转自动确认（状态条入口）。
+  const handleToggleAuto = async (enabled: boolean) => {
+    setLiveAuto(enabled) // 乐观
+    try {
+      await CodeloopAPI.setAutoConfirm(enabled)
+    } catch (e) {
+      setLiveAuto(!enabled) // 回滚
       setStartErr(String(e))
     }
   }
@@ -301,13 +357,22 @@ export default function CodeloopPage() {
         setStepConfirm={setStepConfirm}
         useWorktree={useWorktree}
         setUseWorktree={setUseWorktree}
+        estCodex={estCodex}
+        setEstCodex={setEstCodex}
+        estClaude={estClaude}
+        setEstClaude={setEstClaude}
+        onPreview={() => setShowPreview(true)}
         running={running}
         canStart={canStart}
         onStart={handleStart}
         onStop={handleStop}
         onTrack={() => setShowTrack(true)}
         canTrack={!!claudeId && !!codexId}
+        onPreflight={() => setShowPreflight(true)}
+        canPreflight={!!claudeId && !!codexId && !!targetPath.trim()}
         progress={progress}
+        liveAuto={liveAuto}
+        onToggleAuto={handleToggleAuto}
       />
       {startErr && (
         <div className="rounded-md bg-red-50 px-3 py-2 text-xs text-red-600 dark:bg-red-900/20 dark:text-red-400">
@@ -315,16 +380,27 @@ export default function CodeloopPage() {
         </div>
       )}
 
-      {/* 记录列表（常驻于启动区下方）：点击一条 → 配置回填到上方；点「跟踪」看两会话消息 */}
-      <div className="min-h-0 flex-1">
-        <LoopList
-          loops={loops}
-          selectedId={selectedLoopId}
-          onSelect={handleSelectLoop}
-          onRefresh={refreshLoops}
-          onDelete={handleDeleteLoop}
-          loading={loadingLoops}
-        />
+      {/* 下方左右分栏：左=历史记录列表，右=选中记录只读详情（状态 + 往返消息 + 上下文操作）。 */}
+      <div className="flex min-h-0 flex-1 gap-3">
+        <div className="w-80 shrink-0">
+          <LoopList
+            loops={loops}
+            selectedId={selectedLoopId}
+            onSelect={handleSelectLoop}
+            onRefresh={refreshLoops}
+            onDelete={handleDeleteLoop}
+            loading={loadingLoops}
+          />
+        </div>
+        <div className="min-w-0 flex-1">
+          <LoopDetail
+            loop={loops.find(l => l.id === selectedLoopId) ?? null}
+            messages={loopMsgs}
+            loadingMessages={loadingLoopMsgs}
+            onCopyConfig={handleCopyConfig}
+            onStartImplementation={setImplSource}
+          />
+        </div>
       </div>
 
       {showAsk && progress?.question && (
@@ -342,7 +418,7 @@ export default function CodeloopPage() {
           direction={progress!.direction}
           title={progress!.title}
           content={progress!.content}
-          onApprove={() => handleDecide(true)}
+          onApprove={auto => handleDecide(true, auto)}
           onReject={() => handleDecide(false)}
         />
       )}
@@ -355,6 +431,22 @@ export default function CodeloopPage() {
           codexMessages={messages.codex}
           onClose={() => setShowTrack(false)}
         />
+      )}
+
+      {showPreflight && (
+        <PreflightModal input={buildInput()} onClose={() => setShowPreflight(false)} />
+      )}
+
+      {implSource && (
+        <ImplementationModal
+          source={implSource}
+          onStart={handleStartImplementation}
+          onClose={() => setImplSource(null)}
+        />
+      )}
+
+      {showPreview && (
+        <PreviewModal claudeId={claudeId} codexId={codexId} onClose={() => setShowPreview(false)} />
       )}
     </div>
   )

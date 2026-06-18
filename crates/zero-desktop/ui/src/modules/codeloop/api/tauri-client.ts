@@ -56,6 +56,8 @@ export interface Progress {
 export interface StatusSnapshot {
   running: boolean
   progress: Progress | null
+  /** 当前逐步确认开关（运行时可翻转）；false = 已转全自动。 */
+  step_confirm: boolean
 }
 
 export type ReviewMode = 'design' | 'implementation'
@@ -72,6 +74,10 @@ export interface StartInput {
   step_confirm?: boolean
   /** worktree 模式：让 Claude 自己用 git worktree + 子 agent 隔离实现，Codex 复核 worktree。 */
   use_worktree?: boolean
+  /** 两阶段血缘：本循环承接自哪条记录（design→implementation）。 */
+  parent_loop_id?: number
+  /** 首轮预热：哪些端已在外部（预览台）发过首轮说明块，循环首轮即跳过其 STANDING_BLOCK。 */
+  established?: { codex?: boolean; claude?: boolean }
 }
 
 // ── 复核循环记录（持久化）──────────────────────────────────────────────────
@@ -99,6 +105,18 @@ export interface LoopRow {
   total_rounds: number
   worktree_path?: string | null
   error?: string | null
+  /** 承接来源记录 id（design→implementation 血缘）。 */
+  parent_loop_id?: number | null
+}
+
+/** 一条自检结果（与后端 CheckRow 对齐）。 */
+export interface CheckRow {
+  id: string
+  label: string
+  tier: 'passive' | 'version' | 'live'
+  status: 'pass' | 'fail' | 'warn' | 'skipped'
+  detail: string
+  raw_excerpt?: string
 }
 
 /** 记录里的一条逐轮消息。 */
@@ -118,10 +136,18 @@ export const CodeloopAPI = {
     invoke<MessagesPage>('codeloop_session_messages', { provider, sessionId, after }),
   newCodexSession: (claudeSessionId: string) =>
     invoke<string>('codeloop_new_codex_session', { claudeSessionId }),
+  /** 向单个会话发一轮（预览驱动台 / 首轮预热）；返回回复文本。真实调用 CLI。 */
+  sendOne: (provider: Provider, sessionId: string, text: string) =>
+    invoke<string>('codeloop_send_one', { provider, sessionId, text }),
   start: (input: StartInput) => invoke<void>('codeloop_start', { input }),
+  /** 启动前自检：live=true 时跑实发往返合成探针（真实调用一次 CLI）。 */
+  preflight: (input: StartInput, live: boolean) =>
+    invoke<CheckRow[]>('codeloop_preflight', { input, live }),
   status: () => invoke<StatusSnapshot>('codeloop_status'),
   answer: (seq: number, text: string) => invoke<void>('codeloop_answer', { seq, text }),
   confirm: (seq: number, approve: boolean) => invoke<void>('codeloop_confirm', { seq, approve }),
+  /** 运行时翻转自动确认：enabled=true 转全自动（顺手放行挂起的确认门），false 恢复逐步确认。 */
+  setAutoConfirm: (enabled: boolean) => invoke<void>('codeloop_set_auto_confirm', { enabled }),
   stop: () => invoke<void>('codeloop_stop'),
   // 记录列表 / 详情 / 删除
   listLoops: (limit = 50) => invoke<LoopRow[]>('codeloop_list_loops', { limit }),

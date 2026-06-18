@@ -33,6 +33,8 @@ pub struct LoopRow {
     pub total_rounds: i64,
     pub worktree_path: Option<String>,
     pub error: Option<String>,
+    /// 血缘：本记录承接自哪条记录（design→implementation 两阶段），无则 None。
+    pub parent_loop_id: Option<i64>,
 }
 
 /// 一条逐轮消息。
@@ -62,6 +64,8 @@ pub struct NewLoop {
     pub wait_for_idle: bool,
     pub step_confirm: bool,
     pub use_worktree: bool,
+    /// 承接来源记录 id（两阶段血缘），新建独立循环时为 None。
+    pub parent_loop_id: Option<i64>,
 }
 
 fn now() -> String {
@@ -100,7 +104,8 @@ impl Db {
                 final_verdict TEXT,
                 total_rounds INTEGER NOT NULL DEFAULT 0,
                 worktree_path TEXT,
-                error TEXT
+                error TEXT,
+                parent_loop_id INTEGER
             );
             CREATE INDEX IF NOT EXISTS loops_created ON loops(created_at DESC);
 
@@ -117,6 +122,10 @@ impl Db {
             "#,
         )
         .context("migrate codeloop state.db")?;
+
+        // 旧库补列（无增量迁移框架，靠幂等 ALTER；列已存在则报错被忽略）。
+        conn.execute("ALTER TABLE loops ADD COLUMN parent_loop_id INTEGER", [])
+            .ok();
 
         // 残留清理：上次进程崩溃 / abort 留下的 running 记录标为 aborted。
         conn.execute(
@@ -141,8 +150,8 @@ impl Db {
             "INSERT INTO loops(
                 created_at, updated_at, claude_session, codex_session, claude_cwd, codex_cwd,
                 repo_root, target_repo_rel, target_abs, target_label, mode, max_rounds,
-                wait_for_idle, step_confirm, use_worktree, status, total_rounds
-             ) VALUES (?1,?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,'running',0)",
+                wait_for_idle, step_confirm, use_worktree, status, total_rounds, parent_loop_id
+             ) VALUES (?1,?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,'running',0,?15)",
             params![
                 ts,
                 m.claude_session,
@@ -158,6 +167,7 @@ impl Db {
                 m.wait_for_idle as i64,
                 m.step_confirm as i64,
                 m.use_worktree as i64,
+                m.parent_loop_id,
             ],
         )?;
         Ok(conn.last_insert_rowid())
@@ -219,7 +229,8 @@ impl Db {
         let mut stmt = conn.prepare(
             "SELECT id, created_at, updated_at, claude_session, codex_session, repo_root,
                     target_repo_rel, target_abs, target_label, mode, max_rounds, step_confirm,
-                    use_worktree, status, final_verdict, total_rounds, worktree_path, error
+                    use_worktree, status, final_verdict, total_rounds, worktree_path, error,
+                    parent_loop_id
              FROM loops ORDER BY id DESC LIMIT ?1",
         )?;
         let rows = stmt
@@ -243,6 +254,7 @@ impl Db {
                     total_rounds: row.get(15)?,
                     worktree_path: row.get(16)?,
                     error: row.get(17)?,
+                    parent_loop_id: row.get(18)?,
                 })
             })?
             .collect::<rusqlite::Result<Vec<_>>>()?;

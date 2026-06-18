@@ -1,4 +1,4 @@
-import { Eye, Play, Square } from 'lucide-react'
+import { Eye, MessageSquare, Play, Square, Stethoscope } from 'lucide-react'
 import type { Progress, ReviewMode } from '../api/tauri-client'
 
 interface Props {
@@ -14,6 +14,13 @@ interface Props {
   setStepConfirm: (v: boolean) => void
   useWorktree: boolean
   setUseWorktree: (v: boolean) => void
+  /** 首轮预热（按 provider 分开）：该端已在预览台外部建立，循环首轮跳过其说明块。 */
+  estCodex: boolean
+  setEstCodex: (v: boolean) => void
+  estClaude: boolean
+  setEstClaude: (v: boolean) => void
+  /** 打开预览 / 手动驱动台。 */
+  onPreview: () => void
   running: boolean
   canStart: boolean
   onStart: () => void
@@ -21,7 +28,14 @@ interface Props {
   /** 跟踪：弹出所选两个会话的消息记录。 */
   onTrack: () => void
   canTrack: boolean
+  /** 环境自检：弹出 preflight 面板。 */
+  onPreflight: () => void
+  canPreflight: boolean
   progress: Progress | null
+  /** 运行中是否已转全自动（= !step_confirm）。 */
+  liveAuto: boolean
+  /** 运行中翻转自动确认（true=转全自动 / false=恢复逐步确认）。 */
+  onToggleAuto: (enabled: boolean) => void
 }
 
 const VERDICT_LABELS: Record<string, string> = {
@@ -134,6 +148,51 @@ export function LoopStatusBar(props: Props) {
           worktree 模式（Claude 用 worktree+子 agent 实现）
         </label>
 
+        <label
+          className="flex items-center gap-1.5 pb-2 text-xs text-gray-600 dark:text-gray-300"
+          title="若已在预览台对该端发过 establishing 首轮，循环首轮跳过其说明块"
+        >
+          <input
+            type="checkbox"
+            checked={props.estCodex}
+            onChange={e => props.setEstCodex(e.target.checked)}
+            disabled={running}
+          />
+          Codex 已预热
+        </label>
+        <label
+          className="flex items-center gap-1.5 pb-2 text-xs text-gray-600 dark:text-gray-300"
+          title="若已在预览台对该端发过 establishing 首轮，循环首轮跳过其说明块"
+        >
+          <input
+            type="checkbox"
+            checked={props.estClaude}
+            onChange={e => props.setEstClaude(e.target.checked)}
+            disabled={running}
+          />
+          Claude 已预热
+        </label>
+
+        <button
+          onClick={props.onPreview}
+          disabled={!props.canTrack}
+          className="flex items-center gap-1.5 rounded-md border border-gray-300 px-3 py-1.5 text-sm text-gray-700 hover:bg-gray-100 disabled:opacity-50 dark:border-gray-600 dark:text-gray-200 dark:hover:bg-gray-800"
+          title="预览单个会话内容，并可手动发一条（首轮预热 / 调试）"
+        >
+          <MessageSquare size={14} />
+          驱动台
+        </button>
+
+        <button
+          onClick={props.onPreflight}
+          disabled={!props.canPreflight}
+          className="flex items-center gap-1.5 rounded-md border border-gray-300 px-3 py-1.5 text-sm text-gray-700 hover:bg-gray-100 disabled:opacity-50 dark:border-gray-600 dark:text-gray-200 dark:hover:bg-gray-800"
+          title="启动前自检：会话可定位 / 三方一致 / CLI 版本 / 可选实发往返"
+        >
+          <Stethoscope size={14} />
+          环境自检
+        </button>
+
         <button
           onClick={props.onTrack}
           disabled={!props.canTrack}
@@ -176,6 +235,19 @@ export function LoopStatusBar(props: Props) {
           <span className="truncate text-red-500" title={p.error}>
             {p.error}
           </span>
+        )}
+        {running && (
+          <label
+            className="flex cursor-pointer items-center gap-1.5 text-gray-600 dark:text-gray-300"
+            title="转全自动后不再逐步确认；撞到 ASK_USER 仍会停下问你"
+          >
+            <input
+              type="checkbox"
+              checked={props.liveAuto}
+              onChange={e => props.onToggleAuto(e.target.checked)}
+            />
+            {props.liveAuto ? '全自动（不再逐步确认）' : '逐步确认中'}
+          </label>
         )}
         {running && (
           <span className="text-amber-600 dark:text-amber-400">
