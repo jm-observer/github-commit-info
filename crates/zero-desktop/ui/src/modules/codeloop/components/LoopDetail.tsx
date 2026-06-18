@@ -1,4 +1,4 @@
-import { GitBranch, Copy } from 'lucide-react'
+import { GitBranch } from 'lucide-react'
 import type { LoopMessageRow, LoopRow } from '../api/tauri-client'
 import { LoopTranscript } from './LoopTranscript'
 
@@ -6,9 +6,7 @@ interface Props {
   loop: LoopRow | null
   messages: LoopMessageRow[]
   loadingMessages: boolean
-  /** 把该记录的配置复制进上方新建表单（显式动作，避免选中即污染）。 */
-  onCopyConfig: (loop: LoopRow) => void
-  /** 「开始实现」：design 且 PASS 的记录可承接进入实现阶段（Task #6 接入）。 */
+  /** 「开始实现」：仅当该 design 记录最终 PASS 时可点，承接进入实现阶段。 */
   onStartImplementation?: (loop: LoopRow) => void
 }
 
@@ -25,10 +23,16 @@ const FINAL_LABELS: Record<string, string> = {
   aborted_timeout: '超时中止',
   aborted_parse: '解析失败中止',
   aborted_by_user: '用户中止',
+  interrupted: '中断（应用重启）',
 }
 
-/** 选中记录的只读详情面板：元信息 + 往返消息 + 上下文操作。 */
-export function LoopDetail({ loop, messages, loadingMessages, onCopyConfig, onStartImplementation }: Props) {
+/** 短 id：会话 id 取末段，避免占满一行。 */
+function shortId(id: string): string {
+  return id.length > 12 ? `…${id.slice(-10)}` : id
+}
+
+/** 选中记录的只读详情面板：配置 + 状态 + 往返消息 + 上下文操作。 */
+export function LoopDetail({ loop, messages, loadingMessages, onStartImplementation }: Props) {
   if (!loop) {
     return (
       <div className="flex h-full items-center justify-center rounded-md border border-gray-200 text-xs text-gray-400 dark:border-gray-800">
@@ -38,8 +42,9 @@ export function LoopDetail({ loop, messages, loadingMessages, onCopyConfig, onSt
   }
 
   const ss = STATUS_STYLE[loop.status] ?? { label: loop.status, cls: 'bg-gray-100 text-gray-600' }
-  // design 且最终 PASS → 可承接进入实现阶段。
-  const canImplement = loop.mode === 'design' && loop.final_verdict === 'pass'
+  // 「开始实现」门槛：design 模式且确实通过复核（done + PASS）。
+  const passed = loop.status === 'done' && loop.final_verdict === 'pass'
+  const showImplement = loop.mode === 'design'
 
   return (
     <div className="flex h-full min-h-0 flex-col gap-2">
@@ -67,6 +72,19 @@ export function LoopDetail({ loop, messages, loadingMessages, onCopyConfig, onSt
             </span>
           )}
         </div>
+
+        {/* 配置内容（只读，对应上方新建表单的字段）。 */}
+        <div className="mt-2 grid grid-cols-[auto_1fr] gap-x-3 gap-y-0.5 text-[11px] text-gray-500 dark:text-gray-400">
+          <span className="text-gray-400">目标</span>
+          <span className="truncate text-gray-600 dark:text-gray-300" title={loop.target_abs}>{loop.target_abs}</span>
+          <span className="text-gray-400">仓库</span>
+          <span className="truncate text-gray-600 dark:text-gray-300" title={loop.repo_root}>{loop.repo_root}</span>
+          <span className="text-gray-400">Claude</span>
+          <span className="truncate font-mono text-gray-600 dark:text-gray-300" title={loop.claude_session}>{shortId(loop.claude_session)}</span>
+          <span className="text-gray-400">Codex</span>
+          <span className="truncate font-mono text-gray-600 dark:text-gray-300" title={loop.codex_session}>{shortId(loop.codex_session)}</span>
+        </div>
+
         {loop.worktree_path && (
           <div className="mt-1 truncate text-[11px] text-violet-500" title={loop.worktree_path}>
             worktree: {loop.worktree_path}
@@ -78,25 +96,18 @@ export function LoopDetail({ loop, messages, loadingMessages, onCopyConfig, onSt
           </div>
         )}
 
-        <div className="mt-2 flex items-center gap-2">
-          <button
-            onClick={() => onCopyConfig(loop)}
-            className="flex items-center gap-1 rounded-md border border-gray-300 px-2.5 py-1 text-xs text-gray-700 hover:bg-gray-100 dark:border-gray-600 dark:text-gray-200 dark:hover:bg-gray-800"
-            title="把此记录的会话/目标/配置复制进上方新建表单"
-          >
-            <Copy size={12} />
-            用此配置新建
-          </button>
-          {canImplement && (
+        {showImplement && (
+          <div className="mt-2">
             <button
-              onClick={() => onStartImplementation?.(loop)}
-              className="rounded-md bg-emerald-600 px-2.5 py-1 text-xs text-white hover:bg-emerald-700"
-              title="设计已通过复核，承接进入实现阶段"
+              onClick={() => passed && onStartImplementation?.(loop)}
+              disabled={!passed}
+              className="rounded-md bg-emerald-600 px-3 py-1 text-xs text-white hover:bg-emerald-700 disabled:cursor-not-allowed disabled:opacity-50"
+              title={passed ? '设计已通过复核，承接进入实现阶段' : '需设计复核通过（PASS）后才能开始实现'}
             >
               开始实现
             </button>
-          )}
-        </div>
+          </div>
+        )}
       </div>
 
       <div className="min-h-0 flex-1">

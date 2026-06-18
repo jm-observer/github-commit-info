@@ -108,9 +108,14 @@ export default function CodeloopPage() {
   }
   useEffect(refreshLoops, [])
 
-  // 循环结束（done/error）→ 刷新列表，让最新记录终态进列表。
+  // 循环结束（done/error）→ 刷新列表，让最新记录终态进列表；并重载选中记录的往返消息。
   useEffect(() => {
-    if (progress?.phase === 'done' || progress?.phase === 'error') refreshLoops()
+    if (progress?.phase === 'done' || progress?.phase === 'error') {
+      refreshLoops()
+      if (selectedLoopId != null) {
+        CodeloopAPI.loopMessages(selectedLoopId).then(setLoopMsgs).catch(() => {})
+      }
+    }
   }, [progress?.phase])
 
   const handleDeleteLoop = async (id: number) => {
@@ -123,30 +128,17 @@ export default function CodeloopPage() {
     refreshLoops()
   }
 
-  // 点击记录：选中 + 加载该记录往返消息到右侧只读详情面板。**不再回填新建表单**
-  // （避免「看历史」污染「配新循环」）；需要复用配置时用详情面板的「用此配置新建」。
+  // 点击记录：选中 + 加载该记录往返消息到右侧只读详情面板。**不回填新建表单**
+  // （避免「看历史」污染「配新循环」）。顺便刷新列表，保证详情头部状态是最新的。
   const handleSelectLoop = (id: number) => {
     setSelectedLoopId(id)
     setLoadingLoopMsgs(true)
     setLoopMsgs([])
+    refreshLoops()
     CodeloopAPI.loopMessages(id)
       .then(setLoopMsgs)
       .catch(() => {})
       .finally(() => setLoadingLoopMsgs(false))
-  }
-
-  // 显式把某记录配置复制进新建表单（详情面板触发；与选中解耦）。
-  const handleCopyConfig = (rec: LoopRow) => {
-    cursors.current.claude = 0
-    cursors.current.codex = 0
-    setMessages({ codex: [], claude: [] })
-    setClaudeId(rec.claude_session)
-    setCodexId(rec.codex_session)
-    setTargetPath(rec.target_abs)
-    setMode(rec.mode)
-    setMaxRounds(rec.max_rounds)
-    setStepConfirm(rec.step_confirm)
-    setUseWorktree(rec.use_worktree)
   }
 
   // 内联：id → 项目名（cwd 末段名）。空 cwd / 未选 → 空串。用于同项目联动。
@@ -397,7 +389,6 @@ export default function CodeloopPage() {
             loop={loops.find(l => l.id === selectedLoopId) ?? null}
             messages={loopMsgs}
             loadingMessages={loadingLoopMsgs}
-            onCopyConfig={handleCopyConfig}
             onStartImplementation={setImplSource}
           />
         </div>

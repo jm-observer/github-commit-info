@@ -127,13 +127,30 @@ impl Db {
         conn.execute("ALTER TABLE loops ADD COLUMN parent_loop_id INTEGER", [])
             .ok();
 
-        // 残留清理：上次进程崩溃 / abort 留下的 running 记录标为 aborted。
+        // 残留清理：上次进程崩溃 / 应用重启留下的 running 记录。
+        // 先救「其实已通过」的：transcript 里已有 codex_review=pass 即代表循环已通过
+        //（Codex 给 PASS 后循环立即收尾，不可能 pass 后再超时），按 done/pass 修正。
+        // 兼顾 running（本次崩溃残留）与 aborted（历史误标成「超时中止」的旧记录），
+        // total_rounds 取已记录的最大轮次。
+        let ts = now();
+        conn.execute(
+            "UPDATE loops SET status='done', final_verdict='pass',
+                 total_rounds=(SELECT COALESCE(MAX(round),0) FROM loop_messages
+                               WHERE loop_id=loops.id),
+                 updated_at=?1
+             WHERE status IN ('running','aborted') AND EXISTS(
+                 SELECT 1 FROM loop_messages m
+                 WHERE m.loop_id=loops.id AND m.kind='codex_review' AND m.verdict='pass')",
+            params![ts],
+        )
+        .ok();
+        // 其余真正中断的 → aborted/interrupted（明确区别于运行期真超时 aborted_timeout）。
         conn.execute(
             "UPDATE loops SET status='aborted',
-                 final_verdict=COALESCE(final_verdict,'aborted_timeout'),
+                 final_verdict=COALESCE(final_verdict,'interrupted'),
                  updated_at=?1
              WHERE status='running'",
-            params![now()],
+            params![ts],
         )
         .ok();
 

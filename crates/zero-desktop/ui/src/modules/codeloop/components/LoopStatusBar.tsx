@@ -50,6 +50,7 @@ const FINAL_LABELS: Record<string, string> = {
   aborted_timeout: '超时中止',
   aborted_parse: '解析失败中止',
   aborted_by_user: '用户中止（可调整后重启）',
+  interrupted: '中断（应用重启）',
 }
 
 function statusText(running: boolean, p: Progress | null): { text: string; cls: string } {
@@ -125,14 +126,21 @@ export function LoopStatusBar(props: Props) {
           先等 Claude 当前轮完成
         </label>
 
-        <label className="flex items-center gap-1.5 pb-2 text-xs text-gray-600 dark:text-gray-300">
+        <label
+          className="flex items-center gap-1.5 pb-2 text-xs text-gray-600 dark:text-gray-300"
+          title="运行中切换会立即应用到当前循环（取消勾选=转全自动；撞到 ASK_USER 仍会停下问你）"
+        >
           <input
             type="checkbox"
-            checked={props.stepConfirm}
-            onChange={e => props.setStepConfirm(e.target.checked)}
-            disabled={running}
+            // 运行中：复选框反映实时状态（逐步确认 = 非全自动），切换立即应用到当前循环。
+            checked={running ? !props.liveAuto : props.stepConfirm}
+            onChange={e => {
+              const checked = e.target.checked
+              if (running) props.onToggleAuto(!checked)
+              else props.setStepConfirm(checked)
+            }}
           />
-          逐步确认（每次传递先弹窗）
+          逐步确认（每次传递先弹窗）{running && (props.liveAuto ? ' · 当前：全自动' : ' · 当前：逐步')}
         </label>
 
         <label
@@ -235,19 +243,6 @@ export function LoopStatusBar(props: Props) {
           <span className="truncate text-red-500" title={p.error}>
             {p.error}
           </span>
-        )}
-        {running && (
-          <label
-            className="flex cursor-pointer items-center gap-1.5 text-gray-600 dark:text-gray-300"
-            title="转全自动后不再逐步确认；撞到 ASK_USER 仍会停下问你"
-          >
-            <input
-              type="checkbox"
-              checked={props.liveAuto}
-              onChange={e => props.onToggleAuto(e.target.checked)}
-            />
-            {props.liveAuto ? '全自动（不再逐步确认）' : '逐步确认中'}
-          </label>
         )}
         {running && (
           <span className="text-amber-600 dark:text-amber-400">

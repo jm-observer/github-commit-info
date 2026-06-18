@@ -23,6 +23,7 @@ const FINAL_LABELS: Record<string, string> = {
   aborted_timeout: '超时',
   aborted_parse: '解析失败',
   aborted_by_user: '用户中止',
+  interrupted: '中断',
 }
 
 function shortTime(iso: string): string {
