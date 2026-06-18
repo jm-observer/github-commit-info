@@ -590,8 +590,7 @@ async fn run_one_connection(
                     let (do_paste, paste_window_ms) = {
                         let s = read_lock(&llm_settings_r);
                         (
-                            s.auto_paste
-                                && matches!(s.auto_copy_mode, AutoCopyMode::OptimizedZh),
+                            s.auto_paste && matches!(s.auto_copy_mode, AutoCopyMode::OptimizedZh),
                             s.merge_window_ms,
                         )
                     };

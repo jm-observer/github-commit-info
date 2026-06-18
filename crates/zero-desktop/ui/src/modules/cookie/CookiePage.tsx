@@ -18,9 +18,11 @@ import {
 
 // ============ 类型定义 ============
 
-interface AppSettings {
+interface NetStatus {
+  mode: "auto" | "lan" | "wan";
+  picked: "auto" | "lan" | "wan";
   g10_base: string;
-  g10_token?: string;
+  configured: boolean;
 }
 
 interface CookieSummary {
@@ -129,11 +131,15 @@ function ActionButton({
 function G10SettingsSection() {
   const navigate = useNavigate();
   const [g10Base, setG10Base] = useState<string>("");
+  const [picked, setPicked] = useState<string>("");
 
   useEffect(() => {
-    invoke<AppSettings>("cookie_get_app_settings")
-      .then((s) => setG10Base(s.g10_base || ""))
-      .catch((e) => console.error("load app settings:", e));
+    invoke<NetStatus>("net_resolve_status")
+      .then((s) => {
+        setG10Base(s.configured ? s.g10_base : "");
+        setPicked(s.picked === "lan" ? "局域网" : s.picked === "wan" ? "外网" : "");
+      })
+      .catch((e) => console.error("load net status:", e));
   }, []);
 
   return (
@@ -146,9 +152,11 @@ function G10SettingsSection() {
       </div>
       <div className="space-y-2">
         <div>
-          <span className="text-xs text-gray-500 dark:text-gray-400">G10 Base URL：</span>
+          <span className="text-xs text-gray-500 dark:text-gray-400">当前生效 G10：</span>
           <span className="ml-1 text-sm font-mono text-gray-800 dark:text-gray-200">
-            {g10Base || <span className="text-yellow-600 dark:text-yellow-400">未配置</span>}
+            {g10Base
+              ? <>{g10Base}{picked && <span className="ml-1 text-xs text-blue-600 dark:text-blue-400">（{picked}）</span>}</>
+              : <span className="text-yellow-600 dark:text-yellow-400">未配置</span>}
           </span>
         </div>
         <div>

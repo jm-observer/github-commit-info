@@ -3,7 +3,7 @@ use std::sync::Arc;
 use std::time::Duration;
 use tauri::State;
 
-use crate::{app_state::AppState, shared::settings::load_app_settings};
+use crate::app_state::AppState;
 
 /// TTS 生成可能 10s+（首次懒加载更久），与 toolkit-server 代理超时（180s）对齐。
 const TTS_TIMEOUT: Duration = Duration::from_secs(180);
@@ -29,11 +29,11 @@ pub fn english_ping() -> &'static str {
     "ok"
 }
 
-/// 返回 app.json 中配置的 g10_base（用于 ApiService 的 apiBase）。
+/// 返回当前生效路径的 g10_base（用于 ApiService 的 apiBase）；按局域网/外网模式解析。
 /// 若未配置返回空字符串，前端应抛错引导用户到设置页配置。
 #[tauri::command]
-pub fn english_get_g10_base(state: State<'_, AppState>) -> String {
-    load_app_settings(&state.workspace).g10_base
+pub async fn english_get_g10_base(state: State<'_, AppState>) -> Result<String, String> {
+    Ok(state.net.resolve(&state.workspace).await.g10_base)
 }
 
 /// 返回 english 音频缓存目录的绝对路径（用于 FileCacheManager 的根路径）。
@@ -61,17 +61,17 @@ fn map_status_err(prefix: &str, status: reqwest::StatusCode, body: &str) -> Stri
 /// 查询音色库：GET `{g10_base}/api/web/audio/voices`，回传上游 JSON（前端自行解析形态）。
 #[tauri::command]
 pub async fn english_tts_voices(state: State<'_, AppState>) -> Result<serde_json::Value, String> {
-    let settings = load_app_settings(&state.workspace);
-    let endpoint = settings
+    let resolved = state.net.resolve(&state.workspace).await;
+    let endpoint = resolved
         .voices_endpoint()
-        .ok_or_else(|| "G10 base 未配置，请到设置页填写 g10_base".to_string())?;
+        .ok_or_else(|| "G10 base 未配置，请到设置页填写局域网/外网地址".to_string())?;
 
     let client = reqwest::Client::builder()
         .timeout(VOICES_TIMEOUT)
         .build()
         .map_err(|e| e.to_string())?;
     let mut req = client.get(&endpoint);
-    if let Some(tok) = settings.g10_token.as_deref().filter(|s| !s.is_empty()) {
+    if let Some(tok) = resolved.g10_token.as_deref().filter(|s| !s.is_empty()) {
         req = req.bearer_auth(tok);
     }
     let resp = req.send().await.map_err(|e| format!("查询音色失败: {e}"))?;
@@ -100,10 +100,10 @@ pub async fn english_tts_preview(
     if text.is_empty() {
         return Err("文本不能为空".to_string());
     }
-    let settings = load_app_settings(&state.workspace);
-    let endpoint = settings
+    let resolved = state.net.resolve(&state.workspace).await;
+    let endpoint = resolved
         .tts_endpoint()
-        .ok_or_else(|| "G10 base 未配置，请到设置页填写 g10_base".to_string())?;
+        .ok_or_else(|| "G10 base 未配置，请到设置页填写局域网/外网地址".to_string())?;
 
     let mut body = serde_json::json!({ "text": text, "voice_id": voice_id });
     if let Some(sp) = speed {
@@ -115,7 +115,7 @@ pub async fn english_tts_preview(
         .build()
         .map_err(|e| e.to_string())?;
     let mut req = client.post(&endpoint).json(&body);
-    if let Some(tok) = settings.g10_token.as_deref().filter(|s| !s.is_empty()) {
+    if let Some(tok) = resolved.g10_token.as_deref().filter(|s| !s.is_empty()) {
         req = req.bearer_auth(tok);
     }
     let resp = req.send().await.map_err(|e| format!("TTS 请求失败: {e}"))?;
@@ -166,10 +166,10 @@ pub async fn english_replace_sentence_audio(
         .await
         .map_err(|e| format!("读预览文件失败（请先生成预览）: {e}"))?;
 
-    let settings = load_app_settings(&state.workspace);
-    let endpoint = settings
+    let resolved = state.net.resolve(&state.workspace).await;
+    let endpoint = resolved
         .replace_sentence_audio_endpoint()
-        .ok_or_else(|| "G10 base 未配置，请到设置页填写 g10_base".to_string())?;
+        .ok_or_else(|| "G10 base 未配置，请到设置页填写局域网/外网地址".to_string())?;
 
     let part = reqwest::multipart::Part::bytes(bytes)
         .file_name(format!("{audio_id}.wav"))
@@ -186,7 +186,7 @@ pub async fn english_replace_sentence_audio(
         .build()
         .map_err(|e| e.to_string())?;
     let mut req = client.post(&endpoint).multipart(form);
-    if let Some(tok) = settings.g10_token.as_deref().filter(|s| !s.is_empty()) {
+    if let Some(tok) = resolved.g10_token.as_deref().filter(|s| !s.is_empty()) {
         req = req.bearer_auth(tok);
     }
     let resp = req.send().await.map_err(|e| format!("替换请求失败: {e}"))?;

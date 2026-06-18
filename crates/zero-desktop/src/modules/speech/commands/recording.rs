@@ -36,13 +36,19 @@ pub async fn speech_start_recording(
         return Err(span.fail("Already recording".to_string()));
     }
 
+    // 局域网/外网活动路径若配了 ASR 地址，优先用它（与 g10 代理同节点同步切换），并写回
+    // SpeechState.remote_url 让 history / base 推导保持一致；未配则回退用户在语音面板自存的地址。
+    let resolved = state.net.resolve(&state.workspace).await;
+    if !resolved.asr_url.is_empty() {
+        *write_lock(&speech.remote_url) = resolved.asr_url.clone();
+    }
     let Some(url) =
         crate::modules::speech::commands::remote::remote_url_from_state(&speech.remote_url)
     else {
         speech.recording.store(false, Ordering::SeqCst);
         return Err(span.fail("远程识别地址未配置(请在控制面板里设置)".to_string()));
     };
-    info!(target: "speech", "[speech_start_recording] remote mode -> {url}");
+    info!(target: "speech", "[speech_start_recording] remote mode -> {url} (picked={:?})", resolved.picked);
     speech.stop_signal.store(false, Ordering::Relaxed);
     speech.init_status.store(1, Ordering::Relaxed);
     *write_lock(&speech.init_error) = String::new();

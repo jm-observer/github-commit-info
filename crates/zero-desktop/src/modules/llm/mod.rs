@@ -8,7 +8,7 @@
 use std::time::Duration;
 use tauri::State;
 
-use crate::{app_state::AppState, shared::settings::load_app_settings};
+use crate::app_state::AppState;
 
 /// 配置 / 提示词读写很快。
 const QUICK_TIMEOUT: Duration = Duration::from_secs(20);
@@ -43,10 +43,10 @@ async fn request_json(
     timeout: Duration,
     prefix: &str,
 ) -> Result<serde_json::Value, String> {
-    let settings = load_app_settings(&state.workspace);
-    let endpoint = settings
+    let resolved = state.net.resolve(&state.workspace).await;
+    let endpoint = resolved
         .llm_endpoint(path)
-        .ok_or_else(|| "G10 base 未配置，请到设置页填写 g10_base".to_string())?;
+        .ok_or_else(|| "G10 base 未配置，请到设置页填写局域网/外网地址".to_string())?;
 
     let client = reqwest::Client::builder()
         .timeout(timeout)
@@ -56,7 +56,7 @@ async fn request_json(
     if let Some(b) = body {
         req = req.json(&b);
     }
-    if let Some(tok) = settings.g10_token.as_deref().filter(|s| !s.is_empty()) {
+    if let Some(tok) = resolved.g10_token.as_deref().filter(|s| !s.is_empty()) {
         req = req.bearer_auth(tok);
     }
     let resp = req.send().await.map_err(|e| format!("{prefix}：{e}"))?;

@@ -43,7 +43,9 @@ impl CookieState {
 
 /// 初始化 Cookie 模块：启动 uploader、bridge、ths_watcher 后台任务。
 pub fn setup(app: &tauri::AppHandle, state: Arc<CookieState>) -> Result<()> {
-    uploader::spawn(app.clone(), state.clone());
+    use tauri::Manager;
+    let net = app.state::<crate::app_state::AppState>().net.clone();
+    uploader::spawn(app.clone(), state.clone(), net);
     bridge::spawn(
         state.workspace.clone(),
         state.douyin_browser.clone(),
@@ -70,11 +72,48 @@ pub fn cookie_get_app_settings(
 }
 
 #[tauri::command]
-pub fn cookie_save_app_settings(
+pub async fn cookie_save_app_settings(
     state: tauri::State<'_, crate::app_state::AppState>,
     settings_data: settings::AppSettings,
 ) -> Result<(), String> {
-    settings::save_app_settings(&state.workspace, &settings_data).map_err(|e| format!("{e:#}"))
+    settings::save_app_settings(&state.workspace, &settings_data).map_err(|e| format!("{e:#}"))?;
+    // 配置变更后立即失效探测缓存，下次请求按新地址重探/选路。
+    state.net.invalidate().await;
+    Ok(())
+}
+
+// ============ 局域网/外网活动端点状态 ============
+
+/// 返回当前生效的网络路径（供设置页状态条展示）：用户选的 `mode` + 实际选中的 `picked`
+/// （auto 模式下经健康探测得出）+ 生效的 g10/asr 地址 + 该地址是否可达。
+#[tauri::command]
+pub async fn net_resolve_status(
+    state: tauri::State<'_, crate::app_state::AppState>,
+) -> Result<serde_json::Value, String> {
+    let app_settings = settings::load_app_settings(&state.workspace);
+    let resolved = state.net.resolve(&state.workspace).await;
+    let reachable = if resolved.is_configured() {
+        Some(settings::health_ok(&resolved.g10_base).await)
+    } else {
+        None
+    };
+    Ok(serde_json::json!({
+        "mode": app_settings.mode,
+        "picked": resolved.picked,
+        "g10_base": resolved.g10_base,
+        "asr_url": resolved.asr_url,
+        "configured": resolved.is_configured(),
+        "reachable": reachable,
+    }))
+}
+
+/// 强制重新探测（清缓存后再解析），返回与 [`net_resolve_status`] 相同的状态。
+#[tauri::command]
+pub async fn net_reprobe(
+    state: tauri::State<'_, crate::app_state::AppState>,
+) -> Result<serde_json::Value, String> {
+    state.net.invalidate().await;
+    net_resolve_status(state).await
 }
 
 // ============ 抖音登录窗（Chrome 子进程） ============
@@ -156,12 +195,13 @@ pub async fn cookie_track_current_creator(
         .map_err(|e| span.fail(e.to_string()))?
         .ok_or_else(|| span.fail("没有打开抖音登录窗口或读 URL 失败".to_string()))?;
 
-    let app_settings = settings::load_app_settings(&state.workspace);
-    if !app_settings.is_configured() {
+    let resolved = state.net.resolve(&state.workspace).await;
+    if !resolved.is_configured() {
         return Err(span.fail("G10 base 未配置".to_string()));
     }
-    let base = app_settings.g10_base.trim_end_matches('/');
-    let endpoint = format!("{base}/api/web/douyin/creators");
+    let endpoint = resolved
+        .endpoint("/api/web/douyin/creators")
+        .ok_or_else(|| span.fail("G10 base 未配置".to_string()))?;
 
     let client = reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(20))
@@ -170,7 +210,7 @@ pub async fn cookie_track_current_creator(
     let mut req = client
         .post(&endpoint)
         .json(&serde_json::json!({ "handle": url }));
-    if let Some(tok) = app_settings.g10_token.as_deref().filter(|s| !s.is_empty()) {
+    if let Some(tok) = resolved.g10_token.as_deref().filter(|s| !s.is_empty()) {
         req = req.bearer_auth(tok);
     }
     let resp = req.send().await.map_err(|e| span.fail(e.to_string()))?;
@@ -249,11 +289,11 @@ pub async fn cookie_login_expiry(
 pub async fn cookie_ping_server(
     state: tauri::State<'_, crate::app_state::AppState>,
 ) -> Result<serde_json::Value, String> {
-    let app_settings = settings::load_app_settings(&state.workspace);
-    if !app_settings.is_configured() {
+    let resolved = state.net.resolve(&state.workspace).await;
+    if !resolved.is_configured() {
         return Ok(serde_json::json!({ "state": "unconfigured" }));
     }
-    let base = app_settings.g10_base.trim_end_matches('/');
+    let base = resolved.g10_base.trim_end_matches('/');
     let url = format!("{base}/api/web/health");
     let client = reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(3))
@@ -347,18 +387,18 @@ pub async fn cookie_inspect_cookies(
 pub async fn cookie_server_cookie_status(
     state: tauri::State<'_, crate::app_state::AppState>,
 ) -> Result<serde_json::Value, String> {
-    let app_settings = settings::load_app_settings(&state.workspace);
-    if !app_settings.is_configured() {
+    let resolved = state.net.resolve(&state.workspace).await;
+    if !resolved.is_configured() {
         return Ok(serde_json::json!({ "state": "unconfigured" }));
     }
-    let base = app_settings.g10_base.trim_end_matches('/');
+    let base = resolved.g10_base.trim_end_matches('/');
     let url = format!("{base}/api/web/douyin/cookie_status");
     let client = reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(4))
         .build()
         .map_err(|e| e.to_string())?;
     let mut req = client.get(&url);
-    if let Some(tok) = app_settings.g10_token.as_deref().filter(|s| !s.is_empty()) {
+    if let Some(tok) = resolved.g10_token.as_deref().filter(|s| !s.is_empty()) {
         req = req.bearer_auth(tok);
     }
     match req.send().await {

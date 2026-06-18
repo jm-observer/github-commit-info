@@ -103,6 +103,15 @@ fn run_gui(workspace: PathBuf) -> Result<()> {
         .plugin(tauri_plugin_clipboard_manager::init())
         .plugin(tauri_plugin_notification::init())
         .manage(state.clone())
+        .on_window_event(|window, event| {
+            // 窗口重新聚焦时失效活动端点探测缓存：用户可能刚切换了网络（回家/外出），
+            // 下次请求据此重新探测局域网可达性、自动选路。
+            if let tauri::WindowEvent::Focused(true) = event {
+                use tauri::Manager;
+                let net = window.state::<AppState>().net.clone();
+                tauri::async_runtime::spawn(async move { net.invalidate().await });
+            }
+        })
         .invoke_handler(tauri::generate_handler![
             // 通用
             shared::console::open_url,
@@ -136,6 +145,8 @@ fn run_gui(workspace: PathBuf) -> Result<()> {
             modules::cookie::cookie_workspace_path,
             modules::cookie::cookie_get_app_settings,
             modules::cookie::cookie_save_app_settings,
+            modules::cookie::net_resolve_status,
+            modules::cookie::net_reprobe,
             modules::cookie::cookie_open_douyin_login,
             modules::cookie::cookie_close_douyin_login,
             modules::cookie::cookie_open_ths_login,

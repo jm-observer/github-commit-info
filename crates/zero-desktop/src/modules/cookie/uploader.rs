@@ -7,7 +7,7 @@
 //! 4. POST `<g10_base>/api/browser/cookie`，body `{session_id, raw_header}`
 //! 5. 落 state.db + 事件通知前端
 
-use crate::shared::settings;
+use crate::shared::settings::NetResolver;
 use anyhow::{anyhow, Result};
 use custom_utils::trace::{self, SpanScope, SpanStatus, TraceContext};
 use sha2::{Digest, Sha256};
@@ -55,7 +55,7 @@ impl UploaderState {
     }
 }
 
-pub fn spawn(app: AppHandle, state: Arc<CookieState>) {
+pub fn spawn(app: AppHandle, state: Arc<CookieState>, net: Arc<NetResolver>) {
     tauri::async_runtime::spawn(async move {
         // 顶层 anchor span：仅 emit_start，长循环不 emit_end。
         let _loop_scope = trace::enabled().then(|| {
@@ -77,7 +77,7 @@ pub fn spawn(app: AppHandle, state: Arc<CookieState>) {
         ticker.tick().await;
         loop {
             ticker.tick().await;
-            if let Err(e) = tick(&app, &state, &client).await {
+            if let Err(e) = tick(&app, &state, &net, &client).await {
                 log::warn!("uploader tick: {e:#}");
                 let _ = app.emit("uploader:status", json_err(&e.to_string()));
             }
@@ -85,9 +85,14 @@ pub fn spawn(app: AppHandle, state: Arc<CookieState>) {
     });
 }
 
-async fn tick(app: &AppHandle, state: &Arc<CookieState>, client: &reqwest::Client) -> Result<()> {
-    let app_settings = settings::load_app_settings(&state.workspace);
-    let Some(endpoint) = app_settings.cookie_endpoint() else {
+async fn tick(
+    app: &AppHandle,
+    state: &Arc<CookieState>,
+    net: &Arc<NetResolver>,
+    client: &reqwest::Client,
+) -> Result<()> {
+    let resolved = net.resolve(&state.workspace).await;
+    let Some(endpoint) = resolved.cookie_endpoint() else {
         let _ = app.emit(
             "uploader:status",
             serde_json::json!({ "state": "unconfigured", "hint": "填 G10 base 并保存" }),
@@ -169,7 +174,7 @@ async fn tick(app: &AppHandle, state: &Arc<CookieState>, client: &reqwest::Clien
 
     let body = serde_json::json!({ "session_id": session_id, "raw_header": raw_header });
     let mut req = client.post(&endpoint).json(&body);
-    if let Some(tok) = app_settings.g10_token.as_deref().filter(|s| !s.is_empty()) {
+    if let Some(tok) = resolved.g10_token.as_deref().filter(|s| !s.is_empty()) {
         req = req.bearer_auth(tok);
     }
     // A.4：注入 W3C traceparent，让 G10 端的 cookie 接收请求接入同一条 trace。

@@ -2,6 +2,7 @@ use crate::modules::{
     codeloop::CodeloopState, cookie::CookieState, english::EnglishState,
     g10_deploy::G10DeployState, music::MusicState, net_policy::NetPolicyState, speech::SpeechState,
 };
+use crate::shared::settings::NetResolver;
 use crate::shared::workspace::speech_db_path;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -10,6 +11,8 @@ use std::sync::Arc;
 #[derive(Clone)]
 pub struct AppState {
     pub workspace: PathBuf,
+    /// 局域网/外网活动端点解析器（带健康探测缓存，全应用共享）。
+    pub net: Arc<NetResolver>,
     pub english: Arc<EnglishState>,
     pub speech: Arc<SpeechState>,
     pub cookie: Arc<CookieState>,
@@ -29,6 +32,7 @@ impl AppState {
         let codeloop = Arc::new(CodeloopState::new(&workspace)?);
         Ok(Self {
             workspace,
+            net: Arc::new(NetResolver::new()),
             english: Arc::new(EnglishState::default()),
             speech,
             cookie,

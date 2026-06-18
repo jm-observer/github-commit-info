@@ -16,7 +16,6 @@ use serde::Serialize;
 use tracing::info;
 
 use crate::app_state::AppState;
-use crate::shared::settings::load_app_settings;
 
 /// 清洗（开 Demucs 整段清洗）可能数分钟，与上游 `MAX_DURATION_SEC=600` / 代理超时对齐。
 const CLEAN_TIMEOUT: Duration = Duration::from_secs(600);
@@ -162,11 +161,11 @@ pub async fn speech_clean_recording(
         }
     }
 
-    // 后端自取全局配置（与 cookie/english 同源），拼端点 + Bearer。
-    let app_settings = load_app_settings(&state.workspace);
-    let endpoint = app_settings
+    // 后端自取全局配置（与 cookie/english 同源），按局域网/外网模式解析端点 + Bearer。
+    let resolved = state.net.resolve(&state.workspace).await;
+    let endpoint = resolved
         .clean_endpoint()
-        .ok_or_else(|| "G10 base 未配置，请到设置页填写 g10_base".to_string())?;
+        .ok_or_else(|| "G10 base 未配置，请到设置页填写局域网/外网地址".to_string())?;
 
     let input = PathBuf::from(&input_path);
     let bytes = tokio::fs::read(&input)
@@ -214,7 +213,7 @@ pub async fn speech_clean_recording(
         .build()
         .map_err(|e| e.to_string())?;
     let mut req = client.post(&endpoint).multipart(form);
-    if let Some(tok) = app_settings.g10_token.as_deref().filter(|s| !s.is_empty()) {
+    if let Some(tok) = resolved.g10_token.as_deref().filter(|s| !s.is_empty()) {
         req = req.bearer_auth(tok);
     }
     let resp = req.send().await.map_err(|e| format!("清洗请求失败: {e}"))?;
