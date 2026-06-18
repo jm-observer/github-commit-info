@@ -12,8 +12,9 @@ mod registry;
 use crate::app_state::AppState;
 use registry::ServiceDef;
 use serde::Serialize;
+use std::collections::HashSet;
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Mutex;
 use std::time::Duration;
 use tauri::{Emitter, State};
 
@@ -25,15 +26,16 @@ pub const DEPLOY_DONE_EVENT: &str = "g10-deploy://done";
 /// g10-deploy 模块状态。
 pub struct G10DeployState {
     pub workspace: PathBuf,
-    /// 全局部署互斥：同一时刻只允许一个部署在跑（交叉编译/scp 重，且共享 docker 卷/ssh）。
-    deploying: AtomicBool,
+    /// 正在部署中的服务名集合。**按服务并发**：不同服务可同时部署（各仓 docker 缓存卷/target
+    /// 目录互相独立，互不冲突），同一服务不可重入（防重复点）。
+    deploying: Mutex<HashSet<String>>,
 }
 
 impl G10DeployState {
     pub fn new(workspace: PathBuf) -> Self {
         Self {
             workspace,
-            deploying: AtomicBool::new(false),
+            deploying: Mutex::new(HashSet::new()),
         }
     }
 }
@@ -112,8 +114,11 @@ pub async fn g10_probe_service(
         });
     }
 
+    // 接受自签证书：english 等服务 prod feature 跑 HTTPS（自签），健康端点是 https://…/health。
+    // 这是内网 G10 面板的连通性探测，放宽证书校验可让 https 自签服务也能探到绿灯。
     let client = reqwest::Client::builder()
         .timeout(Duration::from_secs(4))
+        .danger_accept_invalid_certs(true)
         .build()
         .map_err(err)?;
 
@@ -163,74 +168,6 @@ pub async fn g10_probe_service(
         },
     };
     Ok(result)
-}
-
-// ============ 端口连通性（TCP 探测各服务登记端口是否在监听） ============
-
-#[derive(Serialize)]
-pub struct PortStatus {
-    pub port: u16,
-    pub note: String,
-    /// TCP 能否连上（在监听）。
-    pub open: bool,
-    pub latency_ms: Option<u64>,
-    pub error: Option<String>,
-}
-
-#[derive(Serialize)]
-pub struct PortsResult {
-    pub name: String,
-    pub host: String,
-    pub ports: Vec<PortStatus>,
-}
-
-/// 单端口 TCP 连接超时。
-const PORT_PROBE_TIMEOUT: Duration = Duration::from_millis(1500);
-
-/// TCP 探测某服务在 G10 主机上登记的各端口是否在监听（仅 connect，不发数据）。
-/// 端口未登记则返回空列表。用 `std::net::TcpStream::connect_timeout`（spawn_blocking），
-/// 无需 tokio net feature。
-#[tauri::command]
-pub async fn g10_probe_ports(
-    state: State<'_, AppState>,
-    name: String,
-) -> Result<PortsResult, String> {
-    let svc = find_service(&state.g10_deploy, &name)?;
-    let host = svc.host.clone();
-    let ports = svc.ports.clone();
-    let probed = tokio::task::spawn_blocking(move || {
-        use std::net::{TcpStream, ToSocketAddrs};
-        ports
-            .into_iter()
-            .map(|p| {
-                let started = std::time::Instant::now();
-                let (open, error) = match (host.as_str(), p.port).to_socket_addrs() {
-                    Ok(mut addrs) => match addrs.next() {
-                        Some(addr) => match TcpStream::connect_timeout(&addr, PORT_PROBE_TIMEOUT) {
-                            Ok(_) => (true, None),
-                            Err(e) => (false, Some(e.to_string())),
-                        },
-                        None => (false, Some("无法解析地址".into())),
-                    },
-                    Err(e) => (false, Some(format!("解析 {host} 失败：{e}"))),
-                };
-                PortStatus {
-                    port: p.port,
-                    note: p.note,
-                    open,
-                    latency_ms: open.then(|| started.elapsed().as_millis() as u64),
-                    error,
-                }
-            })
-            .collect::<Vec<_>>()
-    })
-    .await
-    .map_err(err)?;
-    Ok(PortsResult {
-        name,
-        host: svc.host,
-        ports: probed,
-    })
 }
 
 // ============ 本地编译版（git 短哈希 + 是否有未提交改动） ============
@@ -320,15 +257,18 @@ struct DeployDone {
     error: Option<String>,
 }
 
-/// 是否有部署正在进行（前端进页/轮询用，避免并发触发）。
+/// 当前正在部署中的服务名列表（前端进页时据此恢复"哪些服务部署中"的状态）。
 #[tauri::command]
-pub fn g10_is_deploying(state: State<'_, AppState>) -> bool {
-    state.g10_deploy.deploying.load(Ordering::SeqCst)
+pub fn g10_deploying_services(state: State<'_, AppState>) -> Vec<String> {
+    let set = state.g10_deploy.deploying.lock().unwrap();
+    let mut v: Vec<String> = set.iter().cloned().collect();
+    v.sort();
+    v
 }
 
 /// 触发一键部署：以仓库根为 cwd 起 `pwsh -File <script> <args...>`，stdout/stderr 逐行
 /// emit `g10-deploy://log`，结束 emit `g10-deploy://done`。命令本身**立即返回**（后台跑）。
-/// 同一时刻仅允许一个部署（全局互斥）。
+/// **按服务并发**：不同服务可同时部署；同一服务部署中则拒绝重入。
 #[tauri::command]
 pub async fn g10_deploy(
     app: tauri::AppHandle,
@@ -350,22 +290,13 @@ pub async fn g10_deploy(
         return Err(format!("部署脚本不存在：{}", script_path.display()));
     }
 
-    // 端口分配链路：把 registry 主端口（ports[0]）拼成 `0.0.0.0:<port>` 作为 `-Bind`
-    // 追加进部署脚本参数，脚本据此在安装时写 unit 的 `Environment=TOOLKIT_BIND=<bind>`。
-    // 脚本已有 `-Bind` 显式参数时不重复追加（registry args 优先）。
-    let mut deploy_args = deploy.args.clone();
-    if let Some(primary) = svc.ports.first() {
-        let has_bind = deploy_args.iter().any(|a| a.eq_ignore_ascii_case("-Bind"));
-        if !has_bind {
-            deploy_args.push("-Bind".into());
-            deploy_args.push(format!("0.0.0.0:{}", primary.port));
-        }
-    }
-
     // 动态环境变量注入：把 registry 的 env 拼成 `-Env KEY=VAL,KEY2=VAL2` 单参追加，脚本据此
-    // 逐条转发为 `install --env KEY=VAL`（custom-utils 0.16 注入 unit 的 `Environment=`）。
+    // 逐条转发为 `install -e KEY=VAL`（custom-utils 0.16 注入 unit 的 `Environment=`）。
+    // **端口即其中的 `<SERVICE>_BIND` 一条**——不再单独走 `-Bind`，统一从 env 注入（脚本默认
+    // `-Bind` 作兜底，env 里的同名 `<SERVICE>_BIND` 后置覆盖之）。
     // 用逗号分隔（PowerShell `[string[]]` 数组的 `-File` 传参约定），故 value 不应含逗号。
     // 脚本已显式带 `-Env` 时不重复追加（registry args 优先）。
+    let mut deploy_args = deploy.args.clone();
     if !svc.env.is_empty() {
         let has_env = deploy_args.iter().any(|a| a.eq_ignore_ascii_case("-Env"));
         if !has_env {
@@ -380,21 +311,21 @@ pub async fn g10_deploy(
         }
     }
 
-    // 抢占部署锁（compare_exchange 保证只有一个能拿到）。
-    if gs
-        .deploying
-        .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
-        .is_err()
+    // 抢占该服务的部署位：同一服务部署中则拒绝重入；不同服务可并发。
     {
-        return Err("已有部署正在进行，请等待其完成".into());
+        let mut set = gs.deploying.lock().unwrap();
+        if set.contains(&name) {
+            return Err(format!("{} 已在部署中，请等待其完成", svc.label));
+        }
+        set.insert(name.clone());
     }
 
     let name_for_task = name.clone();
     let app_bg = app.clone();
     tokio::spawn(async move {
         let result = run_deploy(&app_bg, &name_for_task, &repo, &deploy.script, &deploy_args).await;
-        // 无论成败，释放部署锁。
-        gs.deploying.store(false, Ordering::SeqCst);
+        // 无论成败，释放该服务的部署位。
+        gs.deploying.lock().unwrap().remove(&name_for_task);
         let done = match result {
             Ok(code) => DeployDone {
                 name: name_for_task.clone(),

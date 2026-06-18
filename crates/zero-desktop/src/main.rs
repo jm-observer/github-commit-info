@@ -189,9 +189,8 @@ fn run_gui(workspace: PathBuf) -> Result<()> {
             modules::g10_deploy::g10_list_services,
             modules::g10_deploy::g10_save_services,
             modules::g10_deploy::g10_probe_service,
-            modules::g10_deploy::g10_probe_ports,
             modules::g10_deploy::g10_local_version,
-            modules::g10_deploy::g10_is_deploying,
+            modules::g10_deploy::g10_deploying_services,
             modules::g10_deploy::g10_deploy,
             // music 模块（本地音乐原生后端播放 + WASAPI 独占 bit-perfect）
             modules::music::music_pick_folder,

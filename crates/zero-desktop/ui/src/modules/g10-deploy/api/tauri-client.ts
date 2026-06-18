@@ -8,15 +8,15 @@ export interface DeployDef {
   args: string[]
 }
 
-export interface PortInfo {
-  port: number
-  note: string
-}
-
-/** 安装时注入 systemd unit 的环境变量（KEY=VAL）。value 不应含逗号（部署链路用逗号分隔多条）。 */
+/**
+ * 安装时注入 systemd unit 的环境变量（KEY=VAL + 可选备注）。
+ * value 不应含逗号（部署链路用逗号分隔多条 -Env）。**端口即其中的 `<SERVICE>_BIND` 一条**。
+ */
 export interface EnvVar {
   key: string
   value: string
+  /** 备注（可选；说明该变量用途，如「监听地址 host:port」）。 */
+  note: string
 }
 
 export interface ServiceDef {
@@ -24,32 +24,14 @@ export interface ServiceDef {
   label: string
   note: string
   repo_dir: string
+  /** HTTP 健康端点（面板可编辑；https 自签也能探，探测已放宽证书校验）。 */
   health_url: string
   remote_service: string | null
   /** 服务 web 后台地址；空串 = 无后台。 */
   web_url: string
-  /** G10 上该服务所在主机（端口探测目标）。 */
-  host: string
-  /** 该服务监听/占用的端口清单。 */
-  ports: PortInfo[]
   /** 安装时动态注入 systemd unit 的环境变量；部署时拼成 `-Env KEY=VAL,...` 传给脚本。 */
   env: EnvVar[]
   deploy: DeployDef | null
-}
-
-export interface PortStatus {
-  port: number
-  note: string
-  /** TCP 能否连上（在监听）。 */
-  open: boolean
-  latency_ms: number | null
-  error: string | null
-}
-
-export interface PortsResult {
-  name: string
-  host: string
-  ports: PortStatus[]
 }
 
 export interface ServiceList {
@@ -94,9 +76,9 @@ export const G10DeployAPI = {
   saveServices: (services: ServiceDef[]) =>
     invoke<void>('g10_save_services', { services }),
   probe: (name: string) => invoke<ProbeResult>('g10_probe_service', { name }),
-  probePorts: (name: string) => invoke<PortsResult>('g10_probe_ports', { name }),
   localVersion: (name: string) => invoke<LocalVersion>('g10_local_version', { name }),
-  isDeploying: () => invoke<boolean>('g10_is_deploying'),
+  /** 当前正在部署中的服务名列表（进页恢复"部署中"状态用）。 */
+  deployingServices: () => invoke<string[]>('g10_deploying_services'),
   deploy: (name: string) => invoke<void>('g10_deploy', { name }),
 }
 
