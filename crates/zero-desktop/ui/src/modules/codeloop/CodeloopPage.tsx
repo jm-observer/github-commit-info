@@ -390,6 +390,9 @@ export default function CodeloopPage() {
             messages={loopMsgs}
             loadingMessages={loadingLoopMsgs}
             onStartImplementation={setImplSource}
+            running={running}
+            liveAuto={liveAuto}
+            onToggleAuto={handleToggleAuto}
           />
         </div>
       </div>

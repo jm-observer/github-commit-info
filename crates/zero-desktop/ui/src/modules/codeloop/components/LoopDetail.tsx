@@ -8,6 +8,12 @@ interface Props {
   loadingMessages: boolean
   /** 「开始实现」：仅当该 design 记录最终 PASS 时可点，承接进入实现阶段。 */
   onStartImplementation?: (loop: LoopRow) => void
+  /** 是否有循环正在运行（全局态）。 */
+  running?: boolean
+  /** 运行中的循环当前是否已转全自动（= !step_confirm）；live 时用它实时反映逐步确认态。 */
+  liveAuto?: boolean
+  /** 运行中翻转自动确认：true=转全自动 / false=恢复逐步确认。仅对运行中的记录可用。 */
+  onToggleAuto?: (enabled: boolean) => void
 }
 
 const STATUS_STYLE: Record<string, { label: string; cls: string }> = {
@@ -32,7 +38,15 @@ function shortId(id: string): string {
 }
 
 /** 选中记录的只读详情面板：配置 + 状态 + 往返消息 + 上下文操作。 */
-export function LoopDetail({ loop, messages, loadingMessages, onStartImplementation }: Props) {
+export function LoopDetail({
+  loop,
+  messages,
+  loadingMessages,
+  onStartImplementation,
+  running = false,
+  liveAuto = false,
+  onToggleAuto,
+}: Props) {
   if (!loop) {
     return (
       <div className="flex h-full items-center justify-center rounded-md border border-gray-200 text-xs text-gray-400 dark:border-gray-800">
@@ -45,6 +59,10 @@ export function LoopDetail({ loop, messages, loadingMessages, onStartImplementat
   // 「开始实现」门槛：design 模式且确实通过复核（done + PASS）。
   const passed = loop.status === 'done' && loop.final_verdict === 'pass'
   const showImplement = loop.mode === 'design'
+  // 该记录是否就是当前正在跑的循环（同一时刻至多一个）。是 → 配置可实时改。
+  const isLive = running && loop.status === 'running'
+  // 逐步确认的展示值：live 时取实时态（liveAuto 翻转），否则取记录里的起始值。
+  const stepConfirmOn = isLive ? !liveAuto : loop.step_confirm
 
   return (
     <div className="flex h-full min-h-0 flex-col gap-2">
@@ -64,13 +82,6 @@ export function LoopDetail({ loop, messages, loadingMessages, onStartImplementat
           <span>{loop.mode === 'design' ? '设计复核' : '实现复核'}</span>
           {loop.final_verdict && <span>· {FINAL_LABELS[loop.final_verdict] ?? loop.final_verdict}</span>}
           <span>· {loop.total_rounds}/{loop.max_rounds} 轮</span>
-          {loop.step_confirm ? <span>· 逐步确认</span> : <span>· 自动</span>}
-          {loop.use_worktree && (
-            <span className="flex items-center gap-0.5 text-violet-500">
-              <GitBranch size={10} />
-              worktree
-            </span>
-          )}
         </div>
 
         {/* 配置内容（只读，对应上方新建表单的字段）。 */}
@@ -96,8 +107,9 @@ export function LoopDetail({ loop, messages, loadingMessages, onStartImplementat
           </div>
         )}
 
-        {showImplement && (
-          <div className="mt-2">
+        {/* 配置（逐步确认 / worktree）+「开始实现」同排。逐步确认对运行中的记录可实时切换。 */}
+        <div className="mt-2 flex flex-wrap items-center gap-3">
+          {showImplement && (
             <button
               onClick={() => passed && onStartImplementation?.(loop)}
               disabled={!passed}
@@ -106,8 +118,37 @@ export function LoopDetail({ loop, messages, loadingMessages, onStartImplementat
             >
               开始实现
             </button>
-          </div>
-        )}
+          )}
+
+          <label
+            className="flex items-center gap-1.5 text-[11px] text-gray-600 dark:text-gray-300"
+            title={
+              isLive
+                ? '运行中：切换会立即应用到当前循环（取消勾选=转全自动；撞到 ASK_USER 仍会停下问你）'
+                : '该记录启动时的逐步确认设置（非运行中，不可更改）'
+            }
+          >
+            <input
+              type="checkbox"
+              checked={stepConfirmOn}
+              disabled={!isLive}
+              onChange={e => onToggleAuto?.(!e.target.checked)}
+            />
+            逐步确认
+            {isLive && (liveAuto ? ' · 当前：全自动' : ' · 当前：逐步')}
+          </label>
+
+          <label
+            className="flex items-center gap-1.5 text-[11px] text-gray-600 dark:text-gray-300"
+            title="worktree 模式在循环启动时确定，运行中/历史记录均不可更改"
+          >
+            <input type="checkbox" checked={loop.use_worktree} disabled readOnly />
+            <span className="flex items-center gap-0.5">
+              <GitBranch size={10} className={loop.use_worktree ? 'text-violet-500' : 'text-gray-400'} />
+              worktree 模式
+            </span>
+          </label>
+        </div>
       </div>
 
       <div className="min-h-0 flex-1">
