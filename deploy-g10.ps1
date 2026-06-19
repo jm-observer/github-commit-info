@@ -85,16 +85,26 @@ $Bins = @(
 # 二进制名即 unit/服务名。新增 daemon 时在此追加。
 $DaemonBins = @("toolkit-server")
 
+# 产物输出目录（host 可见，从容器内的 CARGO_TARGET_DIR 拷出来）。
+# 改用 dist/g10 而非 target/ 是为了把 CARGO_TARGET_DIR 放进命名卷（Linux ext4），
+# 避免 Windows NTFS 经 Docker Desktop 的 mtime/权限抖动让 cargo 指纹失效每次全量重编。
+$OutDir = Join-Path $RepoRoot "dist/g10"
+
 if (-not $SkipBuild) {
     Write-Host "==> 交叉编译 $Target（Docker: $Image）" -ForegroundColor Cyan
     if (-not (Get-Command docker -ErrorAction SilentlyContinue)) {
         throw "未找到 docker，请先安装/启动 Docker Desktop。"
     }
 
-    # 逐 crate 带 prod feature 构建（virtual workspace 必须 -p）。
-    $buildCmd = ($Bins | ForEach-Object {
-        "cargo build --release --target $Target -p $($_.Crate) --features prod"
+    New-Item -ItemType Directory -Force -Path $OutDir | Out-Null
+
+    # 单次 cargo build 串多个 -p，让 cargo 跨 crate 调度依赖图（比逐 crate 串行更快）。
+    $pkgArgs = ($Bins | ForEach-Object { "-p $($_.Crate)" }) -join " "
+    $copyCmd = ($Bins | ForEach-Object {
+        "cp /cargo-target/$Target/release/$($_.Bin) /work/dist/g10/"
     }) -join " && "
+    $buildCmd = "cargo build --release --target $Target $pkgArgs --features prod && " `
+        + "mkdir -p /work/dist/g10 && $copyCmd"
 
     # workspace Cargo.toml 当前用本地 path 依赖 `custom-utils = { path = "../custom-utils" }`，
     # 容器内仓库挂在 /work，故 ../custom-utils 解析为 /custom-utils —— 必须把同级目录也挂进去。
@@ -103,24 +113,35 @@ if (-not $SkipBuild) {
         throw "未找到本地 custom-utils（$CustomUtils）；workspace 依赖 path = ../custom-utils，无它无法交叉编译。"
     }
 
-    # 挂载仓库 + 同级 custom-utils；用命名卷缓存 cargo registry，加速重复构建。
-    # AR_ 显式补上（镜像只预置了 CC_/CXX_/LINKER）。
+    # 命名卷缓存(挂对镜像实际用的路径,不依赖任何 env 假设):
+    #   - shared-cargo-registry → /root/.cargo/registry。
+    #     镜像里 `CARGO_HOME` 未设、cargo 默认走 `$HOME/.cargo = /root/.cargo`(已 docker exec
+    #     进去 echo 确认过);**不是** `/usr/local/cargo`——之前挂在那等于挂了个空目录,cargo 仍
+    #     把 crate 下载到 /root/.cargo/registry(容器临时层),退出就丢,每次都全量下载。
+    #     registry 跨项目可共享(crate 按 name-version 寻址,不冲突)。
+    #   - toolkit-cargo-target → /cargo-target。编译产物 + fingerprint,**必须项目专属**(不同
+    #     workspace 共用 target 会互相覆盖指纹 → 每次全量重编)。
+    # 命名卷在 Linux ext4 上,避免 NTFS 经 Docker Desktop 时 mtime 抖动让 cargo 指纹失效。
+    # 仓库 + 同级 custom-utils 仍 bind-mount(源码必须 host 可写);产物在容器内 cp 到 /work/dist/g10。
+    # AR_ 显式补上(镜像只预置了 CC_/CXX_/LINKER)。
     docker run --rm `
         -v "${RepoRoot}:/work" `
         -v "${CustomUtils}:/custom-utils" `
-        -v "zero-tools-cargo-registry:/usr/local/cargo/registry" `
+        -v "shared-cargo-registry:/root/.cargo/registry" `
+        -v "toolkit-cargo-target:/cargo-target" `
         -w /work `
+        -e CARGO_TARGET_DIR=/cargo-target `
         -e AR_aarch64_unknown_linux_gnu=aarch64-linux-gnu-ar `
         $Image bash -lc $buildCmd
     if ($LASTEXITCODE -ne 0) { throw "交叉编译失败（exit $LASTEXITCODE）" }
 }
 
-# 校验产物存在。
-$ReleaseDir = Join-Path $RepoRoot "target/$Target/release"
+# 校验产物存在（统一在 dist/g10 下；-SkipBuild 时也读这里）。
 foreach ($b in $Bins) {
-    $p = Join-Path $ReleaseDir $b.Bin
+    $p = Join-Path $OutDir $b.Bin
     if (-not (Test-Path $p)) { throw "产物缺失：$p（先去掉 -SkipBuild 完整构建）" }
 }
+$ReleaseDir = $OutDir
 
 Write-Host "==> 部署到 ${G10Host}:${DestDir}" -ForegroundColor Cyan
 # 确保远端目录存在。
@@ -155,7 +176,11 @@ if ($DaemonBins -contains $Service) {
     $ws = if ($Workspace) { $Workspace } else { "~/.config/$Service" }
     Write-Host "==> 重装 $Service unit（bind=$Bind, workspace=$ws）" -ForegroundColor Cyan
     # 把每条 KEY=VAL 拼成 `--env 'KEY=VAL'`（单引号防远端 shell 二次解析），追加进 install 命令。
-    $envArgs = ($Env | Where-Object { $_ -and $_.Trim() -ne "" } | ForEach-Object { "--env '$($_.Trim())'" }) -join " "
+    # 注：面板把多条 env 拼成 "K1=V1,K2=V2,K3=V3" 作单参传入（`[string[]]` 从 `pwsh -File`
+    # 单 argv 不会自动拆逗号），故先按逗号展开再逐条转 `--env`。
+    $envArgs = ($Env | Where-Object { $_ -and $_.Trim() -ne "" } | ForEach-Object {
+        $_.Split(",") | Where-Object { $_.Trim() -ne "" } | ForEach-Object { "--env '$($_.Trim())'" }
+    }) -join " "
     if ($envArgs) {
         Write-Host "    注入环境变量：$($Env -join ', ')" -ForegroundColor DarkGray
     }
