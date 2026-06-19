@@ -135,7 +135,7 @@ pub struct Established {
 }
 
 fn default_max_rounds() -> u32 {
-    5
+    10
 }
 
 fn default_true() -> bool {
@@ -1380,6 +1380,119 @@ pub async fn codeloop_delete_loop(state: State<'_, AppState>, loop_id: i64) -> R
         .db
         .delete_loop(loop_id)
         .map_err(|e| format!("{e:#}"))
+}
+
+/// 把记录关联的 worktree 合并回主仓库当前分支。
+/// 流程：worktree 干净校验 → 仓库根干净 + 已知分支 → `git merge --no-ff <wt_commit>`。
+/// 不自动切换分支：repo_root 当前 HEAD 是什么分支就合到哪个分支（通常 main）；用户需先 checkout。
+/// 不删除 worktree，方便复查；用户可手动 `git worktree remove`。
+#[tauri::command]
+pub async fn codeloop_merge_worktree(
+    state: State<'_, AppState>,
+    loop_id: i64,
+) -> Result<String, String> {
+    let row = state
+        .codeloop
+        .db
+        .get_loop(loop_id)
+        .map_err(|e| format!("读取记录失败：{e:#}"))?
+        .ok_or_else(|| "记录不存在".to_string())?;
+    let worktree = row
+        .worktree_path
+        .as_deref()
+        .filter(|s| !s.trim().is_empty())
+        .ok_or_else(|| "该记录没有关联 worktree，无法合并".to_string())?;
+    let repo_root = row.repo_root.as_str();
+    let wt_path = std::path::PathBuf::from(worktree);
+    if !wt_path.exists() {
+        return Err(format!("worktree 路径不存在：{worktree}"));
+    }
+    let repo_path = std::path::PathBuf::from(repo_root);
+    if !repo_path.exists() {
+        return Err(format!("仓库根不存在：{repo_root}"));
+    }
+    if std::fs::canonicalize(&wt_path).ok() == std::fs::canonicalize(&repo_path).ok() {
+        return Err("worktree 与仓库根是同一路径，没有需要合并的内容".into());
+    }
+
+    async fn git(
+        cwd: &std::path::Path,
+        args: &[&str],
+    ) -> std::result::Result<String, String> {
+        let output = tokio::process::Command::new("git")
+            .current_dir(cwd)
+            .args(args)
+            .output()
+            .await
+            .map_err(|e| format!("git {args:?} 启动失败：{e}"))?;
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            return Err(format!(
+                "git {args:?} 失败：{}{}",
+                stderr.trim(),
+                if stdout.trim().is_empty() {
+                    String::new()
+                } else {
+                    format!(" / {}", stdout.trim())
+                }
+            ));
+        }
+        Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
+    }
+
+    let wt_commit = git(&wt_path, &["rev-parse", "HEAD"]).await?;
+    let wt_branch = git(&wt_path, &["rev-parse", "--abbrev-ref", "HEAD"])
+        .await
+        .unwrap_or_else(|_| "(detached)".into());
+
+    let wt_status = git(&wt_path, &["status", "--porcelain"]).await?;
+    if !wt_status.is_empty() {
+        return Err("worktree 有未提交改动，请先 commit 或 stash 后再合并".into());
+    }
+    let repo_status = git(&repo_path, &["status", "--porcelain"]).await?;
+    if !repo_status.is_empty() {
+        return Err("主仓库工作树非干净状态，请先 commit/stash 后再合并".into());
+    }
+    let repo_branch = git(&repo_path, &["rev-parse", "--abbrev-ref", "HEAD"]).await?;
+    let repo_head = git(&repo_path, &["rev-parse", "HEAD"]).await?;
+
+    if repo_head == wt_commit {
+        return Ok(format!("无需合并：{repo_branch} 已经是 {}", short(&wt_commit)));
+    }
+    // is-ancestor 返回 0 表示是祖先（已被包含在 HEAD 历史里）；用 status 判断
+    let is_anc = tokio::process::Command::new("git")
+        .current_dir(&repo_path)
+        .args(["merge-base", "--is-ancestor", &wt_commit, &repo_head])
+        .status()
+        .await
+        .map(|s| s.success())
+        .unwrap_or(false);
+    if is_anc {
+        return Ok(format!(
+            "无需合并：{} 已在 {} 历史中",
+            short(&wt_commit),
+            repo_branch
+        ));
+    }
+
+    let msg = format!("merge worktree from codeloop #{loop_id} ({wt_branch})");
+    git(
+        &repo_path,
+        &["merge", "--no-ff", "-m", &msg, &wt_commit],
+    )
+    .await?;
+    let new_head = git(&repo_path, &["rev-parse", "--short", "HEAD"])
+        .await
+        .unwrap_or_default();
+    Ok(format!(
+        "已合并 {wt_branch}({}) → {repo_branch}（新 HEAD：{new_head}）",
+        short(&wt_commit)
+    ))
+}
+
+fn short(sha: &str) -> &str {
+    &sha[..sha.len().min(7)]
 }
 
 // ============================================================================

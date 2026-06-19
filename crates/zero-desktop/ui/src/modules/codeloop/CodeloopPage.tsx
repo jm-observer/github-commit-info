@@ -16,14 +16,19 @@ import { LoopStatusBar } from './components/LoopStatusBar'
 import { AskUserModal } from './components/AskUserModal'
 import { ConfirmGateModal } from './components/ConfirmGateModal'
 import { LoopList } from './components/LoopList'
-import { LoopDetail } from './components/LoopDetail'
+import { LoopDetail, type StageStartOptions } from './components/LoopDetail'
 import { TrackModal } from './components/TrackModal'
 import { PreflightModal } from './components/PreflightModal'
 import { PreviewModal } from './components/PreviewModal'
-import { ImplementationModal } from './components/ImplementationModal'
 import type { StartInput } from './api/tauri-client'
 
 const POLL_MS = 1500
+
+/** 一个运行中循环的前端态：最近进度 + 是否已转全自动。 */
+interface LiveLoop {
+  progress: Progress
+  liveAuto: boolean
+}
 
 export default function CodeloopPage() {
   const [sessions, setSessions] = useState<SessionSummary[]>([])
@@ -38,10 +43,10 @@ export default function CodeloopPage() {
   const cursors = useRef<Record<Provider, number>>({ codex: 0, claude: 0 })
   const [messages, setMessages] = useState<Record<Provider, SessionMessage[]>>({ codex: [], claude: [] })
 
-  // 表单
+  // 新建表单
   const [targetPath, setTargetPath] = useState('')
   const [mode, setMode] = useState<ReviewMode>('design')
-  const [maxRounds, setMaxRounds] = useState(5)
+  const [maxRounds, setMaxRounds] = useState(10)
   const [waitIdle, setWaitIdle] = useState(false)
   const [stepConfirm, setStepConfirm] = useState(true)
   const [useWorktree, setUseWorktree] = useState(false)
@@ -49,30 +54,35 @@ export default function CodeloopPage() {
   const [estCodex, setEstCodex] = useState(false)
   const [estClaude, setEstClaude] = useState(false)
 
-  // 循环
-  const [running, setRunning] = useState(false)
-  const [progress, setProgress] = useState<Progress | null>(null)
+  // 并发循环：按 loop_id 索引每个运行中循环的进度 + 是否已转全自动。
+  const [runningLoops, setRunningLoops] = useState<Record<number, LiveLoop>>({})
   const [startErr, setStartErr] = useState<string | null>(null)
-  const [answeredSeq, setAnsweredSeq] = useState(0)
-  const [decidedSeq, setDecidedSeq] = useState(0)
-  // 运行中是否已转全自动（= !step_confirm）；由 status 初始化、确认弹窗/状态条开关翻转。
-  const [liveAuto, setLiveAuto] = useState(false)
+  // 各循环已应答 / 已拍板的 seq（避免弹窗重复触发；seq 在循环内单调）。
+  const [answered, setAnswered] = useState<Record<number, number>>({})
+  const [decided, setDecided] = useState<Record<number, number>>({})
 
   // 记录列表
   const [loops, setLoops] = useState<LoopRow[]>([])
   const [loadingLoops, setLoadingLoops] = useState(false)
   const [selectedLoopId, setSelectedLoopId] = useState<number | null>(null)
+  // onProgress 闭包在 mount 时定型，用 ref 读最新选中 id（避免 stale closure）。
+  const selectedRef = useRef<number | null>(null)
+  useEffect(() => {
+    selectedRef.current = selectedLoopId
+  }, [selectedLoopId])
   // 选中记录的往返消息（详情面板）。
   const [loopMsgs, setLoopMsgs] = useState<LoopMessageRow[]>([])
   const [loadingLoopMsgs, setLoadingLoopMsgs] = useState(false)
   // 跟踪弹窗：展示所选两个会话的消息记录。
   const [showTrack, setShowTrack] = useState(false)
+  // 详情面板的跟踪弹窗：按选中记录的两端 session 拉消息，与新建表单互不污染。
+  const [detailTrack, setDetailTrack] = useState<{ claude: string; codex: string } | null>(null)
+  const detailCursors = useRef<Record<Provider, number>>({ codex: 0, claude: 0 })
+  const [detailTrackMessages, setDetailTrackMessages] = useState<Record<Provider, SessionMessage[]>>({ codex: [], claude: [] })
   // 环境自检弹窗。
   const [showPreflight, setShowPreflight] = useState(false)
   // 预览 / 手动驱动台弹窗。
   const [showPreview, setShowPreview] = useState(false)
-  // 「开始实现」配置确认窗的源记录（非 null = 弹窗开启）。
-  const [implSource, setImplSource] = useState<LoopRow | null>(null)
 
   // 由表单组装 StartInput（启动 / 自检共用）。
   const buildInput = (): StartInput => ({
@@ -86,6 +96,22 @@ export default function CodeloopPage() {
     use_worktree: useWorktree,
     established: { codex: estCodex, claude: estClaude },
   })
+
+  // 启动后清空新建表单，让用户立即配下一个循环（含会话选择——同一会话不可并发占用）。
+  const resetForm = () => {
+    setTargetPath('')
+    setMode('design')
+    setMaxRounds(10)
+    setWaitIdle(false)
+    setStepConfirm(true)
+    setUseWorktree(false)
+    setEstCodex(false)
+    setEstClaude(false)
+    setClaudeId('')
+    setCodexId('')
+    cursors.current = { codex: 0, claude: 0 }
+    setMessages({ codex: [], claude: [] })
+  }
 
   // ── 会话清单 ──────────────────────────────────────────────────────────────
   const refreshSessions = () => {
@@ -108,16 +134,6 @@ export default function CodeloopPage() {
   }
   useEffect(refreshLoops, [])
 
-  // 循环结束（done/error）→ 刷新列表，让最新记录终态进列表；并重载选中记录的往返消息。
-  useEffect(() => {
-    if (progress?.phase === 'done' || progress?.phase === 'error') {
-      refreshLoops()
-      if (selectedLoopId != null) {
-        CodeloopAPI.loopMessages(selectedLoopId).then(setLoopMsgs).catch(() => {})
-      }
-    }
-  }, [progress?.phase])
-
   const handleDeleteLoop = async (id: number) => {
     try {
       await CodeloopAPI.deleteLoop(id)
@@ -128,7 +144,7 @@ export default function CodeloopPage() {
     refreshLoops()
   }
 
-  // 点击记录：选中 + 加载该记录往返消息到右侧只读详情面板。**不回填新建表单**
+  // 点击记录：选中 + 加载该记录往返消息到右侧详情面板。**不回填新建表单**
   // （避免「看历史」污染「配新循环」）。顺便刷新列表，保证详情头部状态是最新的。
   const handleSelectLoop = (id: number) => {
     setSelectedLoopId(id)
@@ -136,7 +152,10 @@ export default function CodeloopPage() {
     setLoopMsgs([])
     refreshLoops()
     CodeloopAPI.loopMessages(id)
-      .then(setLoopMsgs)
+      .then(msgs => {
+        setLoopMsgs(msgs)
+        refreshLoops()
+      })
       .catch(() => {})
       .finally(() => setLoadingLoopMsgs(false))
   }
@@ -205,111 +224,216 @@ export default function CodeloopPage() {
     }
   }, [claudeId, codexId])
 
-  // ── 循环进度（event + 初始快照） ─────────────────────────────────────────
+  // ── 详情跟踪：按 detailTrack 拉两端会话消息（与上方新建表单的轮询独立） ──
+  useEffect(() => {
+    if (!detailTrack) return
+    let alive = true
+    detailCursors.current = { codex: 0, claude: 0 }
+    setDetailTrackMessages({ codex: [], claude: [] })
+    const pollSide = async (provider: Provider, id: string) => {
+      if (!id) return
+      try {
+        const page = await CodeloopAPI.sessionMessages(provider, id, detailCursors.current[provider])
+        if (!alive) return
+        if (page.messages.length) {
+          setDetailTrackMessages(m => ({ ...m, [provider]: [...m[provider], ...page.messages] }))
+        }
+        detailCursors.current[provider] = page.cursor
+      } catch {
+        /* 抖动：跳过本轮 */
+      }
+    }
+    const tick = () => {
+      void pollSide('claude', detailTrack.claude)
+      void pollSide('codex', detailTrack.codex)
+    }
+    tick()
+    const t = setInterval(tick, POLL_MS)
+    return () => {
+      alive = false
+      clearInterval(t)
+    }
+  }, [detailTrack?.claude, detailTrack?.codex])
+
+  // ── 并发循环进度（event + 初始快照） ─────────────────────────────────────
   useEffect(() => {
     let un: UnlistenFn | undefined
     onProgress(p => {
-      setProgress(p)
-      if (p.phase === 'done' || p.phase === 'error') setRunning(false)
+      const id = p.loop_id
+      if (id == null) return
+      const ended = p.phase === 'done' || p.phase === 'error'
+      setRunningLoops(prev => {
+        if (ended) {
+          const next = { ...prev }
+          delete next[id]
+          return next
+        }
+        return { ...prev, [id]: { progress: p, liveAuto: prev[id]?.liveAuto ?? false } }
+      })
+      if (id === selectedRef.current) {
+        CodeloopAPI.loopMessages(id).then(setLoopMsgs).catch(() => {})
+      }
+      if (ended) {
+        refreshLoops()
+      }
     }).then(f => {
       un = f
     })
+    // mount 时重建并发态（应用重开 / 切页回来）。
     CodeloopAPI.status()
-      .then(s => {
-        setRunning(s.running)
-        if (s.progress) setProgress(s.progress)
-        setLiveAuto(!s.step_confirm)
+      .then(list => {
+        const map: Record<number, LiveLoop> = {}
+        for (const s of list) map[s.loop_id] = { progress: s.progress ?? {}, liveAuto: !s.step_confirm }
+        setRunningLoops(map)
       })
       .catch(() => {})
     return () => un?.()
   }, [])
 
   // ── 启动 / 应答 ──────────────────────────────────────────────────────────
-  const canStart = !!claudeId && !!codexId && !!targetPath.trim() && !running
+  const canStart = !!claudeId && !!codexId && !!targetPath.trim()
   const startWith = async (input: StartInput) => {
     setStartErr(null)
     try {
-      await CodeloopAPI.start(input)
-      setRunning(true)
-      setProgress({ phase: 'starting' })
-      setLiveAuto(!input.step_confirm)
+      const id = await CodeloopAPI.start(input)
+      setRunningLoops(prev => ({
+        ...prev,
+        [id]: { progress: { phase: 'starting' }, liveAuto: !input.step_confirm },
+      }))
+      resetForm()
+      setSelectedLoopId(id)
+      setLoopMsgs([])
       refreshLoops()
     } catch (e) {
       setStartErr(String(e))
     }
   }
   const handleStart = () => startWith(buildInput())
-  // 「开始实现」：弹配置确认窗 → 确认后以 implementation 模式启动并关联血缘。
-  const handleStartImplementation = async (input: StartInput) => {
-    setImplSource(null)
-    await startWith(input)
+  // 阶段动作：可选择先新建 Codex Agent/session，再启动派生记录。
+  const startStageWith = async (input: StartInput, options?: StageStartOptions) => {
+    let next = input
+    if (options?.freshCodex) {
+      setCreatingCodex(true)
+      try {
+        const newId = await CodeloopAPI.newCodexSession(input.claude.session_id)
+        next = { ...input, codex: { session_id: newId } }
+        refreshSessions()
+      } catch (e) {
+        setStartErr(String(e))
+        return
+      } finally {
+        setCreatingCodex(false)
+      }
+    }
+    await startWith(next)
   }
-  const handleStop = async () => {
+  // 「开始实现」：LoopDetail 内联配好 StartInput（承接血缘已带 parent_loop_id）后直接启动。
+  const handleStartImplementation = (input: StartInput, options?: StageStartOptions) =>
+    startStageWith(input, options)
+  const handleContinueReview = (input: StartInput, options?: StageStartOptions) =>
+    startStageWith(input, options)
+  const handleContinue = (input: StartInput, options?: StageStartOptions) =>
+    startStageWith(input, options)
+
+  const handleStop = async (loopId: number) => {
     try {
-      await CodeloopAPI.stop()
+      await CodeloopAPI.stop(loopId)
     } catch {
       /* ignore */
     }
-    setRunning(false)
+    setRunningLoops(prev => {
+      const next = { ...prev }
+      delete next[loopId]
+      return next
+    })
+    if (loopId === selectedRef.current) {
+      CodeloopAPI.loopMessages(loopId).then(setLoopMsgs).catch(() => {})
+    }
+    refreshLoops()
   }
-  const handleAnswer = async (text: string) => {
-    const seq = progress?.seq
+
+  const handleAnswer = async (loopId: number, text: string) => {
+    const seq = runningLoops[loopId]?.progress?.seq
     if (seq == null) return
     try {
-      await CodeloopAPI.answer(seq, text)
-      setAnsweredSeq(seq)
+      await CodeloopAPI.answer(loopId, seq, text)
+      setAnswered(prev => ({ ...prev, [loopId]: seq }))
     } catch (e) {
       setStartErr(String(e))
     }
   }
 
-  const handleDecide = async (approve: boolean, auto = false) => {
-    const seq = progress?.seq
+  const handleDecide = async (loopId: number, approve: boolean, auto = false) => {
+    const seq = runningLoops[loopId]?.progress?.seq
     if (seq == null) return
-    setDecidedSeq(seq) // 乐观关窗，避免重复点击
+    setDecided(prev => ({ ...prev, [loopId]: seq })) // 乐观关窗，避免重复点击
     try {
-      await CodeloopAPI.confirm(seq, approve)
+      await CodeloopAPI.confirm(loopId, seq, approve)
       // 勾选「确认后转自动」：放行当前步后关掉逐步确认。
       if (approve && auto) {
-        await CodeloopAPI.setAutoConfirm(true)
-        setLiveAuto(true)
+        await CodeloopAPI.setAutoConfirm(loopId, true)
+        setRunningLoops(prev =>
+          prev[loopId] ? { ...prev, [loopId]: { ...prev[loopId], liveAuto: true } } : prev,
+        )
       }
     } catch (e) {
       setStartErr(String(e))
     }
   }
 
-  // 运行中随时翻转自动确认（状态条入口）。
-  const handleToggleAuto = async (enabled: boolean) => {
-    setLiveAuto(enabled) // 乐观
+  // 运行中随时翻转自动确认（详情面板入口）。
+  const handleToggleAuto = async (loopId: number, enabled: boolean) => {
+    setRunningLoops(prev =>
+      prev[loopId] ? { ...prev, [loopId]: { ...prev[loopId], liveAuto: enabled } } : prev,
+    ) // 乐观
     try {
-      await CodeloopAPI.setAutoConfirm(enabled)
+      await CodeloopAPI.setAutoConfirm(loopId, enabled)
     } catch (e) {
-      setLiveAuto(!enabled) // 回滚
+      setRunningLoops(prev =>
+        prev[loopId] ? { ...prev, [loopId]: { ...prev[loopId], liveAuto: !enabled } } : prev,
+      ) // 回滚
       setStartErr(String(e))
     }
   }
 
-  // ASK_USER 弹窗：进入 awaiting_input 且该 seq 未答过。
-  const showAsk =
-    progress?.phase === 'awaiting_input' &&
-    progress.seq != null &&
-    progress.seq > answeredSeq &&
-    !!progress.question
+  // 详情面板对应的记录 + 其运行态（若在跑）。
+  const detailLoop = loops.find(l => l.id === selectedLoopId) ?? null
+  const detailLive = detailLoop ? runningLoops[detailLoop.id] : undefined
+  // 是否已派生下一阶段子记录（用于禁用详情面板的派生入口）。
+  const detailHasChild = detailLoop
+    ? loops.some(l => l.parent_loop_id === detailLoop.id)
+    : false
 
-  // 逐步确认弹窗：运行中、进入 awaiting_confirm 且该 seq 未拍板过。
+  // 列表标记：运行中 id / 需关注（等待作答或确认）id。
+  const liveIds = new Set(Object.keys(runningLoops).map(Number))
+  const attentionIds = new Set(
+    Object.entries(runningLoops)
+      .filter(([, v]) => v.progress?.phase === 'awaiting_input' || v.progress?.phase === 'awaiting_confirm')
+      .map(([k]) => Number(k)),
+  )
+
+  // 弹窗按「选中循环」路由：只展示当前选中循环的待答 / 待确认。其余需关注的循环在列表里有标记。
+  const selId = selectedLoopId
+  const selProg = selId != null ? runningLoops[selId]?.progress : undefined
+  const showAsk =
+    selId != null &&
+    selProg?.phase === 'awaiting_input' &&
+    selProg.seq != null &&
+    selProg.seq > (answered[selId] ?? 0) &&
+    !!selProg.question
+
   const showConfirm =
-    running &&
-    progress?.phase === 'awaiting_confirm' &&
-    progress.seq != null &&
-    progress.seq > decidedSeq
+    selId != null &&
+    selProg?.phase === 'awaiting_confirm' &&
+    selProg.seq != null &&
+    selProg.seq > (decided[selId] ?? 0)
 
   return (
     <div className="flex h-full flex-col gap-3">
       <div>
         <h1 className="text-xl font-semibold">复核循环</h1>
         <p className="mt-1 text-xs text-gray-500 dark:text-gray-400">
-          关联一对 Codex / Claude Code 会话，驱动「复核 ↔ 修订」往复。默认逐步确认：每次跨会话传递前弹窗等你拍板（本机直跑，无需额外进程）。
+          关联一对 Codex / Claude Code 会话，驱动「复核 ↔ 修订」往复。启动后表单即清空，可继续配下一个循环（多个循环可同时跑，同一会话除外）。运行中循环在下方记录里管理（停止 / 逐步确认）。
         </p>
       </div>
 
@@ -354,17 +478,13 @@ export default function CodeloopPage() {
         estClaude={estClaude}
         setEstClaude={setEstClaude}
         onPreview={() => setShowPreview(true)}
-        running={running}
         canStart={canStart}
         onStart={handleStart}
-        onStop={handleStop}
         onTrack={() => setShowTrack(true)}
         canTrack={!!claudeId && !!codexId}
         onPreflight={() => setShowPreflight(true)}
         canPreflight={!!claudeId && !!codexId && !!targetPath.trim()}
-        progress={progress}
-        liveAuto={liveAuto}
-        onToggleAuto={handleToggleAuto}
+        liveCount={liveIds.size}
       />
       {startErr && (
         <div className="rounded-md bg-red-50 px-3 py-2 text-xs text-red-600 dark:bg-red-900/20 dark:text-red-400">
@@ -372,7 +492,7 @@ export default function CodeloopPage() {
         </div>
       )}
 
-      {/* 下方左右分栏：左=历史记录列表，右=选中记录只读详情（状态 + 往返消息 + 上下文操作）。 */}
+      {/* 下方左右分栏：左=历史记录列表，右=选中记录详情（状态 + 往返消息 + 上下文操作）。 */}
       <div className="flex min-h-0 flex-1 gap-3">
         <div className="w-80 shrink-0">
           <LoopList
@@ -382,38 +502,63 @@ export default function CodeloopPage() {
             onRefresh={refreshLoops}
             onDelete={handleDeleteLoop}
             loading={loadingLoops}
+            liveIds={liveIds}
+            attentionIds={attentionIds}
           />
         </div>
         <div className="min-w-0 flex-1">
           <LoopDetail
-            loop={loops.find(l => l.id === selectedLoopId) ?? null}
+            loop={detailLoop}
             messages={loopMsgs}
             loadingMessages={loadingLoopMsgs}
-            onStartImplementation={setImplSource}
-            running={running}
-            liveAuto={liveAuto}
-            onToggleAuto={handleToggleAuto}
+            onStartImplementation={handleStartImplementation}
+            onContinueReview={handleContinueReview}
+            onContinue={handleContinue}
+            isLive={!!detailLive}
+            liveProgress={detailLive?.progress ?? null}
+            liveAuto={detailLive?.liveAuto ?? false}
+            onToggleAuto={enabled => detailLoop && handleToggleAuto(detailLoop.id, enabled)}
+            onStop={() => detailLoop && handleStop(detailLoop.id)}
+            onTrack={
+              detailLoop
+                ? () =>
+                    setDetailTrack({
+                      claude: detailLoop.claude_session,
+                      codex: detailLoop.codex_session,
+                    })
+                : undefined
+            }
+            onMergeWorktree={
+              detailLoop
+                ? async () => {
+                    const msg = await CodeloopAPI.mergeWorktree(detailLoop.id)
+                    refreshLoops()
+                    return msg
+                  }
+                : undefined
+            }
+            hasChild={detailHasChild}
           />
         </div>
       </div>
 
-      {showAsk && progress?.question && (
+      {showAsk && selProg?.question && (
         <AskUserModal
-          question={progress.question}
-          seq={progress.seq!}
-          askedBy={progress.asked_by}
-          onAnswer={handleAnswer}
+          question={selProg.question}
+          seq={selProg.seq!}
+          askedBy={selProg.asked_by}
+          onAnswer={text => handleAnswer(selId!, text)}
         />
       )}
 
       {showConfirm && (
         <ConfirmGateModal
-          seq={progress!.seq!}
-          direction={progress!.direction}
-          title={progress!.title}
-          content={progress!.content}
-          onApprove={auto => handleDecide(true, auto)}
-          onReject={() => handleDecide(false)}
+          seq={selProg!.seq!}
+          direction={selProg!.direction}
+          title={selProg!.title}
+          content={selProg!.content}
+          onApprove={auto => handleDecide(selId!, true, auto)}
+          onReject={() => handleDecide(selId!, false)}
         />
       )}
 
@@ -427,16 +572,18 @@ export default function CodeloopPage() {
         />
       )}
 
-      {showPreflight && (
-        <PreflightModal input={buildInput()} onClose={() => setShowPreflight(false)} />
+      {detailTrack && (
+        <TrackModal
+          claudeId={detailTrack.claude}
+          codexId={detailTrack.codex}
+          claudeMessages={detailTrackMessages.claude}
+          codexMessages={detailTrackMessages.codex}
+          onClose={() => setDetailTrack(null)}
+        />
       )}
 
-      {implSource && (
-        <ImplementationModal
-          source={implSource}
-          onStart={handleStartImplementation}
-          onClose={() => setImplSource(null)}
-        />
+      {showPreflight && (
+        <PreflightModal input={buildInput()} onClose={() => setShowPreflight(false)} />
       )}
 
       {showPreview && (
