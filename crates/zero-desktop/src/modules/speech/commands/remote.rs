@@ -4,7 +4,7 @@
 //! The orchestrator URL is held in `SpeechState.remote_url` and edited
 //! from the desktop UI (persisted as `remote.url` in SQLite).
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 use std::sync::mpsc as std_mpsc;
 use std::sync::Arc;
@@ -44,13 +44,55 @@ struct AutoCopyAccum {
 /// 复制走「完整拼接文本进剪贴板」供手动 Ctrl+V 兜底，粘贴走「逐段增量直接输入」。
 #[derive(Default)]
 struct AutoPasteState {
-    /// 已自动输入过的段落 id，保证同一段只输入一次（再次优化只更新剪贴板，不重复打字，也不覆盖）。
-    typed_ids: std::collections::HashSet<i64>,
+    /// 已自动输入过的段落 id。用于区分首次输入和同段累计文本的增量输入。
+    typed_ids: HashSet<i64>,
+    /// 每个 ref 已经自动输入到的完整文本。合并链模式下，同一 ref 会反复回发累计文本；
+    /// 只有新文本以旧文本为前缀时才输入后缀，改写旧内容则保守跳过，避免盲目覆盖。
+    typed_text_by_id: HashMap<i64, String>,
     /// 上一段自动输入的结束时刻，用于判定续接（决定英文模式是否补分隔空格）。
     last_t_end: Option<f64>,
 }
 
-/// 把一段识别结果直接打字进当前焦点输入框。同段去重、续接时英文补空格。
+fn next_auto_paste_text(
+    ap: &mut AutoPasteState,
+    text: &str,
+    ref_id: i64,
+    t_start: f64,
+    t_end: f64,
+    window: Duration,
+    space_separator: bool,
+) -> Option<String> {
+    if text.is_empty() {
+        return None;
+    }
+    if ap.typed_ids.contains(&ref_id) {
+        let prev = ap.typed_text_by_id.get(&ref_id)?;
+        let suffix = text.strip_prefix(prev)?;
+        if suffix.is_empty() {
+            return None;
+        }
+        ap.typed_text_by_id.insert(ref_id, text.to_string());
+        ap.last_t_end = Some(t_end);
+        return Some(suffix.to_string());
+    }
+
+    ap.typed_ids.insert(ref_id);
+    ap.typed_text_by_id.insert(ref_id, text.to_string());
+    let continues = ap
+        .last_t_end
+        .is_some_and(|prev_end| (t_start - prev_end) < window.as_secs_f64());
+    ap.last_t_end = Some(t_end);
+    Some(if continues && space_separator {
+        format!(" {text}")
+    } else {
+        text.to_string()
+    })
+}
+
+/// 把一段识别结果直接打字进当前焦点输入框。
+///
+/// 新 ref 首次输入完整文本；合并链模式下同 ref 后续回发累计文本时，只输入严格后缀。
+/// 若同 ref 后续结果改写了已输入部分，则不做盲删覆盖，留给剪贴板兜底。
 fn auto_paste_segment(
     ap: &mut AutoPasteState,
     text: &str,
@@ -60,21 +102,10 @@ fn auto_paste_segment(
     window: Duration,
     space_separator: bool,
 ) {
-    if text.is_empty() {
+    let Some(payload) =
+        next_auto_paste_text(ap, text, ref_id, t_start, t_end, window, space_separator)
+    else {
         return;
-    }
-    // 同一段落只输入一次：再次优化不重复打字，也不做（已商定放弃的）覆盖。
-    if !ap.typed_ids.insert(ref_id) {
-        return;
-    }
-    let continues = ap
-        .last_t_end
-        .is_some_and(|prev_end| (t_start - prev_end) < window.as_secs_f64());
-    ap.last_t_end = Some(t_end);
-    let payload = if continues && space_separator {
-        format!(" {text}")
-    } else {
-        text.to_string()
     };
     let typed = crate::modules::speech::paste_watch::type_text_to_foreground(&payload);
     info!(
@@ -176,8 +207,15 @@ pub(crate) fn remote_http_base_from_state(remote_url: &RwLock<String>) -> Option
     } else {
         return None;
     };
-    let host = rest.split_once('/').map(|(h, _)| h).unwrap_or(rest);
-    Some(format!("{scheme}{host}"))
+    // 去掉末尾 `/stream` 得到 HTTP 基址，**保留中间路径前缀**：合并后 asr_url 形如
+    // `ws://host:8788/api/asr/stream` → `http://host:8788/api/asr`，于是 `{base}/api/history`
+    // 命中 nest 在 /api/asr 下的 orchestrator 路由；旧独立 `ws://host:8090/stream` →
+    // `http://host:8090`，`{base}/api/history` 仍命中（向后兼容）。
+    let base = match rest.strip_suffix("/stream") {
+        Some(b) => b,
+        None => rest.split_once('/').map(|(h, _)| h).unwrap_or(rest),
+    };
+    Some(format!("{scheme}{base}"))
 }
 
 /// Fetch recent transcribed segments from the orchestrator's `/api/history`.
@@ -777,6 +815,41 @@ mod tests {
         next_clipboard_text(&mut acc, "二", 2, 1.5, 2.5, w(3000));
         let out = next_clipboard_text(&mut acc, "三", 3, 3.0, 4.0, w(3000));
         assert_eq!(out, "一 二 三");
+    }
+
+    #[test]
+    fn autopaste_same_ref_cumulative_text_types_suffix() {
+        let mut ap = AutoPasteState::default();
+        let first = next_auto_paste_text(&mut ap, "第一句。", 1, 0.0, 1.0, w(3000), false);
+        assert_eq!(first.as_deref(), Some("第一句。"));
+
+        let second = next_auto_paste_text(&mut ap, "第一句。第二句。", 1, 0.0, 2.0, w(3000), false);
+        assert_eq!(second.as_deref(), Some("第二句。"));
+    }
+
+    #[test]
+    fn autopaste_same_ref_identical_text_does_not_repeat() {
+        let mut ap = AutoPasteState::default();
+        next_auto_paste_text(&mut ap, "Hello", 1, 0.0, 1.0, w(3000), true);
+        let out = next_auto_paste_text(&mut ap, "Hello", 1, 0.0, 1.0, w(3000), true);
+        assert_eq!(out, None);
+    }
+
+    #[test]
+    fn autopaste_same_ref_rewrite_is_skipped() {
+        let mut ap = AutoPasteState::default();
+        next_auto_paste_text(&mut ap, "第一句。", 1, 0.0, 1.0, w(3000), false);
+        let out =
+            next_auto_paste_text(&mut ap, "第一句改写。第二句。", 1, 0.0, 2.0, w(3000), false);
+        assert_eq!(out, None);
+    }
+
+    #[test]
+    fn autopaste_new_english_ref_continuation_gets_separator() {
+        let mut ap = AutoPasteState::default();
+        next_auto_paste_text(&mut ap, "Hello.", 1, 0.0, 1.0, w(3000), true);
+        let out = next_auto_paste_text(&mut ap, "World.", 2, 1.5, 2.0, w(3000), true);
+        assert_eq!(out.as_deref(), Some(" World."));
     }
 
     #[test]

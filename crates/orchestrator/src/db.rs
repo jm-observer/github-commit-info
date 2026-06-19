@@ -94,7 +94,9 @@ impl Db {
                 return Err(e.into());
             }
         }
-        Ok(Self { conn: Mutex::new(conn) })
+        Ok(Self {
+            conn: Mutex::new(conn),
+        })
     }
 
     fn lock(&self) -> std::sync::MutexGuard<'_, Connection> {
@@ -208,7 +210,11 @@ impl Db {
     }
     pub fn audio_get(&self, sid: i64) -> Option<Vec<u8>> {
         self.lock()
-            .query_row("SELECT wav FROM segment_audio WHERE segment_id=?1", [sid], |r| r.get(0))
+            .query_row(
+                "SELECT wav FROM segment_audio WHERE segment_id=?1",
+                [sid],
+                |r| r.get(0),
+            )
             .ok()
     }
     /// Purge audio blobs older than one day. Returns number removed.
@@ -243,7 +249,12 @@ impl Db {
     /// Optimized texts for segments in the same session whose t_end falls in
     /// [before_t - window_sec, before_t). Returned oldest-first so they can
     /// be presented as chronological context to the LLM.
-    pub fn segments_context_before(&self, session_id: &str, before_t: f64, window_sec: f64) -> Vec<String> {
+    pub fn segments_context_before(
+        &self,
+        session_id: &str,
+        before_t: f64,
+        window_sec: f64,
+    ) -> Vec<String> {
         let c = self.lock();
         let mut stmt = match c.prepare(
             "SELECT optimized FROM segments \
@@ -292,7 +303,8 @@ impl Db {
                 has_audio: r.get::<_, i64>(8)? != 0,
             })
         });
-        rows.map(|it| it.filter_map(Result::ok).collect()).unwrap_or_default()
+        rows.map(|it| it.filter_map(Result::ok).collect())
+            .unwrap_or_default()
     }
 
     pub fn stats(&self) -> Stats {
@@ -318,7 +330,9 @@ impl Db {
         Ok(c.last_insert_rowid())
     }
     pub fn speaker_delete(&self, id: i64) {
-        let _ = self.lock().execute("DELETE FROM speakers WHERE id=?1", [id]);
+        let _ = self
+            .lock()
+            .execute("DELETE FROM speakers WHERE id=?1", [id]);
     }
     pub fn speaker_rename(&self, id: i64, name: &str) {
         let _ = self
@@ -326,16 +340,18 @@ impl Db {
             .execute("UPDATE speakers SET name=?2 WHERE id=?1", (id, name));
     }
     pub fn speaker_set_enabled(&self, id: i64, enabled: bool) {
-        let _ = self
-            .lock()
-            .execute("UPDATE speakers SET enabled=?2 WHERE id=?1", (id, enabled as i64));
+        let _ = self.lock().execute(
+            "UPDATE speakers SET enabled=?2 WHERE id=?1",
+            (id, enabled as i64),
+        );
     }
     pub fn speakers_list(&self) -> Vec<Speaker> {
         let c = self.lock();
-        let mut stmt = match c.prepare("SELECT id,name,enabled,created_at FROM speakers ORDER BY id") {
-            Ok(s) => s,
-            Err(_) => return Vec::new(),
-        };
+        let mut stmt =
+            match c.prepare("SELECT id,name,enabled,created_at FROM speakers ORDER BY id") {
+                Ok(s) => s,
+                Err(_) => return Vec::new(),
+            };
         let rows = stmt.query_map([], |r| {
             Ok(Speaker {
                 id: r.get(0)?,
@@ -344,7 +360,8 @@ impl Db {
                 created_at: r.get(3)?,
             })
         });
-        rows.map(|it| it.filter_map(Result::ok).collect()).unwrap_or_default()
+        rows.map(|it| it.filter_map(Result::ok).collect())
+            .unwrap_or_default()
     }
     /// (name, embedding) for all enabled speakers — pushed to asr for gating.
     pub fn enabled_voiceprints(&self) -> Vec<(String, Vec<f32>)> {
@@ -361,7 +378,10 @@ impl Db {
         rows.map(|it| {
             it.filter_map(Result::ok)
                 .map(|(n, csv)| {
-                    let v = csv.split(',').filter_map(|x| x.trim().parse::<f32>().ok()).collect();
+                    let v = csv
+                        .split(',')
+                        .filter_map(|x| x.trim().parse::<f32>().ok())
+                        .collect();
                     (n, v)
                 })
                 .collect()
@@ -389,6 +409,7 @@ impl Db {
             Err(_) => return Vec::new(),
         };
         let rows = stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?)));
-        rows.map(|it| it.filter_map(Result::ok).collect()).unwrap_or_default()
+        rows.map(|it| it.filter_map(Result::ok).collect())
+            .unwrap_or_default()
     }
 }

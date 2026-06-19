@@ -29,16 +29,11 @@ function applyTheme(theme: 'light' | 'dark') {
 
 type NetMode = 'auto' | 'lan' | 'wan'
 
-interface Endpoint {
-  g10_base: string
-  asr_url: string
-}
-
 interface AppSettings {
   schema?: number
   mode: NetMode
-  lan: Endpoint
-  wan: Endpoint
+  lan_host: string
+  wan_host: string
   g10_token?: string | null
 }
 
@@ -60,37 +55,29 @@ const MODE_LABEL: Record<NetMode, string> = {
 const inputCls =
   'rounded-md border border-gray-300 bg-white px-3 py-1.5 text-sm outline-none focus:border-blue-400 dark:border-gray-600 dark:bg-gray-800 dark:text-gray-100'
 
-function EndpointFields(props: {
+function HostField(props: {
   title: string
   icon: React.ReactNode
-  ep: Endpoint
-  onChange: (ep: Endpoint) => void
-  g10Placeholder: string
-  asrPlaceholder: string
+  hint: string
+  value: string
+  onChange: (v: string) => void
+  placeholder: string
 }) {
-  const { title, icon, ep, onChange, g10Placeholder, asrPlaceholder } = props
+  const { title, icon, hint, value, onChange, placeholder } = props
   return (
     <div className="flex flex-col gap-2 rounded-md border border-gray-200 p-3 dark:border-gray-700">
       <div className="flex items-center gap-2 text-xs font-medium text-gray-600 dark:text-gray-300">
         {icon}
         {title}
       </div>
-      <label className="text-xs text-gray-500 dark:text-gray-400">G10 base URL</label>
       <input
         type="text"
-        value={ep.g10_base}
-        onChange={e => onChange({ ...ep, g10_base: e.target.value })}
-        placeholder={g10Placeholder}
+        value={value}
+        onChange={e => onChange(e.target.value)}
+        placeholder={placeholder}
         className={inputCls}
       />
-      <label className="text-xs text-gray-500 dark:text-gray-400">语音 ASR 地址（ws:// 或 wss://，可留空）</label>
-      <input
-        type="text"
-        value={ep.asr_url}
-        onChange={e => onChange({ ...ep, asr_url: e.target.value })}
-        placeholder={asrPlaceholder}
-        className={inputCls}
-      />
+      <p className="text-xs text-gray-400">{hint}</p>
     </div>
   )
 }
@@ -130,8 +117,8 @@ function StatusBar({ status, onReprobe, reprobing }: { status: NetStatus | null;
 
 function G10ConfigSection() {
   const [mode, setMode] = useState<NetMode>('auto')
-  const [lan, setLan] = useState<Endpoint>({ g10_base: '', asr_url: '' })
-  const [wan, setWan] = useState<Endpoint>({ g10_base: '', asr_url: '' })
+  const [lanHost, setLanHost] = useState('')
+  const [wanHost, setWanHost] = useState('')
   const [g10Token, setG10Token] = useState('')
   const [feedback, setFeedback] = useState<{ kind: 'ok' | 'err'; msg: string } | null>(null)
   const [loading, setLoading] = useState(false)
@@ -149,8 +136,8 @@ function G10ConfigSection() {
   useEffect(() => {
     void invoke<AppSettings>('cookie_get_app_settings').then(s => {
       setMode(s.mode ?? 'auto')
-      setLan(s.lan ?? { g10_base: '', asr_url: '' })
-      setWan(s.wan ?? { g10_base: '', asr_url: '' })
+      setLanHost(s.lan_host ?? '')
+      setWanHost(s.wan_host ?? '')
       setG10Token(s.g10_token ?? '')
     }).catch(err => console.error('[SettingsPage] 加载 G10 配置失败:', err))
     void refreshStatus()
@@ -161,16 +148,14 @@ function G10ConfigSection() {
     setTimeout(() => setFeedback(null), 3000)
   }
 
-  const trimEp = (ep: Endpoint): Endpoint => ({ g10_base: ep.g10_base.trim(), asr_url: ep.asr_url.trim() })
-
   const handleSave = async () => {
     setLoading(true)
     try {
       const settingsData: AppSettings = {
-        schema: 2,
+        schema: 3,
         mode,
-        lan: trimEp(lan),
-        wan: trimEp(wan),
+        lan_host: lanHost.trim(),
+        wan_host: wanHost.trim(),
         g10_token: g10Token.trim() || null,
       }
       await invoke('cookie_save_app_settings', { settingsData })
@@ -235,21 +220,21 @@ function G10ConfigSection() {
         </p>
       </div>
 
-      <EndpointFields
+      <HostField
         title="局域网地址（在家直连）"
         icon={<Wifi size={13} />}
-        ep={lan}
-        onChange={setLan}
-        g10Placeholder="http://192.168.1.100:8788"
-        asrPlaceholder="ws://192.168.1.100:8090/stream"
+        value={lanHost}
+        onChange={setLanHost}
+        placeholder="192.168.1.100"
+        hint="只填局域网 IP；端口/协议（http :8788、ASR ws）由各服务自动决定。需要时可写 IP:端口。"
       />
-      <EndpointFields
+      <HostField
         title="外网地址（在外经域名）"
         icon={<Globe size={13} />}
-        ep={wan}
-        onChange={setWan}
-        g10Placeholder="https://www.for-memory.cloud:28080"
-        asrPlaceholder="wss://www.for-memory.cloud:28090/stream"
+        value={wanHost}
+        onChange={setWanHost}
+        placeholder="www.for-memory.cloud:28080"
+        hint="只填外网域名（含反代端口）；https + wss、ASR 路径全部自动派生。"
       />
 
       <div className="flex flex-col gap-2">

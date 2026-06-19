@@ -1,15 +1,13 @@
 //! 全局应用配置，落盘在 `{workspace}/app.json`。
 //!
-//! **单节点双地址模型**：同一台 GB10 既可经局域网直连，也可经外网域名到达。配置里为
-//! 每条路径各存一组地址（g10 代理 base + 语音 ASR 的 WebSocket 地址）。`mode` 决定运行时
-//! 选哪条：
-//! - `auto`（默认）：对局域网 g10 健康端点做一次短超时探测，通则走局域网、否则回退外网；
-//! - `lan` / `wan`：强制档（调试用）。
+//! **单服务 · 单 host 模型**：orchestrator 已并入 toolkit-server（ASR 走
+//! `{g10_base}/api/asr/stream`），桌面端直连的后端只剩 toolkit-server 一个。所以用户只需填
+//! 两个 **host**：局域网 IP、外网域名。各服务的协议/端口/路径是部署事实，烘进代码
+//! （[`NetScheme`]）——`http(s)` 与端口按局域网/外网各自固定，ASR 由同一 host 派生 `ws(s)`。
 //!
-//! g10 代理类服务（cookie / TTS / 清洗 / LLM / english 替换）与语音 ASR 同属一个节点，
-//! 自动切换时一起切，避免「代理走外网、语音仍连内网 IP」的错位。
-//!
-//! 解析带缓存：见 [`NetResolver`]。旧版 `app.json`（schema 1，仅单 `g10_base`）会被平滑迁移。
+//! `mode`：`auto`（默认，探测局域网可达性自动选路）/ `lan` / `wan`（强制档，调试用）。
+//! 解析带缓存：见 [`NetResolver`]。旧版 `app.json`（schema 1 单 `g10_base` / schema 2 双
+//! `Endpoint`）会被平滑迁移成 host。
 
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
@@ -17,47 +15,58 @@ use std::time::{Duration, Instant};
 use tokio::sync::Mutex;
 
 /// 当前 app.json schema 版本。
-const CURRENT_SCHEMA: u32 = 2;
+const CURRENT_SCHEMA: u32 = 3;
 /// 自动探测的 health 请求超时（局域网内基本 10ms 返回；不可达则快速回退外网）。
 const PROBE_TIMEOUT: Duration = Duration::from_millis(800);
 /// 探测结果缓存时长；保存配置 / 网络变化时通过 [`NetResolver::invalidate`] 主动失效。
 const PROBE_TTL: Duration = Duration::from_secs(30);
 
-/// 一条到达路径的地址对。任一字段允许为空串，表示该路径未配置对应服务。
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
-pub struct Endpoint {
-    /// g10 代理 base，如 `http://192.168.1.100:8788`（不含路径）。
-    #[serde(default)]
-    pub g10_base: String,
-    /// 语音 ASR orchestrator 的 WebSocket 地址，如 `ws://192.168.1.100:8090/stream`。
-    #[serde(default)]
-    pub asr_url: String,
+/// 默认外网 host（含端口，与既有 G10 反代一致）。
+const DEFAULT_WAN_HOST: &str = "www.for-memory.cloud:28080";
+
+/// 一种到达路径（局域网 / 外网）的协议与默认端口约定——**部署事实，非用户配置**。
+/// `host` 不含端口时补 `default_port`；含端口则原样用。
+struct NetScheme {
+    /// g10 代理类服务（toolkit-server）的 HTTP 协议。
+    http: &'static str,
+    /// 语音 ASR WebSocket 协议（与 http 同 host/端口，仅协议升级）。
+    ws: &'static str,
+    /// host 未显式带端口时补的默认端口。
+    default_port: u16,
 }
 
+/// 局域网：toolkit-server 原生端口 8788 + 明文 http/ws。
+const LAN_SCHEME: NetScheme = NetScheme {
+    http: "http",
+    ws: "ws",
+    default_port: 8788,
+};
+/// 外网：反向代理发布端口 28080 + TLS https/wss。
+const WAN_SCHEME: NetScheme = NetScheme {
+    http: "https",
+    ws: "wss",
+    default_port: 28080,
+};
+
+/// ASR WebSocket 在 toolkit-server 下的挂载路径（orchestrator 并入后）。
+const ASR_PATH: &str = "/api/asr/stream";
+
 /// 网络模式：自动探测 / 强制局域网 / 强制外网。
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum NetMode {
+    #[default]
     Auto,
     Lan,
     Wan,
-}
-
-impl Default for NetMode {
-    fn default() -> Self {
-        NetMode::Auto
-    }
 }
 
 fn default_schema() -> u32 {
     CURRENT_SCHEMA
 }
 
-fn default_wan() -> Endpoint {
-    Endpoint {
-        g10_base: "https://www.for-memory.cloud:28080".to_string(),
-        asr_url: String::new(),
-    }
+fn default_wan_host() -> String {
+    DEFAULT_WAN_HOST.to_string()
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -66,12 +75,12 @@ pub struct AppSettings {
     pub schema: u32,
     #[serde(default)]
     pub mode: NetMode,
-    /// 局域网路径地址（在家直连，速度快）。
+    /// 局域网 host（IP，可含 `:port`；不含端口则用 8788）。留空表示未配局域网。
     #[serde(default)]
-    pub lan: Endpoint,
-    /// 外网路径地址（在外经域名到达）。
-    #[serde(default = "default_wan")]
-    pub wan: Endpoint,
+    pub lan_host: String,
+    /// 外网 host（域名，可含 `:port`；不含端口则用 28080）。
+    #[serde(default = "default_wan_host")]
+    pub wan_host: String,
     /// 可选 Bearer token（若 G10 server 启用了鉴权；内外网共用）。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub g10_token: Option<String>,
@@ -82,58 +91,63 @@ impl Default for AppSettings {
         Self {
             schema: CURRENT_SCHEMA,
             mode: NetMode::Auto,
-            lan: Endpoint::default(),
-            wan: default_wan(),
+            lan_host: String::new(),
+            wan_host: default_wan_host(),
             g10_token: None,
         }
     }
 }
 
-/// schema 1 旧结构（仅单 `g10_base` + token）。
-#[derive(Deserialize)]
-struct LegacyAppSettings {
-    #[serde(default)]
-    g10_base: String,
-    #[serde(default)]
-    g10_token: Option<String>,
+/// 把用户输入/旧配置规整成 `host[:port]`：剥掉 `scheme://` 前缀与路径；空 → 空。
+/// 不在此补默认端口（补端口在派生时按 [`NetScheme`] 做，便于「裸 host + 默认端口」展示）。
+fn normalize_host(raw: &str) -> String {
+    let s = raw.trim();
+    if s.is_empty() {
+        return String::new();
+    }
+    // 容错：用户可能粘进整条 URL（http://x:8788/...）。
+    let s = s.rsplit("://").next().unwrap_or(s);
+    let s = s.split('/').next().unwrap_or(s);
+    s.trim().trim_end_matches('.').to_string()
+}
+
+/// `host[:port]` + scheme → `host:port`（无端口补默认）。空 host → 空。
+fn host_with_port(host: &str, default_port: u16) -> String {
+    let h = normalize_host(host);
+    if h.is_empty() {
+        return String::new();
+    }
+    if h.contains(':') {
+        h
+    } else {
+        format!("{h}:{default_port}")
+    }
 }
 
 impl AppSettings {
-    /// 从旧版（schema 1）迁移：旧单地址挪到 `wan.g10_base`，mode 留 `auto`（局域网未配时
-    /// auto 直接走外网，行为与旧版完全一致；用户补上局域网地址后即自动启用切换）。
-    fn from_legacy(legacy: LegacyAppSettings) -> Self {
-        let base = legacy.g10_base.trim().to_string();
-        let wan = if base.is_empty() {
-            default_wan()
-        } else {
-            Endpoint {
-                g10_base: base,
-                asr_url: String::new(),
-            }
-        };
-        Self {
-            schema: CURRENT_SCHEMA,
-            mode: NetMode::Auto,
-            lan: Endpoint::default(),
-            wan,
-            g10_token: legacy.g10_token,
-        }
-    }
-
-    fn endpoint_for(&self, mode: NetMode) -> &Endpoint {
+    fn host_for(&self, mode: NetMode) -> (&str, &NetScheme) {
         match mode {
-            NetMode::Lan => &self.lan,
+            NetMode::Lan => (&self.lan_host, &LAN_SCHEME),
             // Auto 仅作兜底（探测后会显式传 Lan/Wan）。
-            NetMode::Wan | NetMode::Auto => &self.wan,
+            NetMode::Wan | NetMode::Auto => (&self.wan_host, &WAN_SCHEME),
         }
     }
 
-    /// 按选定路径构造运行时端点（trim 后）。
+    /// 按选定路径，从 host 派生运行时端点（g10_base + asr_url）。
     fn resolved(&self, picked: NetMode) -> ResolvedEndpoint {
-        let ep = self.endpoint_for(picked);
+        let (host, scheme) = self.host_for(picked);
+        let hostport = host_with_port(host, scheme.default_port);
+        let (g10_base, asr_url) = if hostport.is_empty() {
+            (String::new(), String::new())
+        } else {
+            (
+                format!("{}://{hostport}", scheme.http),
+                format!("{}://{hostport}{ASR_PATH}", scheme.ws),
+            )
+        };
         ResolvedEndpoint {
-            g10_base: ep.g10_base.trim().to_string(),
-            asr_url: ep.asr_url.trim().to_string(),
+            g10_base,
+            asr_url,
             g10_token: self.g10_token.clone().filter(|s| !s.trim().is_empty()),
             picked,
         }
@@ -141,7 +155,7 @@ impl AppSettings {
 }
 
 /// 运行时选定的一条到达路径 + token，附带选中的模式（供 UI 展示）。
-/// 各服务端点统一从这里派生，调用方不再直接读裸 `g10_base`。
+/// 各服务端点统一从这里派生，调用方不再直接读裸 host / `g10_base`。
 #[derive(Debug, Clone)]
 pub struct ResolvedEndpoint {
     pub g10_base: String,
@@ -202,18 +216,63 @@ pub fn app_settings_path(workspace: &Path) -> PathBuf {
     workspace.join("app.json")
 }
 
-/// 解析 app.json 文本，自动识别 schema 1 / 2 并迁移。
+/// 从旧配置的 URL/base 提取 `host[:port]`（剥 scheme + 路径）。供 schema 1/2 迁移。
+fn host_from_base(base: &str) -> String {
+    normalize_host(base)
+}
+
+/// 解析 app.json 文本，自动识别 schema 1/2/3 并迁移到 host 模型。
 fn parse_app_settings(raw: &str) -> Result<AppSettings, serde_json::Error> {
     let value: serde_json::Value = serde_json::from_str(raw)?;
     let schema = value.get("schema").and_then(|v| v.as_u64()).unwrap_or(1);
-    let has_v2_keys =
-        value.get("lan").is_some() || value.get("wan").is_some() || value.get("mode").is_some();
-    if schema >= 2 || has_v2_keys {
-        serde_json::from_value(value)
-    } else {
-        let legacy: LegacyAppSettings = serde_json::from_value(value)?;
-        Ok(AppSettings::from_legacy(legacy))
+    let has_v3_keys = value.get("lan_host").is_some() || value.get("wan_host").is_some();
+    if schema >= 3 || has_v3_keys {
+        return serde_json::from_value(value);
     }
+
+    // 旧版迁移：取 mode / token + 从 g10_base 抽 host。
+    let mode = value
+        .get("mode")
+        .and_then(|m| serde_json::from_value::<NetMode>(m.clone()).ok())
+        .unwrap_or_default();
+    let g10_token = value
+        .get("g10_token")
+        .and_then(|t| t.as_str())
+        .map(str::to_string);
+
+    let (lan_host, wan_host) = if value.get("lan").is_some() || value.get("wan").is_some() {
+        // schema 2：lan/wan 各有 g10_base。
+        let pick = |key: &str| {
+            value
+                .get(key)
+                .and_then(|e| e.get("g10_base"))
+                .and_then(|b| b.as_str())
+                .map(host_from_base)
+                .unwrap_or_default()
+        };
+        (pick("lan"), pick("wan"))
+    } else {
+        // schema 1：单 g10_base → 当外网。
+        let wan = value
+            .get("g10_base")
+            .and_then(|b| b.as_str())
+            .map(host_from_base)
+            .unwrap_or_default();
+        (String::new(), wan)
+    };
+    let wan_host = if wan_host.is_empty() {
+        default_wan_host()
+    } else {
+        wan_host
+    };
+
+    Ok(AppSettings {
+        schema: CURRENT_SCHEMA,
+        mode,
+        lan_host,
+        wan_host,
+        g10_token,
+    })
 }
 
 pub fn load_app_settings(workspace: &Path) -> AppSettings {
@@ -290,8 +349,9 @@ impl NetResolver {
             NetMode::Wan => return settings.resolved(NetMode::Wan),
             NetMode::Auto => {}
         }
-        // 局域网地址未配 → 无需探测，直接外网。
-        if settings.lan.g10_base.trim().is_empty() {
+        // 局域网未配 → 无需探测，直接外网。
+        let lan = settings.resolved(NetMode::Lan);
+        if !lan.is_configured() {
             return settings.resolved(NetMode::Wan);
         }
         let mut guard = self.cache.lock().await;
@@ -300,8 +360,12 @@ impl NetResolver {
                 return entry.resolved.clone();
             }
         }
-        let lan_ok = health_ok(&settings.lan.g10_base).await;
-        let resolved = settings.resolved(if lan_ok { NetMode::Lan } else { NetMode::Wan });
+        let lan_ok = health_ok(&lan.g10_base).await;
+        let resolved = if lan_ok {
+            lan
+        } else {
+            settings.resolved(NetMode::Wan)
+        };
         *guard = Some(CacheEntry {
             resolved: resolved.clone(),
             at: Instant::now(),
@@ -320,25 +384,67 @@ mod tests {
     use super::*;
 
     #[test]
-    fn legacy_schema1_migrates_to_wan_base() {
+    fn fresh_default_is_auto_wan_host() {
+        let s = AppSettings::default();
+        assert_eq!(s.mode, NetMode::Auto);
+        assert_eq!(s.wan_host, DEFAULT_WAN_HOST);
+        assert!(s.lan_host.is_empty());
+    }
+
+    #[test]
+    fn lan_host_derives_http_and_ws() {
+        let s = AppSettings {
+            lan_host: "192.168.1.100".to_string(),
+            ..AppSettings::default()
+        };
+        let r = s.resolved(NetMode::Lan);
+        assert!(r.is_configured());
+        assert_eq!(r.g10_base, "http://192.168.1.100:8788");
+        assert_eq!(r.asr_url, "ws://192.168.1.100:8788/api/asr/stream");
+        assert_eq!(
+            r.tts_endpoint().as_deref(),
+            Some("http://192.168.1.100:8788/api/web/audio/tts")
+        );
+    }
+
+    #[test]
+    fn wan_host_derives_https_and_wss() {
+        let s = AppSettings::default();
+        let r = s.resolved(NetMode::Wan);
+        assert_eq!(r.g10_base, "https://www.for-memory.cloud:28080");
+        assert_eq!(r.asr_url, "wss://www.for-memory.cloud:28080/api/asr/stream");
+    }
+
+    #[test]
+    fn explicit_port_in_host_overrides_default() {
+        let s = AppSettings {
+            lan_host: "10.0.0.2:9000".to_string(),
+            ..AppSettings::default()
+        };
+        assert_eq!(s.resolved(NetMode::Lan).g10_base, "http://10.0.0.2:9000");
+    }
+
+    #[test]
+    fn empty_lan_host_not_configured() {
+        let s = AppSettings::default();
+        let r = s.resolved(NetMode::Lan);
+        assert!(!r.is_configured());
+        assert_eq!(r.tts_endpoint(), None);
+        assert_eq!(r.asr_url, "");
+    }
+
+    #[test]
+    fn migrate_schema1_single_base_to_wan_host() {
         let raw = r#"{"g10_base":"http://192.168.1.50:8788","g10_token":"abc"}"#;
         let s = parse_app_settings(raw).unwrap();
         assert_eq!(s.schema, CURRENT_SCHEMA);
-        assert_eq!(s.mode, NetMode::Auto);
-        assert_eq!(s.wan.g10_base, "http://192.168.1.50:8788");
-        assert!(s.lan.g10_base.is_empty());
+        assert_eq!(s.wan_host, "192.168.1.50:8788");
+        assert!(s.lan_host.is_empty());
         assert_eq!(s.g10_token.as_deref(), Some("abc"));
     }
 
     #[test]
-    fn legacy_empty_base_falls_back_to_default_wan() {
-        let raw = r#"{"g10_token":null}"#;
-        let s = parse_app_settings(raw).unwrap();
-        assert_eq!(s.wan.g10_base, "https://www.for-memory.cloud:28080");
-    }
-
-    #[test]
-    fn v2_roundtrip_parses() {
+    fn migrate_schema2_extracts_hosts() {
         let raw = r#"{
             "schema":2,"mode":"lan",
             "lan":{"g10_base":"http://10.0.0.2:8788","asr_url":"ws://10.0.0.2:8090/stream"},
@@ -347,56 +453,25 @@ mod tests {
         }"#;
         let s = parse_app_settings(raw).unwrap();
         assert_eq!(s.mode, NetMode::Lan);
-        assert_eq!(s.lan.asr_url, "ws://10.0.0.2:8090/stream");
-        assert_eq!(s.wan.g10_base, "https://x.cloud:28080");
+        assert_eq!(s.lan_host, "10.0.0.2:8788");
+        assert_eq!(s.wan_host, "x.cloud:28080");
+        assert_eq!(s.g10_token.as_deref(), Some("tok"));
     }
 
     #[test]
-    fn resolved_lan_builds_endpoints() {
-        let s = AppSettings {
-            schema: 2,
-            mode: NetMode::Lan,
-            lan: Endpoint {
-                g10_base: "http://10.0.0.2:8788/".to_string(),
-                asr_url: "ws://10.0.0.2:8090/stream".to_string(),
-            },
-            wan: default_wan(),
-            g10_token: Some("tok".to_string()),
-        };
-        let r = s.resolved(NetMode::Lan);
-        assert!(r.is_configured());
-        assert_eq!(
-            r.tts_endpoint().as_deref(),
-            Some("http://10.0.0.2:8788/api/web/audio/tts")
-        );
-        assert_eq!(
-            r.llm_endpoint("/config").as_deref(),
-            Some("http://10.0.0.2:8788/api/web/llm/config")
-        );
-        assert_eq!(r.asr_url, "ws://10.0.0.2:8090/stream");
-        assert_eq!(r.g10_token.as_deref(), Some("tok"));
-    }
-
-    #[test]
-    fn resolved_empty_base_not_configured() {
-        let s = AppSettings {
-            schema: 2,
-            mode: NetMode::Lan,
-            lan: Endpoint::default(),
-            wan: default_wan(),
-            g10_token: None,
-        };
-        let r = s.resolved(NetMode::Lan);
-        assert!(!r.is_configured());
-        assert_eq!(r.tts_endpoint(), None);
+    fn migrate_empty_wan_falls_back_to_default() {
+        let raw = r#"{"g10_token":null}"#;
+        let s = parse_app_settings(raw).unwrap();
+        assert_eq!(s.wan_host, DEFAULT_WAN_HOST);
     }
 
     #[test]
     fn blank_token_filtered_out() {
         let s = AppSettings {
+            lan_host: "1.2.3.4".to_string(),
             g10_token: Some("   ".to_string()),
             ..AppSettings::default()
         };
-        assert_eq!(s.resolved(NetMode::Wan).g10_token, None);
+        assert_eq!(s.resolved(NetMode::Lan).g10_token, None);
     }
 }

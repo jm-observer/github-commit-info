@@ -20,9 +20,13 @@
     跳过交叉编译，直接复制已有产物（调试部署用）。
 
 .PARAMETER Service
-    部署后要 install + 重启的 systemd 用户服务名,默认 toolkit-server。daemon 见 $DaemonBins
-    (toolkit-server / orchestrator);二进制名即服务名。其余 $Bins 是 CLI 工具,无需重启。
-    部署面板按各服务分别调用本脚本(每次一个 -Service)。
+    部署后要 install + 重启的 systemd 用户服务名,默认 toolkit-server。daemon 见 $DaemonBins。
+    二进制名即服务名。其余 $Bins 是 CLI 工具,无需重启。部署面板按各服务分别调用本脚本
+    (每次一个 -Service)。
+    注:orchestrator(ASR 编排层)已并入 toolkit-server 同进程(ASR 走 /api/asr/stream),
+    不再单独部署;G10 上若残留旧 orchestrator 服务,执行
+    `systemctl --user disable --now orchestrator` 停掉(其 app.db 可拷到 toolkit-server
+    workspace 以保留声纹/历史)。
 
 .PARAMETER SkipRestart
     跳过部署后重启（仅换二进制，下次服务自然重启时生效）。
@@ -48,7 +52,6 @@
     pwsh ./deploy-g10.ps1 -SkipRestart
     pwsh ./deploy-g10.ps1 -Bind 0.0.0.0:8790
     pwsh ./deploy-g10.ps1 -Env TTS_BASE_URL=http://127.0.0.1:8095,LLM_MODEL=qwen
-    pwsh ./deploy-g10.ps1 -Service orchestrator -Bind 0.0.0.0:8090
 #>
 param(
     [string]$G10Host = "fengqi@192.168.0.68",
@@ -72,13 +75,15 @@ $Bins = @(
     @{ Crate = "github_commit_info"; Bin = "github-commit-info" },
     @{ Crate = "hf_watcher";         Bin = "hf-watcher" },
     @{ Crate = "douyin";             Bin = "douyin" },
-    @{ Crate = "toolkit-server";     Bin = "toolkit-server" },
-    @{ Crate = "orchestrator";       Bin = "orchestrator" }
+    @{ Crate = "toolkit-server";     Bin = "toolkit-server" }
 )
+# 注:orchestrator 已并入 toolkit-server 同进程(ASR=/api/asr/stream),不再单独构建/部署。
+# 其 ASR 下游地址走环境变量(ASR_WS/ASR_EMBED/VLLM_BASE/VLLM_MODEL),缺省即本机回环,
+# 需要时经 -Env 注入 toolkit-server unit。
 
 # 哪些 $Bins 是 daemon（有 `install`/systemd unit、需重装+重启）；其余是 CLI 工具。
 # 二进制名即 unit/服务名。新增 daemon 时在此追加。
-$DaemonBins = @("toolkit-server", "orchestrator")
+$DaemonBins = @("toolkit-server")
 
 if (-not $SkipBuild) {
     Write-Host "==> 交叉编译 $Target（Docker: $Image）" -ForegroundColor Cyan

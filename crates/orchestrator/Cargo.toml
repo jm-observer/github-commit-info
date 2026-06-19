@@ -9,9 +9,9 @@ edition.workspace = true
 
 [dependencies]
 tokio = { workspace = true, features = ["rt", "rt-multi-thread", "macros", "signal", "net", "time"] }
-# axum 显式 0.7:本 crate 是独立 binary,与 workspace 的 axum 0.8 互不影响(WS Message
-# 类型在 0.8 有破坏性变更,迁移期保持 0.7 降低风险)。
-axum = { version = "0.7", features = ["ws"] }
+# axum 跟随 workspace(0.8)+ ws feature:orchestrator 已并入 toolkit-server 同进程同
+# 路由,必须与宿主 axum 版本一致才能 nest;WS Message 在 0.8 改用 Utf8Bytes/Bytes。
+axum = { workspace = true, features = ["ws"] }
 tokio-tungstenite = "0.24"
 futures-util = "0.3"
 serde = { workspace = true }

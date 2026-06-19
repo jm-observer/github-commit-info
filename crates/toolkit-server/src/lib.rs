@@ -84,7 +84,11 @@ pub async fn serve_with_web(
     state: AppState,
     web_dir: &std::path::Path,
 ) -> Result<()> {
-    let app = build_router(state, web_dir);
+    // orchestrator(ASR 编排层）同进程挂载到 /api/asr：WS 在 /api/asr/stream，HTTP 在
+    // /api/asr/api/*。其 app.db 落在 toolkit-server 的 workspace 下，与 toolkit.db 并列。
+    let orch_ctx =
+        orchestrator::init_ctx(&state.workspace).context("orchestrator init_ctx (ASR 编排层)")?;
+    let app = build_router(state, web_dir).nest("/api/asr", orchestrator::router(orch_ctx));
     let listener = tokio::net::TcpListener::bind(bind)
         .await
         .with_context(|| format!("bind {bind}"))?;

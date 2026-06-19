@@ -19,7 +19,7 @@ workspace，作为 zero/Agent 生态的统一工具底座。架构目标：
 | `toolkit-tasks` | **通用长任务引擎**：`TaskKind` trait + `Registry` 注册、`submit` 即 spawn、`run_task` 状态机、`store` 持久化到 `tasks` 表。 |
 | `toolkit-llm` | **统一 OpenAI 兼容 LLM 客户端**：`LlmConfig`（含 `from_env`）+ `LlmClient`（`complete`/`chat` + 指数退避重试 + 响应解析）+ `prompt_hash`。任何需调大模型的内部 crate 都走它，不要自行拼 HTTP。**不持有提示词**（提示词由功能层/可配目录决定后传入）。 |
 | `toolkit-server` | axum daemon。`bootstrap` 装配 pool/migrate/registry/recovery；`/api/web`、`/api/web/audio`（TTS 代理）、`/api/web/douyin`、`/api/web/llm`（**公共大模型：连接配置/可配提示词/连通性自测/对话总结**）、`/api/agent`、`/api/browser` 路由 + web 控制台。systemd 安装 / 自更新（`custom-utils` updater）。 |
-| `toolkit-desktop` | Tauri 桌面端：抖音 / 同花顺登录窗（headless_chrome/CDP）、msToken 采集、cookie 自动上传 G10。**需 Tauri 工具链**，CI 式环境通常排除。 |
+| `zero-desktop` | 统一 Tauri 桌面壳：cookie 采集（抖音/同花顺 headless_chrome/CDP + msToken + 上传 G10）、speech / english / codeloop / g10-deploy / 音乐 / 网络策略 等模块。**需 Tauri 工具链**，CI 式环境通常排除。 |
 | `asr-client` | 通用 FunASR `/transcribe` HTTP 客户端（multipart 上传 + 强类型响应 + 错误归类）。**任何需要离线 ASR 的内部 crate 都走它**，不要自行拼 multipart。端点契约权威源在 streaming-speech `docs/asr-transcribe-api.md`。 |
 | `douyin` | 抖音 web 工具：a-bogus 签名、creator/works/tags API、下载 + ASR 管线（**通过 `asr-client` 调 FunASR**）、LLM 整理（`refine`）、knowledge md 生成。既是库（被 server 调）也有独立 daemon/CLI。 |
 | `rag` | 抖音 knowledge md 的语义检索 → sqlite-vec。CLI `ingest`/`search`，HTTP `serve`。 |
@@ -32,7 +32,7 @@ workspace，作为 zero/Agent 生态的统一工具底座。架构目标：
 # 构建 / 测试（desktop 需 Tauri，CI 式环境排除）
 cargo check --workspace
 cargo test  --workspace
-cargo check --workspace --exclude toolkit-desktop      # 无 Tauri 工具链时
+cargo check --workspace --exclude zero-desktop         # 无 Tauri 工具链时
 cargo fmt
 
 # 本地起 server（workspace = 所有持久状态的根目录）
@@ -114,11 +114,21 @@ pwsh ./deploy-g10.ps1 -SkipBuild # 仅复制已有产物
 
 | 端口 | 服务 | 维护仓 |
 |---|---|---|
-| `:9101` | FunASR `/transcribe`（离线 ASR） | streaming-speech |
+| `:9100` | FunASR 流式 ASR WebSocket（orchestrator 上游） | streaming-speech |
+| `:9101` | FunASR `/transcribe` + `/embed`（离线 ASR / 声纹） | streaming-speech |
 | `:8095` | CosyVoice2 TTS | streaming-speech |
 | `:8097` | audio-cleanup `/clean`（音频清洗） | streaming-speech |
-| `:8788` | toolkit-server（Web API + 代理 + 控制台） | 本仓 |
+| `:8788` | toolkit-server（Web API + 代理 + 控制台 + **内嵌 ASR 编排**） | 本仓 |
 | `:8000` | vLLM（OpenAI 兼容 LLM） | 第三方/外部 |
+
+> **orchestrator（StreamSpeech ASR 编排层）已并入 toolkit-server 同进程**：其 axum 路由 nest 在
+> `/api/asr` 下（WS=`/api/asr/stream`、HTTP=`/api/asr/api/*`），不再独立 `:8090` 部署。`orchestrator`
+> crate 现为 **lib + bin** 双形态——lib 暴露 `router(ctx)`/`init_ctx()` 供 toolkit-server 挂载，bin 仅
+> 留作独立调试。下游地址（`ASR_WS`/`ASR_EMBED`/`VLLM_BASE`/`VLLM_MODEL`）经 toolkit-server 的 env 传入，
+> 缺省即本机回环。其 `app.db`（声纹/段落/配置）落在 toolkit-server 的 workspace 下，与 `toolkit.db` 并列。
+> **桌面端（zero-desktop）只需配「局域网 IP / 外网域名」两个 host**：协议/端口/ASR 路径按局域网（http/ws
+> :8788）或外网（https/wss :28080 反代）的固定约定派生，`auto` 模式经 health 探测自动选路（见
+> `zero-desktop/src/shared/settings.rs`）。
 
 ## 公共大模型层（LLM 中枢）
 
