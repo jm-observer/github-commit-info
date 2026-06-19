@@ -1,11 +1,13 @@
-import { Eye, MessageSquare, Play, Square, Stethoscope } from 'lucide-react'
-import type { Progress, ReviewMode } from '../api/tauri-client'
+import { Eye, MessageSquare, Play, Stethoscope } from 'lucide-react'
+import type { EntryKind, ReviewMode } from '../api/tauri-client'
 
 interface Props {
   targetPath: string
   setTargetPath: (v: string) => void
+  /** 入口种类：决定 target_path 控件的 label 文案（多入口设计 §7）。 */
+  entryKind: EntryKind
+  /** ReviewSeed 时的二级 mode 子选；DocReview/Implement 时只读、由入口决定。 */
   mode: ReviewMode
-  setMode: (v: ReviewMode) => void
   maxRounds: number
   setMaxRounds: (v: number) => void
   waitIdle: boolean
@@ -21,86 +23,51 @@ interface Props {
   setEstClaude: (v: boolean) => void
   /** 打开预览 / 手动驱动台。 */
   onPreview: () => void
-  running: boolean
   canStart: boolean
   onStart: () => void
-  onStop: () => void
   /** 跟踪：弹出所选两个会话的消息记录。 */
   onTrack: () => void
   canTrack: boolean
   /** 环境自检：弹出 preflight 面板。 */
   onPreflight: () => void
   canPreflight: boolean
-  progress: Progress | null
-  /** 运行中是否已转全自动（= !step_confirm）。 */
-  liveAuto: boolean
-  /** 运行中翻转自动确认（true=转全自动 / false=恢复逐步确认）。 */
-  onToggleAuto: (enabled: boolean) => void
+  /** 当前并发运行中的循环数（并发模型：本栏只配置 + 启动，运行态在下方记录里逐个管理）。 */
+  liveCount: number
 }
 
-const VERDICT_LABELS: Record<string, string> = {
-  pass: 'PASS',
-  needs_work: 'NEEDS_WORK',
-  parse_failed: '解析失败',
-}
-
-const FINAL_LABELS: Record<string, string> = {
-  pass: '通过 ✓',
-  max_rounds: '达最大轮次',
-  aborted_timeout: '超时中止',
-  aborted_parse: '解析失败中止',
-  aborted_by_user: '用户中止（可调整后重启）',
-  interrupted: '中断（应用重启）',
-}
-
-function statusText(running: boolean, p: Progress | null): { text: string; cls: string } {
-  if (p?.phase === 'error') return { text: '基础设施错误', cls: 'text-red-600 dark:text-red-400' }
-  if (p?.phase === 'awaiting_confirm')
-    return { text: '等待确认传递…', cls: 'text-amber-600 dark:text-amber-400' }
-  if (p?.phase === 'awaiting_input')
-    return { text: '等待你作答…', cls: 'text-amber-600 dark:text-amber-400' }
-  if (p?.phase === 'done') {
-    const f = p.final_verdict ?? ''
-    const ok = f === 'pass'
-    return {
-      text: `已结束：${FINAL_LABELS[f] ?? f}`,
-      cls: ok ? 'text-green-600 dark:text-green-400' : 'text-amber-600 dark:text-amber-400',
-    }
+/** target_path 控件的 label 文案随入口 + mode 变化（§7 角色矩阵）。 */
+function targetPathLabel(entryKind: EntryKind, mode: ReviewMode): string {
+  switch (entryKind) {
+    case 'doc_review':
+      return '待复核 / 修订文档（仓库内路径）'
+    case 'implement':
+      return '设计/规格文档（仓库内路径）'
+    case 'review_seed':
+      return mode === 'implementation'
+        ? '待修订代码根（仓库内路径）'
+        : '待修订文档（仓库内路径）'
   }
-  if (running) return { text: '运行中 ●', cls: 'text-blue-600 dark:text-blue-400' }
-  return { text: '空闲', cls: 'text-gray-400' }
 }
 
+/**
+ * 新建循环的配置 + 启动栏（并发模型）：本栏只负责「配一个新循环并启动」，启动后表单清空、
+ * 可继续配下一个；运行中循环的停止 / 逐步确认翻转在下方记录的详情面板里逐个进行。
+ */
 export function LoopStatusBar(props: Props) {
-  const { running, canStart, onStart, onStop, progress: p } = props
-  const st = statusText(running, p)
+  const { canStart, onStart, entryKind, mode, liveCount } = props
 
   return (
     <div className="flex flex-col gap-2 rounded-md border border-gray-200 bg-gray-50 p-3 dark:border-gray-800 dark:bg-gray-900">
       <div className="flex flex-wrap items-end gap-3">
         <div className="flex flex-1 flex-col gap-1" style={{ minWidth: 220 }}>
-          <label className="text-xs text-gray-500 dark:text-gray-400">复核目标（仓库内文件/目录路径）</label>
+          <label className="text-xs text-gray-500 dark:text-gray-400">{targetPathLabel(entryKind, mode)}</label>
           <input
             type="text"
             value={props.targetPath}
             onChange={e => props.setTargetPath(e.target.value)}
-            disabled={running}
-            placeholder="docs/foo.md"
-            className="rounded-md border border-gray-300 bg-white px-2 py-1.5 text-sm outline-none focus:border-blue-400 disabled:opacity-60 dark:border-gray-600 dark:bg-gray-800 dark:text-gray-100"
+            placeholder={entryKind === 'review_seed' && mode === 'implementation' ? 'src/' : 'docs/foo.md'}
+            className="rounded-md border border-gray-300 bg-white px-2 py-1.5 text-sm outline-none focus:border-blue-400 dark:border-gray-600 dark:bg-gray-800 dark:text-gray-100"
           />
-        </div>
-
-        <div className="flex flex-col gap-1">
-          <label className="text-xs text-gray-500 dark:text-gray-400">模式</label>
-          <select
-            value={props.mode}
-            onChange={e => props.setMode(e.target.value as ReviewMode)}
-            disabled={running}
-            className="rounded-md border border-gray-300 bg-white px-2 py-1.5 text-sm outline-none focus:border-blue-400 disabled:opacity-60 dark:border-gray-600 dark:bg-gray-800 dark:text-gray-100"
-          >
-            <option value="design">设计复核</option>
-            <option value="implementation">实现复核</option>
-          </select>
         </div>
 
         <div className="flex flex-col gap-1">
@@ -111,8 +78,7 @@ export function LoopStatusBar(props: Props) {
             max={20}
             value={props.maxRounds}
             onChange={e => props.setMaxRounds(Math.max(1, Number(e.target.value) || 1))}
-            disabled={running}
-            className="w-20 rounded-md border border-gray-300 bg-white px-2 py-1.5 text-sm outline-none focus:border-blue-400 disabled:opacity-60 dark:border-gray-600 dark:bg-gray-800 dark:text-gray-100"
+            className="w-20 rounded-md border border-gray-300 bg-white px-2 py-1.5 text-sm outline-none focus:border-blue-400 dark:border-gray-600 dark:bg-gray-800 dark:text-gray-100"
           />
         </div>
 
@@ -121,26 +87,20 @@ export function LoopStatusBar(props: Props) {
             type="checkbox"
             checked={props.waitIdle}
             onChange={e => props.setWaitIdle(e.target.checked)}
-            disabled={running}
           />
           先等 Claude 当前轮完成
         </label>
 
         <label
           className="flex items-center gap-1.5 pb-2 text-xs text-gray-600 dark:text-gray-300"
-          title="运行中切换会立即应用到当前循环（取消勾选=转全自动；撞到 ASK_USER 仍会停下问你）"
+          title="新循环首轮起按此设置；运行中可在记录详情里逐个翻转"
         >
           <input
             type="checkbox"
-            // 运行中：复选框反映实时状态（逐步确认 = 非全自动），切换立即应用到当前循环。
-            checked={running ? !props.liveAuto : props.stepConfirm}
-            onChange={e => {
-              const checked = e.target.checked
-              if (running) props.onToggleAuto(!checked)
-              else props.setStepConfirm(checked)
-            }}
+            checked={props.stepConfirm}
+            onChange={e => props.setStepConfirm(e.target.checked)}
           />
-          逐步确认（每次传递先弹窗）{running && (props.liveAuto ? ' · 当前：全自动' : ' · 当前：逐步')}
+          逐步确认（每次传递先弹窗）
         </label>
 
         <label
@@ -151,7 +111,6 @@ export function LoopStatusBar(props: Props) {
             type="checkbox"
             checked={props.useWorktree}
             onChange={e => props.setUseWorktree(e.target.checked)}
-            disabled={running}
           />
           worktree 模式（Claude 用 worktree+子 agent 实现）
         </label>
@@ -164,7 +123,6 @@ export function LoopStatusBar(props: Props) {
             type="checkbox"
             checked={props.estCodex}
             onChange={e => props.setEstCodex(e.target.checked)}
-            disabled={running}
           />
           Codex 已预热
         </label>
@@ -176,7 +134,6 @@ export function LoopStatusBar(props: Props) {
             type="checkbox"
             checked={props.estClaude}
             onChange={e => props.setEstClaude(e.target.checked)}
-            disabled={running}
           />
           Claude 已预热
         </label>
@@ -211,43 +168,21 @@ export function LoopStatusBar(props: Props) {
           跟踪
         </button>
 
-        {running ? (
-          <button
-            onClick={onStop}
-            className="flex items-center gap-1.5 rounded-md bg-red-600 px-3 py-1.5 text-sm text-white hover:bg-red-700"
-          >
-            <Square size={14} />
-            停止
-          </button>
-        ) : (
-          <button
-            onClick={onStart}
-            disabled={!canStart}
-            className="flex items-center gap-1.5 rounded-md bg-blue-600 px-3 py-1.5 text-sm text-white hover:bg-blue-700 disabled:opacity-50"
-          >
-            <Play size={14} />
-            启动复核循环
-          </button>
-        )}
+        <button
+          onClick={onStart}
+          disabled={!canStart}
+          className="flex items-center gap-1.5 rounded-md bg-blue-600 px-3 py-1.5 text-sm text-white hover:bg-blue-700 disabled:opacity-50"
+        >
+          <Play size={14} />
+          启动复核循环
+        </button>
       </div>
 
       <div className="flex items-center gap-4 text-xs">
-        <span className={st.cls}>循环：{st.text}</span>
-        {p?.round != null && <span className="text-gray-500 dark:text-gray-400">轮次 {p.round}</span>}
-        {p?.verdict && (
-          <span className="text-gray-500 dark:text-gray-400">
-            判定 {VERDICT_LABELS[p.verdict] ?? p.verdict}
-          </span>
-        )}
-        {p?.phase === 'error' && p.error && (
-          <span className="truncate text-red-500" title={p.error}>
-            {p.error}
-          </span>
-        )}
-        {running && (
-          <span className="text-amber-600 dark:text-amber-400">
-            ⚠ 循环期间请勿在桌面端操作这两个会话
-          </span>
+        {liveCount > 0 ? (
+          <span className="text-blue-600 dark:text-blue-400">● {liveCount} 个循环运行中（在下方记录里逐个管理）</span>
+        ) : (
+          <span className="text-gray-400">空闲：配置上方表单后启动；可同时跑多个循环（同一会话除外）</span>
         )}
       </div>
     </div>

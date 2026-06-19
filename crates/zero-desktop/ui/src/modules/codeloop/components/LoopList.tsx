@@ -1,5 +1,5 @@
 import { RefreshCw, Trash2, GitBranch } from 'lucide-react'
-import type { LoopRow } from '../api/tauri-client'
+import type { EntryKind, LoopRow } from '../api/tauri-client'
 
 interface Props {
   loops: LoopRow[]
@@ -8,6 +8,10 @@ interface Props {
   onRefresh: () => void
   onDelete: (id: number) => void
   loading: boolean
+  /** 运行中循环 id（实时态，权威来自运行时；DB status 可能滞后）。 */
+  liveIds: Set<number>
+  /** 需关注循环 id（等待作答 / 确认）。 */
+  attentionIds: Set<number>
 }
 
 const STATUS_STYLE: Record<string, { label: string; cls: string }> = {
@@ -26,6 +30,18 @@ const FINAL_LABELS: Record<string, string> = {
   interrupted: '中断',
 }
 
+/** 入口徽标（旧数据 entry_kind=null 时按 mode 推断；见多入口设计 §5 兼容映射）。 */
+const ENTRY_META: Record<EntryKind, { icon: string; label: string; title: string }> = {
+  doc_review: { icon: '📄', label: '文档复核', title: '从文档复核开始（DocReview）' },
+  implement: { icon: '🛠', label: '实现', title: '从实现开始（Implement）' },
+  review_seed: { icon: '📝', label: '外部 seed', title: '从既有复核意见开始（ReviewSeed）' },
+}
+
+function inferEntryKind(loop: LoopRow): EntryKind {
+  if (loop.entry_kind) return loop.entry_kind
+  return loop.mode === 'design' ? 'doc_review' : 'implement'
+}
+
 function shortTime(iso: string): string {
   const d = new Date(iso)
   if (Number.isNaN(d.getTime())) return iso
@@ -35,7 +51,7 @@ function shortTime(iso: string): string {
 }
 
 export function LoopList(props: Props) {
-  const { loops, selectedId, onSelect, onRefresh, onDelete, loading } = props
+  const { loops, selectedId, onSelect, onRefresh, onDelete, loading, liveIds, attentionIds } = props
   return (
     <div className="flex h-full w-full flex-col rounded-md border border-gray-200 dark:border-gray-800">
       <div className="flex items-center justify-between border-b border-gray-200 px-2 py-1.5 dark:border-gray-800">
@@ -54,6 +70,7 @@ export function LoopList(props: Props) {
         ) : (
           loops.map(l => {
             const ss = STATUS_STYLE[l.status] ?? { label: l.status, cls: 'bg-gray-100 text-gray-600' }
+            const entry = ENTRY_META[inferEntryKind(l)]
             return (
               <li
                 key={l.id}
@@ -65,7 +82,23 @@ export function LoopList(props: Props) {
                 }`}
               >
                 <div className="flex items-center gap-1.5">
-                  <span className={`rounded px-1.5 py-0.5 text-[10px] ${ss.cls}`}>{ss.label}</span>
+                  <span className={`rounded px-1.5 py-0.5 text-[10px] ${ss.cls}`}>
+                    {liveIds.has(l.id) ? '运行中 ●' : ss.label}
+                  </span>
+                  {attentionIds.has(l.id) && (
+                    <span
+                      className="rounded bg-amber-100 px-1 py-0.5 text-[10px] text-amber-700 dark:bg-amber-900/40 dark:text-amber-300"
+                      title="待处理：等待作答 / 确认"
+                    >
+                      !
+                    </span>
+                  )}
+                  <span
+                    className="rounded bg-gray-100 px-1 py-0.5 text-[10px] text-gray-600 dark:bg-gray-800 dark:text-gray-300"
+                    title={entry.title}
+                  >
+                    {entry.icon}
+                  </span>
                   <span
                     className="min-w-0 flex-1 truncate text-sm text-gray-800 dark:text-gray-100"
                     title={l.target_abs}

@@ -3,6 +3,7 @@ import type { UnlistenFn } from '@tauri-apps/api/event'
 import {
   CodeloopAPI,
   onProgress,
+  type EntryKind,
   type LoopMessageRow,
   type LoopRow,
   type Progress,
@@ -45,10 +46,21 @@ export default function CodeloopPage() {
 
   // 新建表单
   const [targetPath, setTargetPath] = useState('')
-  const [mode, setMode] = useState<ReviewMode>('design')
-  const [maxRounds, setMaxRounds] = useState(10)
+  // 入口种类（多入口设计 §3）：默认 doc_review。ReviewSeed 时有二级 mode 子选；
+  // DocReview/Implement 时 mode 由入口决定（design / implementation）。
+  const [entryKind, setEntryKind] = useState<EntryKind>('doc_review')
+  // 仅 ReviewSeed 时由用户选；DocReview→design / Implement→implementation 由 entry 卡片自动写。
+  const [seedMode, setSeedMode] = useState<ReviewMode>('design')
+  // ReviewSeed 的 seed 输入：tab 切换文件路径 / 内联文本（两选一，相互清空）。
+  const [seedTab, setSeedTab] = useState<'path' | 'inline'>('path')
+  const [seedReviewPath, setSeedReviewPath] = useState('')
+  const [seedReviewInline, setSeedReviewInline] = useState('')
+  // ReviewSeed(mode=implementation) 可选规格依据文档。其它入口忽略。
+  const [designDocPath, setDesignDocPath] = useState('')
+  const [maxRounds, setMaxRounds] = useState(5)
   const [waitIdle, setWaitIdle] = useState(false)
   const [stepConfirm, setStepConfirm] = useState(true)
+  // 多入口设计 §7：Implement 默认 use_worktree=true，其余默认 false。
   const [useWorktree, setUseWorktree] = useState(false)
   // 首轮预热：哪些端已在预览台外部建立（按 provider 分开）。
   const [estCodex, setEstCodex] = useState(false)
@@ -56,6 +68,27 @@ export default function CodeloopPage() {
 
   // 并发循环：按 loop_id 索引每个运行中循环的进度 + 是否已转全自动。
   const [runningLoops, setRunningLoops] = useState<Record<number, LiveLoop>>({})
+
+  // 入口选择 → 同步 mode 默认 / use_worktree 默认。
+  const handlePickEntry = (next: EntryKind) => {
+    setEntryKind(next)
+    if (next === 'implement') setUseWorktree(true)
+    // DocReview/Implement 时 seed 字段清空，避免后端校验拒绝。
+    if (next !== 'review_seed') {
+      setSeedReviewPath('')
+      setSeedReviewInline('')
+    }
+    // 切到 review_seed 时不强行重置 seedMode（保留用户上次选择）。
+  }
+
+  // 由入口 + ReviewSeed 子选 推出最终 mode。
+  const effectiveMode: ReviewMode =
+    entryKind === 'doc_review'
+      ? 'design'
+      : entryKind === 'implement'
+        ? 'implementation'
+        : seedMode
+
   const [startErr, setStartErr] = useState<string | null>(null)
   // 各循环已应答 / 已拍板的 seq（避免弹窗重复触发；seq 在循环内单调）。
   const [answered, setAnswered] = useState<Record<number, number>>({})
@@ -84,24 +117,44 @@ export default function CodeloopPage() {
   // 预览 / 手动驱动台弹窗。
   const [showPreview, setShowPreview] = useState(false)
 
-  // 由表单组装 StartInput（启动 / 自检共用）。
-  const buildInput = (): StartInput => ({
-    claude: { session_id: claudeId },
-    codex: { session_id: codexId },
-    target_path: targetPath.trim(),
-    mode,
-    max_rounds: maxRounds,
-    wait_for_claude_idle: waitIdle,
-    step_confirm: stepConfirm,
-    use_worktree: useWorktree,
-    established: { codex: estCodex, claude: estClaude },
-  })
+  // 由表单组装 StartInput（启动 / 自检共用）。多入口字段按 entry_kind 条件性附带：
+  // 仅 ReviewSeed 才透传 seed_review_*；仅 ReviewSeed(impl) 才透传 design_doc_path。
+  const buildInput = (): StartInput => {
+    const base: StartInput = {
+      claude: { session_id: claudeId },
+      codex: { session_id: codexId },
+      target_path: targetPath.trim(),
+      mode: effectiveMode,
+      max_rounds: maxRounds,
+      wait_for_claude_idle: waitIdle,
+      step_confirm: stepConfirm,
+      use_worktree: useWorktree,
+      established: { codex: estCodex, claude: estClaude },
+      entry_kind: entryKind,
+    }
+    if (entryKind === 'review_seed') {
+      if (seedTab === 'path' && seedReviewPath.trim()) {
+        base.seed_review_path = seedReviewPath.trim()
+      } else if (seedTab === 'inline' && seedReviewInline.trim()) {
+        base.seed_review_inline = seedReviewInline
+      }
+      if (effectiveMode === 'implementation' && designDocPath.trim()) {
+        base.design_doc_path = designDocPath.trim()
+      }
+    }
+    return base
+  }
 
   // 启动后清空新建表单，让用户立即配下一个循环（含会话选择——同一会话不可并发占用）。
   const resetForm = () => {
     setTargetPath('')
-    setMode('design')
-    setMaxRounds(10)
+    setEntryKind('doc_review')
+    setSeedMode('design')
+    setSeedTab('path')
+    setSeedReviewPath('')
+    setSeedReviewInline('')
+    setDesignDocPath('')
+    setMaxRounds(5)
     setWaitIdle(false)
     setStepConfirm(true)
     setUseWorktree(false)
@@ -291,7 +344,12 @@ export default function CodeloopPage() {
   }, [])
 
   // ── 启动 / 应答 ──────────────────────────────────────────────────────────
-  const canStart = !!claudeId && !!codexId && !!targetPath.trim()
+  // ReviewSeed 必须提供 seed_review_path 或 seed_review_inline（按当前 tab 取）。
+  const seedReady =
+    entryKind !== 'review_seed' ||
+    (seedTab === 'path' ? !!seedReviewPath.trim() : !!seedReviewInline.trim())
+  // 并发模型：可随时配置/启动新循环（同一会话除外，由后端校验），不设全局 running 闸。
+  const canStart = !!claudeId && !!codexId && !!targetPath.trim() && seedReady
   const startWith = async (input: StartInput) => {
     setStartErr(null)
     try {
@@ -460,11 +518,28 @@ export default function CodeloopPage() {
         </div>
       )}
 
+      {/* 入口选择卡 + ReviewSeed 动态字段（多入口设计 §7）。 */}
+      <EntryPicker
+        entryKind={entryKind}
+        onPick={handlePickEntry}
+        seedMode={seedMode}
+        setSeedMode={setSeedMode}
+        seedTab={seedTab}
+        setSeedTab={setSeedTab}
+        seedReviewPath={seedReviewPath}
+        setSeedReviewPath={setSeedReviewPath}
+        seedReviewInline={seedReviewInline}
+        setSeedReviewInline={setSeedReviewInline}
+        designDocPath={designDocPath}
+        setDesignDocPath={setDesignDocPath}
+        disabled={false}
+      />
+
       <LoopStatusBar
         targetPath={targetPath}
         setTargetPath={setTargetPath}
-        mode={mode}
-        setMode={setMode}
+        entryKind={entryKind}
+        mode={effectiveMode}
         maxRounds={maxRounds}
         setMaxRounds={setMaxRounds}
         waitIdle={waitIdle}
@@ -588,6 +663,182 @@ export default function CodeloopPage() {
 
       {showPreview && (
         <PreviewModal claudeId={claudeId} codexId={codexId} onClose={() => setShowPreview(false)} />
+      )}
+    </div>
+  )
+}
+
+// ── 入口选择卡 sub-section（多入口设计 §7）─────────────────────────────────────
+// 三选一卡片 + ReviewSeed 时的二级 mode 子选 / seed tab / 可选规格依据文档。
+// 选中即更新 page 顶部状态，buildInput 据此组装请求。
+
+interface EntryPickerProps {
+  entryKind: EntryKind
+  onPick: (next: EntryKind) => void
+  seedMode: ReviewMode
+  setSeedMode: (v: ReviewMode) => void
+  seedTab: 'path' | 'inline'
+  setSeedTab: (v: 'path' | 'inline') => void
+  seedReviewPath: string
+  setSeedReviewPath: (v: string) => void
+  seedReviewInline: string
+  setSeedReviewInline: (v: string) => void
+  designDocPath: string
+  setDesignDocPath: (v: string) => void
+  disabled: boolean
+}
+
+const ENTRY_CARDS: { kind: EntryKind; icon: string; title: string; hint: string }[] = [
+  { kind: 'doc_review', icon: '📄', title: '从文档复核开始', hint: '现有默认：Codex 复核文档 ↔ Claude 修订。' },
+  { kind: 'implement', icon: '🛠', title: '从实现开始', hint: '文档已定稿：Claude 按文档实现 → 复核环。' },
+  { kind: 'review_seed', icon: '📝', title: '从既有复核意见开始', hint: '已有 review 产物：跳过 Codex 首轮直接修订。' },
+]
+
+function EntryPicker(props: EntryPickerProps) {
+  const {
+    entryKind,
+    onPick,
+    seedMode,
+    setSeedMode,
+    seedTab,
+    setSeedTab,
+    seedReviewPath,
+    setSeedReviewPath,
+    seedReviewInline,
+    setSeedReviewInline,
+    designDocPath,
+    setDesignDocPath,
+    disabled,
+  } = props
+  const seedActive = entryKind === 'review_seed'
+
+  return (
+    <div className="flex flex-col gap-2 rounded-md border border-gray-200 bg-white p-3 dark:border-gray-800 dark:bg-gray-900">
+      <div className="text-xs font-medium text-gray-600 dark:text-gray-300">起点（入口）</div>
+      <div className="grid grid-cols-1 gap-2 md:grid-cols-3">
+        {ENTRY_CARDS.map(c => {
+          const selected = c.kind === entryKind
+          return (
+            <button
+              key={c.kind}
+              type="button"
+              disabled={disabled}
+              onClick={() => onPick(c.kind)}
+              className={`flex flex-col items-start gap-1 rounded-md border px-3 py-2 text-left transition disabled:cursor-not-allowed disabled:opacity-60 ${
+                selected
+                  ? 'border-blue-400 bg-blue-50 dark:border-blue-500 dark:bg-blue-900/30'
+                  : 'border-gray-200 hover:bg-gray-50 dark:border-gray-700 dark:hover:bg-gray-800/50'
+              }`}
+            >
+              <span className="text-sm">
+                <span className="mr-1">{c.icon}</span>
+                <span className="font-medium text-gray-800 dark:text-gray-100">{c.title}</span>
+              </span>
+              <span className="text-[11px] text-gray-500 dark:text-gray-400">{c.hint}</span>
+            </button>
+          )
+        })}
+      </div>
+
+      {seedActive && (
+        <div className="mt-1 flex flex-col gap-2 rounded-md border border-amber-200 bg-yellow-50 p-3 dark:border-amber-700/50 dark:bg-amber-900/20">
+          {/* ReviewSeed 二级 mode 子选 */}
+          <div className="flex items-center gap-3 text-xs">
+            <span className="text-gray-600 dark:text-gray-300">修订对象</span>
+            <label className="flex items-center gap-1 text-gray-700 dark:text-gray-200">
+              <input
+                type="radio"
+                name="seed-mode"
+                value="design"
+                checked={seedMode === 'design'}
+                disabled={disabled}
+                onChange={() => setSeedMode('design')}
+              />
+              文档（design）
+            </label>
+            <label className="flex items-center gap-1 text-gray-700 dark:text-gray-200">
+              <input
+                type="radio"
+                name="seed-mode"
+                value="implementation"
+                checked={seedMode === 'implementation'}
+                disabled={disabled}
+                onChange={() => setSeedMode('implementation')}
+              />
+              代码（implementation）
+            </label>
+          </div>
+
+          {/* seed tab：文件路径 / 直接粘贴文本（二选一，相互清空） */}
+          <div className="flex items-center gap-2 text-xs">
+            <button
+              type="button"
+              disabled={disabled}
+              onClick={() => {
+                setSeedTab('path')
+                setSeedReviewInline('')
+              }}
+              className={`rounded px-2 py-0.5 ${
+                seedTab === 'path'
+                  ? 'bg-amber-200 text-amber-800 dark:bg-amber-800/60 dark:text-amber-100'
+                  : 'text-gray-600 hover:bg-gray-100 dark:text-gray-300 dark:hover:bg-gray-800'
+              }`}
+            >
+              文件路径
+            </button>
+            <button
+              type="button"
+              disabled={disabled}
+              onClick={() => {
+                setSeedTab('inline')
+                setSeedReviewPath('')
+              }}
+              className={`rounded px-2 py-0.5 ${
+                seedTab === 'inline'
+                  ? 'bg-amber-200 text-amber-800 dark:bg-amber-800/60 dark:text-amber-100'
+                  : 'text-gray-600 hover:bg-gray-100 dark:text-gray-300 dark:hover:bg-gray-800'
+              }`}
+            >
+              直接粘贴文本
+            </button>
+          </div>
+
+          {seedTab === 'path' ? (
+            <input
+              type="text"
+              value={seedReviewPath}
+              onChange={e => setSeedReviewPath(e.target.value)}
+              disabled={disabled}
+              placeholder="docs/review-2026-06-19.md（待 Claude 修订的 seed 复核意见文件）"
+              className="rounded-md border border-gray-300 bg-white px-2 py-1.5 text-sm outline-none focus:border-amber-400 disabled:opacity-60 dark:border-gray-600 dark:bg-gray-800 dark:text-gray-100"
+            />
+          ) : (
+            <textarea
+              value={seedReviewInline}
+              onChange={e => setSeedReviewInline(e.target.value)}
+              disabled={disabled}
+              rows={5}
+              placeholder="直接粘贴 review 文本（非 Codex 输出；将作为 round 1 喂给 Claude 修订）"
+              className="rounded-md border border-gray-300 bg-white px-2 py-1.5 text-sm outline-none focus:border-amber-400 disabled:opacity-60 dark:border-gray-600 dark:bg-gray-800 dark:text-gray-100"
+            />
+          )}
+
+          {seedMode === 'implementation' && (
+            <div className="flex flex-col gap-1">
+              <label className="text-xs text-gray-600 dark:text-gray-300">
+                规格依据文档（可选；同仓内相对/绝对路径，仅 implementation 子模式可用）
+              </label>
+              <input
+                type="text"
+                value={designDocPath}
+                onChange={e => setDesignDocPath(e.target.value)}
+                disabled={disabled}
+                placeholder="docs/spec.md"
+                className="rounded-md border border-gray-300 bg-white px-2 py-1.5 text-sm outline-none focus:border-amber-400 disabled:opacity-60 dark:border-gray-600 dark:bg-gray-800 dark:text-gray-100"
+              />
+            </div>
+          )}
+        </div>
       )}
     </div>
   )

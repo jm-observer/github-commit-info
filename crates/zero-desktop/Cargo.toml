@@ -28,6 +28,8 @@ tokio = { workspace = true, features = ["rt-multi-thread", "macros", "time", "sy
 anyhow = { workspace = true }
 log = { workspace = true }
 clap = { workspace = true, features = ["env"] }
+async-trait = "0.1"
+humantime = "2"
 dirs = "5"
 custom-utils = { workspace = true, features = ["updater", "trace"] }
 # Cookie 模块依赖

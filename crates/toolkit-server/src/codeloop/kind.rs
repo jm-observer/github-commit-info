@@ -6,7 +6,7 @@
 
 use super::io;
 use super::parse::{self, AskUser, Verdict};
-use super::prompt::{self, ReviewMode, TargetSpec};
+use super::prompt::{self, ReviewMode, TargetRole, TargetSpec};
 use super::validate;
 use agent_session::driver;
 use agent_session::store::Store;
@@ -194,12 +194,21 @@ impl LoopCtx {
             // 1. Codex 复核（含 ASK_USER 挂起处理）。
             // first_turn = n==1：常驻说明块（定位 + ASK_USER 协议）只在持续会话首轮发一次，
             // 后续轮依赖会话历史，不再重发（避免每条消息末尾重复刷屏/占 token）。
+            // toolkit-server 路径：保持今天行为不变。
+            // mode=Design → 文档复核 (target_path 既是规格也是修订对象);
+            // mode=Implementation → 复核 target_path 所指代码 (与今天 Implement 入口一致)。
+            let target_role = match self.mode {
+                ReviewMode::Design => TargetRole::RevisionDoc,
+                ReviewMode::Implementation => TargetRole::SpecDoc,
+            };
             let codex_prompt = prompt::render_codex_prompt(
                 &self.codex_template,
                 &self.target,
                 self.mode,
                 n,
                 n == 1,
+                target_role,
+                None,
             );
             let review = match self.send_and_resolve(&self.codex, &codex_prompt).await? {
                 Resolved::Reply(r) => r,
@@ -245,8 +254,18 @@ impl LoopCtx {
 
             // 4. Claude 据意见修订（含 ASK_USER 挂起处理）。
             // Claude 仅在 NEEDS_WORK 时被发起，其首次发送恒为第 1 轮 → n==1 即首轮。
-            let claude_prompt =
-                prompt::render_claude_prompt(&self.claude_template, &self.target, &review, n == 1);
+            let target_role = match self.mode {
+                ReviewMode::Design => TargetRole::RevisionDoc,
+                ReviewMode::Implementation => TargetRole::SpecDoc,
+            };
+            let claude_prompt = prompt::render_claude_prompt(
+                &self.claude_template,
+                &self.target,
+                &review,
+                n == 1,
+                target_role,
+                None,
+            );
             let revision = match self.send_and_resolve(&self.claude, &claude_prompt).await? {
                 Resolved::Reply(r) => r,
                 Resolved::Timeout => {
