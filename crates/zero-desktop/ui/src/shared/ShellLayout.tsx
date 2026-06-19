@@ -4,7 +4,7 @@ import { BookOpen, Mic, Wand2, Cookie, ShieldCheck, GitCompareArrows, MessageSqu
 import { invoke } from '@tauri-apps/api/core'
 import { listen } from '@tauri-apps/api/event'
 import EnvConfigService from '../modules/english/services/EnvConfigService'
-import MiniPlayer from '../modules/music/MiniPlayer'
+import BottomPlayerBar from './BottomPlayerBar'
 
 const navItems = [
   { to: '/english/annotated', icon: BookOpen, label: '英语听力' },
@@ -211,10 +211,17 @@ function RecordingToggle() {
         .catch(() => {/* 忽略抖动 */})
     }, 2000)
 
-    // 启动默认开启识别（best-effort：地址/设备未配置时静默失败，后端有重复启动保护）。
+    // 启动自动开启识别：仅当设置里「启动时自动识别」打开时触发。
+    // best-effort：地址/设备未配置时静默失败，后端有重复启动保护。
     if (!autoStarted) {
       autoStarted = true
-      invoke('speech_start_recording').catch(() => {/* 未配置则忽略，用户配好后下次自动开启 */})
+      invoke<{ auto_start?: boolean }>('speech_get_settings')
+        .then(s => {
+          if (s?.auto_start) {
+            return invoke('speech_start_recording').catch(() => {/* 未配置则忽略 */})
+          }
+        })
+        .catch(() => {/* 读设置失败则不自动开启 */})
     }
 
     return () => {
@@ -349,8 +356,9 @@ export default function ShellLayout() {
       </div>
       </div>
 
-      {/* 底栏常驻迷你播放器（跨页不中断） */}
-      <MiniPlayer />
+      {/* 底栏常驻播放器:左侧 tab 切换音乐/英语,右侧渲染所选条目控件;两个 service
+          单例都在后台跑,切 tab 只切 UI。 */}
+      <BottomPlayerBar />
     </div>
   )
 }
