@@ -11,8 +11,11 @@
 //! - 任务引擎：`impl TaskKind` → `tokio::spawn` 的后台任务，句柄存 `CodeloopState`。
 //! - 通知回调（推微信）本期不做。
 
-mod db;
+pub mod db;
+pub mod runtime;
+pub mod smoke;
 
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
 use std::sync::Arc;
@@ -26,12 +29,16 @@ use codeloop_core::prompt::{self, ReviewMode, TargetSpec};
 use codeloop_core::validate;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
-use tauri::{AppHandle, Emitter, State};
-use tokio::sync::{oneshot, Mutex};
+use tauri::{AppHandle, State};
+use tokio::sync::Mutex;
 use tokio::task::JoinHandle;
 
 use crate::app_state::AppState;
 use crate::shared::workspace::codeloop_db_path;
+use runtime::{
+    AskUserRequest, ConfirmPolicy, ConfirmRequest, Gate, LoopEvents, Pending, PendingConfirm,
+    TauriLoopEvents, UiConfirmPolicy,
+};
 
 /// 等待 Claude 当前轮空闲的超时（对应 wait_for_claude_idle）。
 const CLAUDE_IDLE_TIMEOUT: Duration = Duration::from_secs(600);
@@ -40,21 +47,20 @@ const ANSWER_TIMEOUT: Duration = Duration::from_secs(1800);
 /// 连续解析失败到此轮数 → AbortedParse。
 const MAX_PARSE_FAILS: u32 = 2;
 
-/// 进度事件名（前端 listen 它刷新状态条 / 触发 ASK_USER 弹窗）。
-const EV_PROGRESS: &str = "codeloop_progress";
-
 // ------------------------- 模块状态 -------------------------
 
-/// Codeloop 模块状态：同一时刻只允许一个复核循环在跑；记录持久化到 SQLite。
+/// Codeloop 模块状态：允许多个复核循环并发在跑（按 loop_id 索引）；记录持久化到 SQLite。
+/// 并发安全约束：同一对会话（claude/codex session_id）同一时刻只允许一个循环占用，
+/// 启动时校验冲突（见 [`codeloop_start`]），避免两个循环驱动同一 CLI 会话互相踩踏。
 pub struct CodeloopState {
-    inner: Mutex<Option<RunningLoop>>,
+    inner: Mutex<HashMap<i64, RunningLoop>>,
     db: Arc<db::Db>,
 }
 
 impl CodeloopState {
     pub fn new(workspace: &Path) -> anyhow::Result<Self> {
         Ok(Self {
-            inner: Mutex::new(None),
+            inner: Mutex::new(HashMap::new()),
             db: Arc::new(db::Db::open(&codeloop_db_path(workspace))?),
         })
     }
@@ -65,26 +71,17 @@ struct RunningLoop {
     handle: JoinHandle<()>,
     /// 该循环在 `loops` 表的记录 id（供 stop 显式 finalize）。
     loop_id: i64,
+    /// 占用的两端会话 id（启动时冲突校验：同一会话不可并发跑多个循环）。
+    claude_session: String,
+    codex_session: String,
     /// 最近一次上报的进度快照（供 `codeloop_status` 兜底读取）。
     progress: Arc<Mutex<Value>>,
-    /// ASK_USER 挂起态（非 None = 正等用户回答）。
+    /// ASK_USER 挂起态（非 None = 正等用户回答）。与 UiConfirmPolicy 共享 Arc。
     pending: Arc<Mutex<Option<Pending>>>,
-    /// 逐步确认门挂起态（非 None = 正等用户确认/否决某次传递）。
+    /// 逐步确认门挂起态（非 None = 正等用户确认/否决某次传递）。与 UiConfirmPolicy 共享 Arc。
     pending_confirm: Arc<Mutex<Option<PendingConfirm>>>,
-    /// 逐步确认开关（运行时可翻转：true=每步确认 / false=全自动）。与 LoopCtx 共享。
+    /// 逐步确认开关（运行时可翻转：true=每步确认 / false=全自动）。与 UiConfirmPolicy 共享。
     step_confirm: Arc<AtomicBool>,
-}
-
-/// 一个待用户回答的问题：seq + 唤醒循环的 oneshot 发送端。
-struct Pending {
-    seq: i64,
-    answer_tx: oneshot::Sender<String>,
-}
-
-/// 一个待用户拍板的传递确认：seq + 决定（true=确认发送 / false=否决）的 oneshot 发送端。
-struct PendingConfirm {
-    seq: i64,
-    decide_tx: oneshot::Sender<bool>,
 }
 
 // ------------------------- 输入契约 -------------------------
@@ -118,6 +115,10 @@ pub struct StartInput {
     /// 两阶段血缘：本循环承接自哪条记录（design→implementation）。新建独立循环时为 None。
     #[serde(default)]
     pub parent_loop_id: Option<i64>,
+    /// 从已完成的 worktree 继续复核：跳过 implementation 模式的 Claude 实现首步，直接让 Codex
+    /// 在该 worktree 内复核。用于恢复「Zero Desktop 已停止跟踪，但 Claude 后续完成」的记录。
+    #[serde(default)]
+    pub resume_worktree_path: Option<String>,
     /// 首轮预热：哪些端已在外部（预览台）发过首轮说明块，循环首轮即跳过其 STANDING_BLOCK。
     /// 按 provider 分开（预览台一次只热一端，另一端仍需照发）。
     #[serde(default)]
@@ -157,7 +158,8 @@ enum FinalVerdict {
 
 /// 运行期上下文：解析好的两端 SessionRef + target 定位 + 配置 + 共享句柄。
 struct LoopCtx {
-    app: AppHandle,
+    events: Arc<dyn LoopEvents>,
+    confirm: Arc<dyn ConfirmPolicy>,
     store: Store,
     db: Arc<db::Db>,
     loop_id: i64,
@@ -167,23 +169,21 @@ struct LoopCtx {
     mode: ReviewMode,
     max_rounds: u32,
     wait_for_claude_idle: bool,
-    /// 逐步确认开关（运行时可翻转，见 codeloop_set_auto_confirm）。confirm_gate 每次实时读。
-    step_confirm: Arc<AtomicBool>,
     use_worktree: bool,
+    /// true 表示实现已由历史 worktree 完成，本循环从 Codex 复核阶段开始。
+    resume_from_worktree: bool,
     /// 首轮预热：对应端已在外部建立，循环首轮跳过其 STANDING_BLOCK。
     established_codex: bool,
     established_claude: bool,
     progress: Arc<Mutex<Value>>,
-    pending: Arc<Mutex<Option<Pending>>>,
-    pending_confirm: Arc<Mutex<Option<PendingConfirm>>>,
     seq: Arc<AtomicI64>,
 }
 
 impl LoopCtx {
-    /// 写进度快照 + emit 给前端。
+    /// 写进度快照 + 通过 events 适配器外发（Tauri emit / 控制台打印 / JSONL）。
     async fn report(&self, v: Value) {
         *self.progress.lock().await = v.clone();
-        let _ = self.app.emit(EV_PROGRESS, v);
+        self.events.progress(self.loop_id, v);
     }
 
     /// 追加一条逐轮消息到记录（失败仅记日志，不影响循环）。
@@ -253,71 +253,74 @@ async fn send_and_resolve(
             session.provider.as_str()
         );
 
-        // 挂起：建 channel、存 pending、emit awaiting_input。
         let seq = ctx.seq.fetch_add(1, Ordering::SeqCst) + 1;
-        let (tx, rx) = oneshot::channel::<String>();
-        *ctx.pending.lock().await = Some(Pending { seq, answer_tx: tx });
-        ctx.report(json!({
-            "phase": "awaiting_input",
-            "seq": seq,
-            "asked_by": session.provider.as_str(),
-            "question": q,
-        }))
-        .await;
-
-        // 等用户回答（带超时）。超时 / 发送端被丢 → 业务终态 Timeout。
-        match tokio::time::timeout(ANSWER_TIMEOUT, rx).await {
-            Ok(Ok(answer)) => current = format!("用户答复：{answer}"),
-            _ => {
-                *ctx.pending.lock().await = None;
-                return Ok(Resolved::Timeout);
-            }
+        let req = AskUserRequest {
+            loop_id: ctx.loop_id,
+            seq,
+            asked_by: session.provider.as_str(),
+            question: &q.question,
+        };
+        // ConfirmPolicy 决定怎么拿答案：UI 走 oneshot 弹窗；headless 走 answer map / 中止。
+        match ctx.confirm.answer_user(req, ctx.events.as_ref()).await {
+            Some(answer) => current = format!("用户答复：{answer}"),
+            None => return Ok(Resolved::Timeout),
         }
     }
 }
 
-/// 逐步确认门的结果。
-enum Gate {
-    /// 用户确认 / 未开启逐步确认 → 放行。
-    Approve,
-    /// 用户否决 → 主动中止。
-    Reject,
-    /// 等待超时 → 按超时中止（保守：不自动发送）。
-    Timeout,
+/// 跨会话传递前的人工确认门：通过 ConfirmPolicy 路由（UI 走弹窗、headless 走全自动）。
+async fn confirm_gate(ctx: &LoopCtx, direction: &str, title: &str, content: &str) -> Gate {
+    let seq = ctx.seq.fetch_add(1, Ordering::SeqCst) + 1;
+    let req = ConfirmRequest {
+        loop_id: ctx.loop_id,
+        seq,
+        direction,
+        title,
+        content,
+    };
+    ctx.confirm.confirm(req, ctx.events.as_ref()).await
 }
 
-/// 跨会话传递前的人工确认门：弹窗展示「即将发送的文本」，等用户拍板。
-///
-/// `step_confirm` 关时直接放行（全自动）。开时挂起：建 oneshot、存 pending_confirm、
-/// emit `awaiting_confirm`（带 direction/title/content），等 `codeloop_confirm` 唤醒。
-async fn confirm_gate(ctx: &LoopCtx, direction: &str, title: &str, content: &str) -> Gate {
-    if !ctx.step_confirm.load(Ordering::SeqCst) {
-        log::info!("[codeloop] 逐步确认关闭（自动），{direction} 直接放行");
-        return Gate::Approve;
-    }
-    log::info!(
-        "[codeloop] 逐步确认门 {direction}：弹窗等用户拍板（content {} 字符）",
-        content.chars().count()
-    );
-    let seq = ctx.seq.fetch_add(1, Ordering::SeqCst) + 1;
-    let (tx, rx) = oneshot::channel::<bool>();
-    *ctx.pending_confirm.lock().await = Some(PendingConfirm { seq, decide_tx: tx });
-    ctx.report(json!({
-        "phase": "awaiting_confirm",
-        "seq": seq,
-        "direction": direction,
-        "title": title,
-        "content": content,
-    }))
-    .await;
-
-    match tokio::time::timeout(ANSWER_TIMEOUT, rx).await {
-        Ok(Ok(true)) => Gate::Approve,
-        Ok(Ok(false)) => Gate::Reject,
-        // 发送端被丢 / 超时：清挂起态，按超时处理。
-        _ => {
-            *ctx.pending_confirm.lock().await = None;
-            Gate::Timeout
+/// worktree 模式：尝试从 Claude 回复解析 worktree 路径，命中且校验通过则把 Codex 重定位过去
+/// （改局部 `target`/`codex`，置 `worktree_established`，下一轮 Codex 强制重发新定位）。`round`
+/// 仅用于 system 消息归属。实现首步与每轮修订共用此逻辑。
+fn try_relocate_worktree(
+    ctx: &LoopCtx,
+    reply: &str,
+    round: u32,
+    target: &mut TargetSpec,
+    codex: &mut SessionRef,
+    worktree_established: &mut bool,
+    force_locator: &mut bool,
+) {
+    let Some(wt) = parse::parse_worktree_path(reply) else {
+        return;
+    };
+    match relocate_to_worktree(&wt, &target.repo_rel) {
+        Ok((new_target, new_cwd)) => {
+            *target = new_target;
+            codex.cwd = new_cwd;
+            *worktree_established = true;
+            *force_locator = true; // 下一轮 Codex 强制重发新定位
+            if let Err(e) = ctx.db.set_worktree(ctx.loop_id, &wt) {
+                log::warn!("[codeloop] set_worktree 失败：{e:#}");
+            }
+            ctx.log_msg(
+                round,
+                "system",
+                None,
+                &format!("已切换到 worktree：{wt}（后续 Codex 在此工作树复核）"),
+            );
+            log::info!("[codeloop] worktree 重定位成功 → {wt}");
+        }
+        Err(e) => {
+            ctx.log_msg(
+                round,
+                "system",
+                None,
+                &format!("worktree 路径校验失败（{e}），继续在原仓库复核"),
+            );
+            log::warn!("[codeloop] worktree 校验失败：{e}");
         }
     }
 }
@@ -342,6 +345,68 @@ async fn drive(ctx: &LoopCtx) -> Result<()> {
     let mut force_locator = false;
     let mut consecutive_parse_fail = 0u32;
     let mut last_claude_reply = String::new();
+    // Claude 端常驻说明块是否已发过（实现首步会发，之后修订轮不再重发）。
+    let mut claude_standing_sent = ctx.established_claude;
+
+    // implementation 模式：先让 Claude Code 按设计文档把功能代码全部实现，再交 Codex 复核。
+    // （design 模式无此步：复核对象是已存在的文档，直接进入 Codex 复核。）
+    // worktree 模式下，worktree 即在这一步由 Claude 建立并回报路径。
+    if ctx.mode == ReviewMode::Implementation && !ctx.resume_from_worktree {
+        log::info!("[codeloop] implementation 模式：先让 Claude 按文档实现功能代码…");
+        let mut implement_prompt = prompt::render_claude_implement_prompt(
+            prompt::DEFAULT_CLAUDE_IMPLEMENT_TEMPLATE,
+            &target,
+            !claude_standing_sent,
+        );
+        if ctx.use_worktree && !worktree_established {
+            implement_prompt.push_str(prompt::WORKTREE_INSTRUCTION);
+        }
+        ctx.log_msg(
+            0,
+            "system",
+            None,
+            &format!(
+                "已进入实现阶段，正在向 Claude 发送实现命令，并等待其按设计文档落地功能代码。{}",
+                if ctx.use_worktree {
+                    "已启用 worktree 模式，Claude 完成后应回报 WORKTREE 路径。"
+                } else {
+                    "未启用 worktree 模式，Claude 将在原会话工作树内实现。"
+                }
+            ),
+        );
+        ctx.report(json!({ "round": 0, "phase": "implementing" }))
+            .await;
+        let reply = match send_and_resolve(ctx, &ctx.claude, &implement_prompt).await? {
+            Resolved::Reply(r) => r,
+            Resolved::Timeout => {
+                ctx.finish(FinalVerdict::AbortedTimeout, 0).await;
+                return Ok(());
+            }
+        };
+        claude_standing_sent = true;
+        if ctx.use_worktree && !worktree_established {
+            try_relocate_worktree(
+                ctx,
+                &reply,
+                0,
+                &mut target,
+                &mut codex,
+                &mut worktree_established,
+                &mut force_locator,
+            );
+        }
+        ctx.log_msg(0, "claude_implement", None, &reply);
+        last_claude_reply = reply;
+        log::info!("[codeloop] Claude 首步实现完成，进入 Codex 复核循环");
+        ctx.report(json!({ "round": 0, "phase": "implemented" }))
+            .await;
+    } else if ctx.mode == ReviewMode::Implementation {
+        log::info!("[codeloop] 从已存在 worktree 继续：跳过 Claude 实现首步，直接进入 Codex 复核");
+        worktree_established = true;
+        ctx.report(json!({ "round": 0, "phase": "implemented" }))
+            .await;
+    }
+
     for n in 1..=ctx.max_rounds {
         // 0. 二轮起：让 Codex 基于上一轮 Claude 修订重新审核前，先确认（展示 Claude 本轮回复）。
         if n > 1 {
@@ -452,10 +517,12 @@ async fn drive(ctx: &LoopCtx) -> Result<()> {
         // 5. Claude 据意见修订（含 ASK_USER 挂起）。
         // Claude 仅在 NEEDS_WORK 时被发起，其首次发送恒为第 1 轮 → n==1 即首轮。
         // 若 Claude 端已外部预热（established_claude），首轮也跳过 STANDING_BLOCK。
-        let claude_first_turn = n == 1 && !ctx.established_claude;
+        // impl 模式首步已给 Claude 发过常驻块；仅在尚未发过时（design 模式首次修订）补发。
+        let claude_first_turn = !claude_standing_sent;
         let mut claude_prompt = prompt::render_claude_prompt(
             prompt::DEFAULT_CLAUDE_TEMPLATE,
             &target,
+            ctx.mode,
             &review,
             claude_first_turn,
         );
@@ -470,38 +537,19 @@ async fn drive(ctx: &LoopCtx) -> Result<()> {
                 return Ok(());
             }
         };
+        claude_standing_sent = true;
 
         // worktree 模式：从 Claude 回复解析 worktree 路径，命中且校验通过则把 Codex 重定位过去。
         if ctx.use_worktree && !worktree_established {
-            if let Some(wt) = parse::parse_worktree_path(&claude_reply) {
-                match relocate_to_worktree(&wt, &target.repo_rel) {
-                    Ok((new_target, new_cwd)) => {
-                        target = new_target;
-                        codex.cwd = new_cwd;
-                        worktree_established = true;
-                        force_locator = true; // 下一轮 Codex 强制重发新定位
-                        if let Err(e) = ctx.db.set_worktree(ctx.loop_id, &wt) {
-                            log::warn!("[codeloop] set_worktree 失败：{e:#}");
-                        }
-                        ctx.log_msg(
-                            n,
-                            "system",
-                            None,
-                            &format!("已切换到 worktree：{wt}（后续 Codex 在此工作树复核）"),
-                        );
-                        log::info!("[codeloop] worktree 重定位成功 → {wt}");
-                    }
-                    Err(e) => {
-                        ctx.log_msg(
-                            n,
-                            "system",
-                            None,
-                            &format!("worktree 路径校验失败（{e}），继续在原仓库复核"),
-                        );
-                        log::warn!("[codeloop] worktree 校验失败：{e}");
-                    }
-                }
-            }
+            try_relocate_worktree(
+                ctx,
+                &claude_reply,
+                n,
+                &mut target,
+                &mut codex,
+                &mut worktree_established,
+                &mut force_locator,
+            );
         }
 
         ctx.log_msg(n, "claude_revise", None, &claude_reply);
@@ -519,33 +567,34 @@ async fn drive(ctx: &LoopCtx) -> Result<()> {
     Ok(())
 }
 
-/// 循环顶层：跑 drive，基础设施错时 emit error；收尾清 pending。
+/// 循环顶层：跑 drive，基础设施错时 emit error；终态由 drive 自身 finish 处理。
 async fn run_loop(ctx: LoopCtx) {
     log::info!(
-        "[codeloop] 循环任务启动：claude={} codex={} target={} mode={:?} max_rounds={} wait_idle={} step_confirm={}",
+        "[codeloop] 循环任务启动：claude={} codex={} target={} mode={:?} max_rounds={} wait_idle={}",
         ctx.claude.session_id,
         ctx.codex.session_id,
         ctx.target.repo_rel,
         ctx.mode,
         ctx.max_rounds,
         ctx.wait_for_claude_idle,
-        ctx.step_confirm.load(Ordering::SeqCst),
     );
     if let Err(e) = drive(&ctx).await {
         log::warn!("[codeloop] 基础设施错误，循环终止：{e:#}");
         // drive 返回 Err 不经 finish → 在此 finalize 为 failed（幂等 WHERE status='running'）。
-        if let Err(fe) = ctx
-            .db
-            .finalize(ctx.loop_id, "failed", None, 0, Some(&format!("{e:#}")))
-        {
+        let total_rounds = ctx.db.recorded_rounds(ctx.loop_id).unwrap_or(0);
+        if let Err(fe) = ctx.db.finalize(
+            ctx.loop_id,
+            "failed",
+            None,
+            total_rounds,
+            Some(&format!("{e:#}")),
+        ) {
             log::warn!("[codeloop] finalize(failed) 失败：{fe:#}");
         }
         ctx.report(json!({ "phase": "error", "error": format!("{e:#}") }))
             .await;
     }
     log::info!("[codeloop] 循环任务结束");
-    *ctx.pending.lock().await = None;
-    *ctx.pending_confirm.lock().await = None;
 }
 
 /// 把 Claude 回报的 worktree 路径校验后转成新的 `(TargetSpec, Codex cwd)`。
@@ -591,6 +640,85 @@ fn resolve_ref(store: &Store, provider: Provider, dto: &SessionRefDto) -> Result
         session_id: dto.session_id.clone(),
         cwd,
     })
+}
+
+/// 历史恢复：循环被停止跟踪后，Claude Code 可能仍在原会话继续实现并最终回报 WORKTREE。
+/// 读取详情消息时尝试把这条完成回复补录进 loop_messages，刷新后即可看到实现输出并获得继续复核入口。
+///
+/// 触发约束(三重护栏防误补录,见 codeloop-headless-smoke-runner-plan §sync 缺陷):
+/// 1. **必须是被显式停跟踪的实现记录**(`status='aborted' && final_verdict='stopped_tracking'`),
+///    其它状态(running / done / aborted_timeout / 用户尚未停跟踪的)都不补;
+/// 2. **必须没有 worktree_path**:从 worktree 继续的代码评审记录创建时 worktree_path 即非空,
+///    `mode='implementation'` 但本来就**故意**不带 `claude_implement`,不能让它被补录污染;
+/// 3. **transcript 上的 WORKTREE 消息必须晚于本 loop 的 `created_at`**:防止抓到本 loop
+///    创建之前 Claude 在同一会话里报过的旧 WORKTREE。
+fn sync_implementation_from_claude(db: &db::Db, store: &Store, loop_id: i64) -> Result<()> {
+    let Some(row) = db.get_loop(loop_id)? else {
+        return Ok(());
+    };
+    if row.mode != "implementation" {
+        return Ok(());
+    }
+    if db.has_message_kind(loop_id, "claude_implement")? {
+        return Ok(());
+    }
+    // 护栏 2:跳过「从 worktree 继续的评审记录」。
+    if row.worktree_path.is_some() {
+        return Ok(());
+    }
+    // 护栏 1:仅当用户显式停跟踪过本记录才补录。
+    if !(row.status == "aborted" && row.final_verdict.as_deref() == Some("stopped_tracking")) {
+        return Ok(());
+    }
+
+    let page = store.messages(Provider::Claude, &row.claude_session, 0)?;
+    // 护栏 3:transcript 消息 timestamp 必须 >= loop.created_at。两侧都是 RFC3339 UTC;
+    // 用 chrono 解析做时序比较(直接字符串比 `+00:00` vs `Z` 不安全)。
+    let loop_created = chrono::DateTime::parse_from_rfc3339(&row.created_at).ok();
+    let Some(reply) = page
+        .messages
+        .iter()
+        .rev()
+        .filter(|m| m.role == "assistant")
+        .filter(|m| match (loop_created, chrono::DateTime::parse_from_rfc3339(&m.timestamp)) {
+            (Some(lc), Ok(mt)) => mt >= lc,
+            // loop 或消息时间戳解析失败 → 保守不补录(fail-closed)。
+            _ => false,
+        })
+        .find(|m| parse::parse_worktree_path(&m.text).is_some())
+        .map(|m| m.text.clone())
+    else {
+        return Ok(());
+    };
+    let Some(wt) = parse::parse_worktree_path(&reply) else {
+        return Ok(());
+    };
+
+    match relocate_to_worktree(&wt, &row.target_repo_rel) {
+        Ok(_) => {
+            db.set_worktree(loop_id, &wt)?;
+            db.append_message(
+                loop_id,
+                0,
+                "system",
+                None,
+                &format!(
+                    "从 Claude transcript 补录实现完成结果；检测到 WORKTREE: {wt}。可从该 worktree 继续 Codex 复核。"
+                ),
+            )?;
+            db.append_message(loop_id, 0, "claude_implement", None, &reply)?;
+        }
+        Err(e) => {
+            db.append_message(
+                loop_id,
+                0,
+                "system",
+                None,
+                &format!("从 Claude transcript 发现 WORKTREE: {wt}，但路径校验失败：{e}"),
+            )?;
+        }
+    }
+    Ok(())
 }
 
 // ------------------------- Tauri 命令 -------------------------
@@ -650,8 +778,15 @@ pub async fn codeloop_send_one(
     let p =
         Provider::parse(&provider).ok_or_else(|| "provider 必须是 codex 或 claude".to_string())?;
     let store = Store::from_env().map_err(|e| format!("定位会话存储失败：{e:#}"))?;
-    let session = resolve_ref(&store, p, &SessionRefDto { session_id, cwd: None })
-        .map_err(|e| format!("解析会话失败：{e:#}"))?;
+    let session = resolve_ref(
+        &store,
+        p,
+        &SessionRefDto {
+            session_id,
+            cwd: None,
+        },
+    )
+    .map_err(|e| format!("解析会话失败：{e:#}"))?;
     let turn = driver::send(&session, &text)
         .await
         .map_err(|e| format!("{e:#}"))?;
@@ -664,18 +799,8 @@ pub async fn codeloop_start(
     app: AppHandle,
     state: State<'_, AppState>,
     input: StartInput,
-) -> Result<(), String> {
+) -> Result<i64, String> {
     let cs = &state.codeloop;
-
-    // 单写者：已有未结束的循环则拒。
-    {
-        let guard = cs.inner.lock().await;
-        if let Some(rl) = guard.as_ref() {
-            if !rl.handle.is_finished() {
-                return Err("已有复核循环在运行，请先停止再启动".into());
-            }
-        }
-    }
 
     let store = Store::from_env()
         .map_err(|e| format!("定位会话存储失败（~/.codex / ~/.claude）：{e:#}"))?;
@@ -683,6 +808,23 @@ pub async fn codeloop_start(
         .map_err(|e| format!("解析 Claude 会话失败：{e:#}"))?;
     let mut codex = resolve_ref(&store, Provider::Codex, &input.codex)
         .map_err(|e| format!("解析 Codex 会话失败：{e:#}"))?;
+
+    // 并发安全：同一对会话同一时刻只允许一个循环占用（顺手清理已结束的句柄）。
+    let claude_sid = claude.session_id.clone();
+    let codex_sid = codex.session_id.clone();
+    {
+        let mut guard = cs.inner.lock().await;
+        guard.retain(|_, rl| !rl.handle.is_finished());
+        if let Some(rl) = guard
+            .values()
+            .find(|rl| rl.claude_session == claude_sid || rl.codex_session == codex_sid)
+        {
+            return Err(format!(
+                "该会话已被复核循环 #{} 占用，请勿对同一会话并发跑多个循环",
+                rl.loop_id
+            ));
+        }
+    }
 
     // 三方仓库一致性校验（拒绝跑错仓）。
     let validated = validate::validate_three_way(&claude.cwd, &codex.cwd, &input.target_path)
@@ -703,12 +845,28 @@ pub async fn codeloop_start(
     let label = input
         .target_label
         .unwrap_or_else(|| prompt::default_label(&repo_rel));
-    let target = TargetSpec {
+    let mut target = TargetSpec {
         label,
         repo_root: repo_root.to_string_lossy().to_string(),
         repo_rel,
         abs: target_abs.to_string_lossy().to_string(),
     };
+
+    let resume_worktree_path = input
+        .resume_worktree_path
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(ToOwned::to_owned);
+    if resume_worktree_path.is_some() && input.mode != ReviewMode::Implementation {
+        return Err("只有 implementation 模式支持从 worktree 继续复核".into());
+    }
+    if let Some(wt) = resume_worktree_path.as_deref() {
+        let (new_target, new_cwd) = relocate_to_worktree(wt, &target.repo_rel)
+            .map_err(|e| format!("worktree 路径校验失败：{e}"))?;
+        target = new_target;
+        codex.cwd = new_cwd;
+    }
 
     // 持久化为一条 running 记录（前端列表/详情据此呈现），拿到 loop_id。
     let db = cs.db.clone();
@@ -730,19 +888,42 @@ pub async fn codeloop_start(
             max_rounds: input.max_rounds.max(1) as i64,
             wait_for_idle: input.wait_for_claude_idle,
             step_confirm: input.step_confirm,
-            use_worktree: input.use_worktree,
+            use_worktree: input.use_worktree || resume_worktree_path.is_some(),
             parent_loop_id: input.parent_loop_id,
         })
         .map_err(|e| format!("写入复核记录失败：{e:#}"))?;
+    if let Some(wt) = resume_worktree_path.as_deref() {
+        db.set_worktree(loop_id, wt)
+            .map_err(|e| format!("写入 worktree 路径失败：{e:#}"))?;
+        db.append_message(
+            loop_id,
+            0,
+            "system",
+            None,
+            &format!(
+                "从已完成 worktree 继续复核：{wt}。已跳过 Claude 实现首步，直接进入 Codex 复核。"
+            ),
+        )
+        .map_err(|e| format!("写入继续复核记录失败：{e:#}"))?;
+    }
 
     let progress = Arc::new(Mutex::new(json!({ "phase": "starting" })));
-    let pending = Arc::new(Mutex::new(None));
-    let pending_confirm = Arc::new(Mutex::new(None));
+    let pending: Arc<Mutex<Option<Pending>>> = Arc::new(Mutex::new(None));
+    let pending_confirm: Arc<Mutex<Option<PendingConfirm>>> = Arc::new(Mutex::new(None));
     let step_confirm = Arc::new(AtomicBool::new(input.step_confirm));
     let seq = Arc::new(AtomicI64::new(0));
 
+    let events: Arc<dyn LoopEvents> = Arc::new(TauriLoopEvents::new(app.clone()));
+    let confirm: Arc<dyn ConfirmPolicy> = Arc::new(UiConfirmPolicy {
+        pending: pending.clone(),
+        pending_confirm: pending_confirm.clone(),
+        step_confirm: step_confirm.clone(),
+        answer_timeout: ANSWER_TIMEOUT,
+    });
+
     let ctx = LoopCtx {
-        app: app.clone(),
+        events,
+        confirm,
         store,
         db: db.clone(),
         loop_id,
@@ -752,41 +933,54 @@ pub async fn codeloop_start(
         mode: input.mode,
         max_rounds: input.max_rounds.max(1),
         wait_for_claude_idle: input.wait_for_claude_idle,
-        step_confirm: step_confirm.clone(),
-        use_worktree: input.use_worktree,
+        use_worktree: input.use_worktree || resume_worktree_path.is_some(),
+        resume_from_worktree: resume_worktree_path.is_some(),
         established_codex: input.established.codex,
         established_claude: input.established.claude,
         progress: progress.clone(),
-        pending: pending.clone(),
-        pending_confirm: pending_confirm.clone(),
         seq,
     };
 
     let handle = tokio::spawn(run_loop(ctx));
-    *cs.inner.lock().await = Some(RunningLoop {
-        handle,
+    cs.inner.lock().await.insert(
         loop_id,
-        progress,
-        pending,
-        pending_confirm,
-        step_confirm,
-    });
-    Ok(())
+        RunningLoop {
+            handle,
+            loop_id,
+            claude_session: claude_sid,
+            codex_session: codex_sid,
+            progress,
+            pending,
+            pending_confirm,
+            step_confirm,
+        },
+    );
+    Ok(loop_id)
 }
 
-/// 当前循环状态快照：`{ running, progress }`。
+/// 单个运行中循环的状态快照（供前端 mount 时重建并发态）。
+#[derive(Debug, Clone, Serialize)]
+pub struct RunningSnapshot {
+    loop_id: i64,
+    progress: Value,
+    /// 当前逐步确认开关（运行时可翻转）；false = 已转全自动。
+    step_confirm: bool,
+}
+
+/// 所有运行中循环的状态快照列表（顺手清理已结束的句柄）。
 #[tauri::command]
-pub async fn codeloop_status(state: State<'_, AppState>) -> Result<Value, String> {
-    let guard = state.codeloop.inner.lock().await;
-    match guard.as_ref() {
-        Some(rl) => {
-            let running = !rl.handle.is_finished();
-            let progress = rl.progress.lock().await.clone();
-            let step_confirm = rl.step_confirm.load(Ordering::SeqCst);
-            Ok(json!({ "running": running, "progress": progress, "step_confirm": step_confirm }))
-        }
-        None => Ok(json!({ "running": false, "progress": Value::Null, "step_confirm": true })),
+pub async fn codeloop_status(state: State<'_, AppState>) -> Result<Vec<RunningSnapshot>, String> {
+    let mut guard = state.codeloop.inner.lock().await;
+    guard.retain(|_, rl| !rl.handle.is_finished());
+    let mut out = Vec::with_capacity(guard.len());
+    for rl in guard.values() {
+        out.push(RunningSnapshot {
+            loop_id: rl.loop_id,
+            progress: rl.progress.lock().await.clone(),
+            step_confirm: rl.step_confirm.load(Ordering::SeqCst),
+        });
     }
+    Ok(out)
 }
 
 // ------------------------- 启动前自检（preflight） -------------------------
@@ -839,32 +1033,98 @@ pub async fn codeloop_preflight(input: StartInput, live: bool) -> Result<Vec<Che
     // 被动：两端会话可定位 + 解出 cwd。
     let claude = resolve_ref(&store, Provider::Claude, &input.claude);
     match &claude {
-        Ok(r) => rows.push(check("claude_locate", "Claude 会话可定位", "passive", "pass", format!("cwd={}", r.cwd.display()))),
-        Err(e) => rows.push(check("claude_locate", "Claude 会话可定位", "passive", "fail", format!("{e:#}"))),
+        Ok(r) => rows.push(check(
+            "claude_locate",
+            "Claude 会话可定位",
+            "passive",
+            "pass",
+            format!("cwd={}", r.cwd.display()),
+        )),
+        Err(e) => rows.push(check(
+            "claude_locate",
+            "Claude 会话可定位",
+            "passive",
+            "fail",
+            format!("{e:#}"),
+        )),
     }
     let codex = resolve_ref(&store, Provider::Codex, &input.codex);
     match &codex {
-        Ok(r) => rows.push(check("codex_locate", "Codex 会话可定位", "passive", "pass", format!("cwd={}", r.cwd.display()))),
-        Err(e) => rows.push(check("codex_locate", "Codex 会话可定位", "passive", "fail", format!("{e:#}"))),
+        Ok(r) => rows.push(check(
+            "codex_locate",
+            "Codex 会话可定位",
+            "passive",
+            "pass",
+            format!("cwd={}", r.cwd.display()),
+        )),
+        Err(e) => rows.push(check(
+            "codex_locate",
+            "Codex 会话可定位",
+            "passive",
+            "fail",
+            format!("{e:#}"),
+        )),
     }
 
     // 被动：三方仓库一致性（两端都定位到才校验）。
     match (&claude, &codex) {
         (Ok(c), Ok(x)) => match validate::validate_three_way(&c.cwd, &x.cwd, &input.target_path) {
-            Ok(_) => rows.push(check("three_way", "三方仓库一致性", "passive", "pass", "claude / codex / target 同仓".into())),
-            Err(e) => rows.push(check("three_way", "三方仓库一致性", "passive", "fail", format!("{e:#}"))),
+            Ok(_) => rows.push(check(
+                "three_way",
+                "三方仓库一致性",
+                "passive",
+                "pass",
+                "claude / codex / target 同仓".into(),
+            )),
+            Err(e) => rows.push(check(
+                "three_way",
+                "三方仓库一致性",
+                "passive",
+                "fail",
+                format!("{e:#}"),
+            )),
         },
-        _ => rows.push(check("three_way", "三方仓库一致性", "passive", "skipped", "会话未定位，跳过".into())),
+        _ => rows.push(check(
+            "three_way",
+            "三方仓库一致性",
+            "passive",
+            "skipped",
+            "会话未定位，跳过".into(),
+        )),
     }
 
     // 版本探针：验证 PATH / npm shim 解析 / 可 spawn（C4/C5）。
     match driver::probe_version("codex").await {
-        Ok(v) => rows.push(check("codex_version", "codex --version", "version", "pass", v)),
-        Err(e) => rows.push(check("codex_version", "codex --version", "version", "fail", format!("{e:#}"))),
+        Ok(v) => rows.push(check(
+            "codex_version",
+            "codex --version",
+            "version",
+            "pass",
+            v,
+        )),
+        Err(e) => rows.push(check(
+            "codex_version",
+            "codex --version",
+            "version",
+            "fail",
+            format!("{e:#}"),
+        )),
     }
     match driver::probe_version("claude").await {
-        Ok(v) => rows.push(check("claude_version", "claude --version", "version", "pass", v)),
-        Err(e) => rows.push(check("claude_version", "claude --version", "version", "fail", format!("{e:#}"))),
+        Ok(v) => rows.push(check(
+            "claude_version",
+            "claude --version",
+            "version",
+            "pass",
+            v,
+        )),
+        Err(e) => rows.push(check(
+            "claude_version",
+            "claude --version",
+            "version",
+            "fail",
+            format!("{e:#}"),
+        )),
     }
 
     // 实发往返（合成探针）：仅在用户勾选时跑。一次性只读会话，不污染真实会话。
@@ -873,36 +1133,96 @@ pub async fn codeloop_preflight(input: StartInput, live: bool) -> Result<Vec<Che
         match &codex {
             Ok(x) => {
                 let row = match driver::probe_codex_synthetic(&x.cwd, PROBE).await {
-                    Ok(reply) if reply.contains("PROBE_OK") => check("codex_live", "Codex 实发往返（合成探针）", "live", "pass", "回复含 PROBE_OK，新建路径全链路通".into()),
+                    Ok(reply) if reply.contains("PROBE_OK") => check(
+                        "codex_live",
+                        "Codex 实发往返（合成探针）",
+                        "live",
+                        "pass",
+                        "回复含 PROBE_OK，新建路径全链路通".into(),
+                    ),
                     Ok(reply) => {
-                        let mut r = check("codex_live", "Codex 实发往返（合成探针）", "live", "warn", "已收到回复但未含 PROBE_OK（输出格式可能变更）".into());
+                        let mut r = check(
+                            "codex_live",
+                            "Codex 实发往返（合成探针）",
+                            "live",
+                            "warn",
+                            "已收到回复但未含 PROBE_OK（输出格式可能变更）".into(),
+                        );
                         r.raw_excerpt = Some(reply.chars().take(500).collect());
                         r
                     }
-                    Err(e) => check("codex_live", "Codex 实发往返（合成探针）", "live", "fail", format!("{e:#}")),
+                    Err(e) => check(
+                        "codex_live",
+                        "Codex 实发往返（合成探针）",
+                        "live",
+                        "fail",
+                        format!("{e:#}"),
+                    ),
                 };
                 rows.push(row);
             }
-            Err(_) => rows.push(check("codex_live", "Codex 实发往返（合成探针）", "live", "skipped", "会话未定位，跳过".into())),
+            Err(_) => rows.push(check(
+                "codex_live",
+                "Codex 实发往返（合成探针）",
+                "live",
+                "skipped",
+                "会话未定位，跳过".into(),
+            )),
         }
         match &claude {
             Ok(c) => {
                 let row = match driver::probe_claude_synthetic(&c.cwd, PROBE).await {
-                    Ok(reply) if reply.contains("PROBE_OK") => check("claude_live", "Claude 实发往返（合成探针）", "live", "pass", "回复含 PROBE_OK，新建路径全链路通".into()),
+                    Ok(reply) if reply.contains("PROBE_OK") => check(
+                        "claude_live",
+                        "Claude 实发往返（合成探针）",
+                        "live",
+                        "pass",
+                        "回复含 PROBE_OK，新建路径全链路通".into(),
+                    ),
                     Ok(reply) => {
-                        let mut r = check("claude_live", "Claude 实发往返（合成探针）", "live", "warn", "已收到回复但未含 PROBE_OK（输出格式可能变更）".into());
+                        let mut r = check(
+                            "claude_live",
+                            "Claude 实发往返（合成探针）",
+                            "live",
+                            "warn",
+                            "已收到回复但未含 PROBE_OK（输出格式可能变更）".into(),
+                        );
                         r.raw_excerpt = Some(reply.chars().take(500).collect());
                         r
                     }
-                    Err(e) => check("claude_live", "Claude 实发往返（合成探针）", "live", "fail", format!("{e:#}")),
+                    Err(e) => check(
+                        "claude_live",
+                        "Claude 实发往返（合成探针）",
+                        "live",
+                        "fail",
+                        format!("{e:#}"),
+                    ),
                 };
                 rows.push(row);
             }
-            Err(_) => rows.push(check("claude_live", "Claude 实发往返（合成探针）", "live", "skipped", "会话未定位，跳过".into())),
+            Err(_) => rows.push(check(
+                "claude_live",
+                "Claude 实发往返（合成探针）",
+                "live",
+                "skipped",
+                "会话未定位，跳过".into(),
+            )),
         }
     } else {
-        rows.push(check("codex_live", "Codex 实发往返（合成探针）", "live", "skipped", "未勾选实发探针".into()));
-        rows.push(check("claude_live", "Claude 实发往返（合成探针）", "live", "skipped", "未勾选实发探针".into()));
+        rows.push(check(
+            "codex_live",
+            "Codex 实发往返（合成探针）",
+            "live",
+            "skipped",
+            "未勾选实发探针".into(),
+        ));
+        rows.push(check(
+            "claude_live",
+            "Claude 实发往返（合成探针）",
+            "live",
+            "skipped",
+            "未勾选实发探针".into(),
+        ));
     }
 
     Ok(rows)
@@ -916,10 +1236,11 @@ pub async fn codeloop_preflight(input: StartInput, live: bool) -> Result<Vec<Che
 #[tauri::command]
 pub async fn codeloop_set_auto_confirm(
     state: State<'_, AppState>,
+    loop_id: i64,
     enabled: bool,
 ) -> Result<(), String> {
     let guard = state.codeloop.inner.lock().await;
-    let Some(rl) = guard.as_ref() else {
+    let Some(rl) = guard.get(&loop_id) else {
         return Err("没有运行中的复核循环".into());
     };
     // enabled=自动 → step_confirm=false。
@@ -937,11 +1258,12 @@ pub async fn codeloop_set_auto_confirm(
 #[tauri::command]
 pub async fn codeloop_answer(
     state: State<'_, AppState>,
+    loop_id: i64,
     seq: i64,
     text: String,
 ) -> Result<(), String> {
     let guard = state.codeloop.inner.lock().await;
-    let Some(rl) = guard.as_ref() else {
+    let Some(rl) = guard.get(&loop_id) else {
         return Err("没有运行中的复核循环".into());
     };
     let mut pending = rl.pending.lock().await;
@@ -963,11 +1285,12 @@ pub async fn codeloop_answer(
 #[tauri::command]
 pub async fn codeloop_confirm(
     state: State<'_, AppState>,
+    loop_id: i64,
     seq: i64,
     approve: bool,
 ) -> Result<(), String> {
     let guard = state.codeloop.inner.lock().await;
-    let Some(rl) = guard.as_ref() else {
+    let Some(rl) = guard.get(&loop_id) else {
         return Err("没有运行中的复核循环".into());
     };
     let mut pending = rl.pending_confirm.lock().await;
@@ -984,17 +1307,36 @@ pub async fn codeloop_confirm(
     }
 }
 
-/// 停止当前循环（abort 后台任务，清状态，记录终态置 aborted_by_user）。
+/// 停止指定循环（abort 后台任务，从并发表移除，记录终态置 stopped_tracking）。
 #[tauri::command]
-pub async fn codeloop_stop(state: State<'_, AppState>) -> Result<(), String> {
+pub async fn codeloop_stop(state: State<'_, AppState>, loop_id: i64) -> Result<(), String> {
     let mut guard = state.codeloop.inner.lock().await;
-    if let Some(rl) = guard.take() {
+    if let Some(rl) = guard.remove(&loop_id) {
+        let progress = rl.progress.lock().await.clone();
         rl.handle.abort();
+        // abort 只停止 Zero Desktop 侧的等待任务；已发给外部 CLI 的长任务可能仍在对应会话里继续。
+        let phase = progress
+            .get("phase")
+            .and_then(|v| v.as_str())
+            .unwrap_or("unknown");
+        let _ = state.codeloop.db.append_message(
+            loop_id,
+            0,
+            "system",
+            None,
+            &format!(
+                "已停止 Zero Desktop 侧跟踪（停止时 phase={phase}）。已发给 Claude/Codex CLI 的当前任务可能仍在对应会话继续运行；请以外部会话最新 transcript/worktree 为准。"
+            ),
+        );
         // abort 是硬终止，任务内 finish 不保证执行 → 在此显式 finalize（幂等）。
-        let _ = state
-            .codeloop
-            .db
-            .finalize(rl.loop_id, "aborted", Some("aborted_by_user"), 0, None);
+        let total_rounds = state.codeloop.db.recorded_rounds(loop_id).unwrap_or(0);
+        let _ = state.codeloop.db.finalize(
+            loop_id,
+            "aborted",
+            Some("stopped_tracking"),
+            total_rounds,
+            None,
+        );
     }
     Ok(())
 }
@@ -1018,6 +1360,11 @@ pub async fn codeloop_loop_messages(
     state: State<'_, AppState>,
     loop_id: i64,
 ) -> Result<Vec<db::LoopMessageRow>, String> {
+    if let Ok(store) = Store::from_env() {
+        if let Err(e) = sync_implementation_from_claude(&state.codeloop.db, &store, loop_id) {
+            log::warn!("[codeloop] 从 Claude transcript 补录实现消息失败：{e:#}");
+        }
+    }
     state
         .codeloop
         .db
@@ -1033,4 +1380,155 @@ pub async fn codeloop_delete_loop(state: State<'_, AppState>, loop_id: i64) -> R
         .db
         .delete_loop(loop_id)
         .map_err(|e| format!("{e:#}"))
+}
+
+// ============================================================================
+// 共享引擎入口（run_codeloop）：UI 命令 codeloop_start 与 CLI codeloop-smoke 都调它。
+// 不依赖 AppHandle / AppState，调用方注入 LoopEvents + ConfirmPolicy。
+// ============================================================================
+
+/// 共享引擎依赖：所有 IO 端点（DB / 会话存储 / 事件外发 / 用户拍板）显式注入。
+pub struct RunLoopDeps {
+    pub store: Store,
+    pub db: Arc<db::Db>,
+    pub events: Arc<dyn LoopEvents>,
+    pub confirm: Arc<dyn ConfirmPolicy>,
+}
+
+/// 共享引擎输入：语义参数（与 `StartInput` 同构，但已是解析后的强类型）。
+pub struct RunLoopInput {
+    pub claude: SessionRef,
+    pub codex: SessionRef,
+    pub target: TargetSpec,
+    pub mode: ReviewMode,
+    pub max_rounds: u32,
+    pub wait_for_claude_idle: bool,
+    pub use_worktree: bool,
+    pub parent_loop_id: Option<i64>,
+    pub resume_worktree_path: Option<String>,
+    pub established: Established,
+}
+
+/// 引擎终态：DB 已 finalize，调用方可直接据此判定下一步。
+#[derive(Debug, Clone, Serialize)]
+pub struct RunLoopResult {
+    pub loop_id: i64,
+    pub status: String,
+    pub final_verdict: Option<String>,
+    pub total_rounds: i64,
+    pub worktree_path: Option<String>,
+}
+
+/// 同步运行一个复核循环到终态。建 DB 行 → 构造 LoopCtx → drive → 读回最终行。
+///
+/// `mode` / `parent_loop_id` / `resume_worktree_path` 的语义与 `codeloop_start` 一致。
+/// 不做会话占用并发校验（headless smoke 串行跑三段，UI 路径仍在 `codeloop_start` 校验）。
+pub async fn run_codeloop(deps: RunLoopDeps, input: RunLoopInput) -> Result<RunLoopResult> {
+    let RunLoopDeps {
+        store,
+        db,
+        events,
+        confirm,
+    } = deps;
+
+    let mut target = input.target;
+    let mut codex = input.codex;
+    let claude = input.claude;
+
+    // resume_worktree_path 已由调用方校验/规范化，这里只在非 None 时把 target/codex 迁过去。
+    let resume_worktree_path = input
+        .resume_worktree_path
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(ToOwned::to_owned);
+    if resume_worktree_path.is_some() && input.mode != ReviewMode::Implementation {
+        return Err(anyhow::anyhow!(
+            "只有 implementation 模式支持从 worktree 继续复核"
+        ));
+    }
+    if let Some(wt) = resume_worktree_path.as_deref() {
+        let (new_target, new_cwd) = relocate_to_worktree(wt, &target.repo_rel)
+            .map_err(|e| anyhow::anyhow!("worktree 路径校验失败：{e}"))?;
+        target = new_target;
+        codex.cwd = new_cwd;
+    }
+
+    let mode_str = match input.mode {
+        ReviewMode::Design => "design",
+        ReviewMode::Implementation => "implementation",
+    };
+    let loop_id = db.insert_loop(&db::NewLoop {
+        claude_session: claude.session_id.clone(),
+        codex_session: codex.session_id.clone(),
+        claude_cwd: claude.cwd.to_string_lossy().to_string(),
+        codex_cwd: codex.cwd.to_string_lossy().to_string(),
+        repo_root: target.repo_root.clone(),
+        target_repo_rel: target.repo_rel.clone(),
+        target_abs: target.abs.clone(),
+        target_label: target.label.clone(),
+        mode: mode_str.to_string(),
+        max_rounds: input.max_rounds.max(1) as i64,
+        wait_for_idle: input.wait_for_claude_idle,
+        // UI 的 step_confirm 已由 ConfirmPolicy 内部决策；DB 字段仅做记录，固定写 false。
+        step_confirm: false,
+        use_worktree: input.use_worktree || resume_worktree_path.is_some(),
+        parent_loop_id: input.parent_loop_id,
+    })?;
+    if let Some(wt) = resume_worktree_path.as_deref() {
+        db.set_worktree(loop_id, wt)?;
+        db.append_message(
+            loop_id,
+            0,
+            "system",
+            None,
+            &format!(
+                "从已完成 worktree 继续复核：{wt}。已跳过 Claude 实现首步，直接进入 Codex 复核。"
+            ),
+        )?;
+    }
+
+    // loop_id 一就绪就发一次 `phase=starting` —— headless smoke 的 CurrentLoopTracker
+    // 据此在「DB 行已建、首条业务 progress 尚未发」的窗口内也能捕获 loop_id,
+    // 避免该窗口内被全局 timeout 击中时 DB 留 running 行。
+    events.progress(
+        loop_id,
+        json!({ "phase": "starting", "mode": mode_str }),
+    );
+
+    let progress = Arc::new(Mutex::new(json!({ "phase": "starting" })));
+    let seq = Arc::new(AtomicI64::new(0));
+    let ctx = LoopCtx {
+        events: events.clone(),
+        confirm: confirm.clone(),
+        store,
+        db: db.clone(),
+        loop_id,
+        claude,
+        codex,
+        target,
+        mode: input.mode,
+        max_rounds: input.max_rounds.max(1),
+        wait_for_claude_idle: input.wait_for_claude_idle,
+        use_worktree: input.use_worktree || resume_worktree_path.is_some(),
+        resume_from_worktree: resume_worktree_path.is_some(),
+        established_codex: input.established.codex,
+        established_claude: input.established.claude,
+        progress,
+        seq,
+    };
+
+    // 直接 await，不 spawn —— smoke runner 串行编排，等本段终态再起下一段。
+    run_loop(ctx).await;
+
+    let row = db
+        .get_loop(loop_id)?
+        .ok_or_else(|| anyhow::anyhow!("插入循环记录后未能读回（loop_id={loop_id}）"))?;
+    Ok(RunLoopResult {
+        loop_id,
+        status: row.status,
+        final_verdict: row.final_verdict,
+        total_rounds: row.total_rounds,
+        worktree_path: row.worktree_path,
+    })
 }
