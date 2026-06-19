@@ -1,5 +1,5 @@
 import { GitBranch } from 'lucide-react'
-import type { LoopMessageRow, LoopRow } from '../api/tauri-client'
+import type { EntryKind, LoopMessageRow, LoopRow } from '../api/tauri-client'
 import { LoopTranscript } from './LoopTranscript'
 
 interface Props {
@@ -32,6 +32,17 @@ const FINAL_LABELS: Record<string, string> = {
   interrupted: '中断（应用重启）',
 }
 
+const ENTRY_META: Record<EntryKind, { icon: string; label: string; title: string }> = {
+  doc_review: { icon: '📄', label: '文档复核', title: '从文档复核开始（DocReview）' },
+  implement: { icon: '🛠', label: '从实现开始', title: '从实现开始（Implement）' },
+  review_seed: { icon: '📝', label: '外部 seed', title: '从既有复核意见开始（ReviewSeed）' },
+}
+
+function inferEntryKind(loop: LoopRow): EntryKind {
+  if (loop.entry_kind) return loop.entry_kind
+  return loop.mode === 'design' ? 'doc_review' : 'implement'
+}
+
 /** 短 id：会话 id 取末段，避免占满一行。 */
 function shortId(id: string): string {
   return id.length > 12 ? `…${id.slice(-10)}` : id
@@ -56,6 +67,7 @@ export function LoopDetail({
   }
 
   const ss = STATUS_STYLE[loop.status] ?? { label: loop.status, cls: 'bg-gray-100 text-gray-600' }
+  const entry = ENTRY_META[inferEntryKind(loop)]
   // 「开始实现」门槛：design 模式且确实通过复核（done + PASS）。
   const passed = loop.status === 'done' && loop.final_verdict === 'pass'
   const showImplement = loop.mode === 'design'
@@ -69,6 +81,12 @@ export function LoopDetail({
       <div className="rounded-md border border-gray-200 p-3 dark:border-gray-800">
         <div className="flex items-center gap-2">
           <span className={`rounded px-1.5 py-0.5 text-[10px] ${ss.cls}`}>{ss.label}</span>
+          <span
+            className="rounded bg-gray-100 px-1.5 py-0.5 text-[10px] text-gray-700 dark:bg-gray-800 dark:text-gray-200"
+            title={entry.title}
+          >
+            {entry.icon} {entry.label}
+          </span>
           <span className="min-w-0 flex-1 truncate text-sm font-medium text-gray-800 dark:text-gray-100" title={loop.target_abs}>
             #{loop.id} {loop.target_label || loop.target_repo_rel}
           </span>
@@ -94,6 +112,30 @@ export function LoopDetail({
           <span className="truncate font-mono text-gray-600 dark:text-gray-300" title={loop.claude_session}>{shortId(loop.claude_session)}</span>
           <span className="text-gray-400">Codex</span>
           <span className="truncate font-mono text-gray-600 dark:text-gray-300" title={loop.codex_session}>{shortId(loop.codex_session)}</span>
+          {loop.design_doc_path && (
+            <>
+              <span className="text-gray-400">规格依据</span>
+              <span className="truncate text-gray-600 dark:text-gray-300" title={loop.design_doc_path}>
+                {loop.design_doc_path}
+              </span>
+            </>
+          )}
+          {loop.seed_review_path && (
+            <>
+              <span className="text-gray-400">seed 文件</span>
+              <span className="truncate text-gray-600 dark:text-gray-300" title={loop.seed_review_path}>
+                {loop.seed_review_path}
+              </span>
+            </>
+          )}
+          {!loop.seed_review_path && loop.seed_review_inline_hash && (
+            <>
+              <span className="text-gray-400">seed 内联</span>
+              <span className="truncate font-mono text-gray-600 dark:text-gray-300" title={loop.seed_review_inline_hash}>
+                sm3:{loop.seed_review_inline_hash}
+              </span>
+            </>
+          )}
         </div>
 
         {loop.worktree_path && (

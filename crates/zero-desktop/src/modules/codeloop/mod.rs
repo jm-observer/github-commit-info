@@ -25,7 +25,7 @@ use agent_session::store::Store;
 use agent_session::{driver, watch, MessagesPage, Provider, SessionRef, SessionSummary};
 use anyhow::Result;
 use codeloop_core::parse::{self, Verdict};
-use codeloop_core::prompt::{self, ReviewMode, TargetSpec};
+use codeloop_core::prompt::{self, EntryKind, ReviewMode, TargetRole, TargetSpec};
 use codeloop_core::validate;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -123,6 +123,20 @@ pub struct StartInput {
     /// 按 provider 分开（预览台一次只热一端，另一端仍需照发）。
     #[serde(default)]
     pub established: Established,
+    // ----- 多入口（codeloop-multi-entry-design.md §6.1）-----
+    /// 多入口标记；未带时按 `mode` 推断（`design ⇒ DocReview` / `implementation ⇒ Implement`）。
+    /// 只发 mode 永远不会被推断为 ReviewSeed，避免误升级。
+    #[serde(default)]
+    pub entry_kind: Option<EntryKind>,
+    /// 仅 `ReviewSeed(mode=implementation)` 可用：规格依据文档路径（绝对或相对 target 仓根）。
+    #[serde(default)]
+    pub design_doc_path: Option<String>,
+    /// `ReviewSeed`：seed 文件路径（与 `seed_review_inline` 二选一）。
+    #[serde(default)]
+    pub seed_review_path: Option<String>,
+    /// `ReviewSeed`：直接粘贴的 review 文本（与 `seed_review_path` 二选一）。
+    #[serde(default)]
+    pub seed_review_inline: Option<String>,
 }
 
 /// 首轮预热状态（按 provider 分开）。见 docs/codeloop-cli-resilience-design.md §5。
@@ -154,6 +168,180 @@ enum FinalVerdict {
     AbortedByUser,
 }
 
+// ------------------------- 多入口（codeloop-multi-entry-design.md §6.1）-------------------------
+
+/// `entry_kind` → 落库字符串（`loops.entry_kind` 列）。
+fn entry_kind_str(k: EntryKind) -> &'static str {
+    match k {
+        EntryKind::DocReview => "doc_review",
+        EntryKind::Implement => "implement",
+        EntryKind::ReviewSeed => "review_seed",
+    }
+}
+
+/// 未带 `entry_kind` 时按 `mode` 推断（§6.1）；只发 mode 永远不会被推断为 ReviewSeed。
+fn infer_entry_kind(explicit: Option<EntryKind>, mode: ReviewMode) -> EntryKind {
+    if let Some(k) = explicit {
+        return k;
+    }
+    match mode {
+        ReviewMode::Design => EntryKind::DocReview,
+        ReviewMode::Implementation => EntryKind::Implement,
+    }
+}
+
+/// `StartInput` / `RunLoopInput` 共用的入口字段校验（§6.1 校验表）。
+///
+/// `design_doc_path` / `seed_review_path` / `seed_review_inline` 仅做"字段层校验"
+/// （是否给了、是否互斥），路径存在性 / 仓根归属 / 大小阈值由 `validate_review_seed_inputs`
+/// 做（preflight + start 均调）。
+fn validate_entry_fields(
+    entry_kind: EntryKind,
+    mode: ReviewMode,
+    design_doc_path: Option<&str>,
+    seed_review_path: Option<&str>,
+    seed_review_inline: Option<&str>,
+) -> std::result::Result<(), String> {
+    let has_seed_path = seed_review_path.map(|s| !s.is_empty()).unwrap_or(false);
+    let has_seed_inline = seed_review_inline.map(|s| !s.is_empty()).unwrap_or(false);
+    let has_design_doc = design_doc_path.map(|s| !s.is_empty()).unwrap_or(false);
+    match entry_kind {
+        EntryKind::DocReview => {
+            if mode != ReviewMode::Design {
+                return Err("DocReview 入口仅支持 mode=design".into());
+            }
+            if has_design_doc {
+                return Err("DocReview 入口不接受 design_doc_path".into());
+            }
+            if has_seed_path || has_seed_inline {
+                return Err("DocReview 入口不接受 seed_review_*".into());
+            }
+        }
+        EntryKind::Implement => {
+            if mode != ReviewMode::Implementation {
+                return Err("Implement 入口仅支持 mode=implementation".into());
+            }
+            if has_design_doc {
+                return Err(
+                    "Implement 入口不接受 design_doc_path（target_path 即规格文档）".into(),
+                );
+            }
+            if has_seed_path || has_seed_inline {
+                return Err("Implement 入口不接受 seed_review_*".into());
+            }
+        }
+        EntryKind::ReviewSeed => {
+            if has_seed_path == has_seed_inline {
+                return Err(
+                    "ReviewSeed 入口要求 seed_review_path / seed_review_inline 恰好一项有值".into(),
+                );
+            }
+            if mode == ReviewMode::Design && has_design_doc {
+                return Err(
+                    "ReviewSeed(mode=design) 拒绝 design_doc_path（target_path 即修订对象）".into(),
+                );
+            }
+            // mode=implementation 时 design_doc_path 可缺省（合法）。
+        }
+    }
+    Ok(())
+}
+
+/// `ReviewSeed` 的 seed 输入校验（路径存在 / 可读 / 大小阈值）。`preflight` 与 `start` 都调。
+const SEED_MAX_BYTES: u64 = 1024 * 1024; // 1 MiB
+
+fn validate_review_seed_inputs(
+    seed_review_path: Option<&str>,
+    seed_review_inline: Option<&str>,
+) -> std::result::Result<(), String> {
+    if let Some(p) = seed_review_path.filter(|s| !s.is_empty()) {
+        let path = Path::new(p);
+        let meta = std::fs::metadata(path)
+            .map_err(|e| format!("seed_review_path 不可读：{}（{e}）", p))?;
+        if !meta.is_file() {
+            return Err(format!("seed_review_path 不是常规文件：{}", p));
+        }
+        if meta.len() > SEED_MAX_BYTES {
+            return Err(format!(
+                "seed_review_path 超过 {}KiB（实际 {} 字节）",
+                SEED_MAX_BYTES / 1024,
+                meta.len()
+            ));
+        }
+    }
+    if let Some(s) = seed_review_inline.filter(|s| !s.is_empty()) {
+        if s.len() as u64 > SEED_MAX_BYTES {
+            return Err(format!(
+                "seed_review_inline 超过 {}KiB",
+                SEED_MAX_BYTES / 1024
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// 把 `design_doc_path` 解析为 `target` 所在仓根之内的绝对路径（canonicalize + 同仓根校验）。
+/// `repo_root` 由调用方提供（已 canonicalize / display_path）。
+pub(super) fn resolve_design_doc(
+    repo_root: &Path,
+    design_doc_path: &str,
+) -> std::result::Result<PathBuf, String> {
+    let p = Path::new(design_doc_path);
+    let abs = if p.is_absolute() {
+        p.to_path_buf()
+    } else {
+        repo_root.join(p)
+    };
+    let canon = std::fs::canonicalize(&abs)
+        .map_err(|e| format!("design_doc_path 解析失败 {}：{e}", abs.display()))?;
+    let meta = std::fs::metadata(&canon)
+        .map_err(|e| format!("design_doc_path 不可读 {}：{e}", canon.display()))?;
+    if !meta.is_file() {
+        return Err(format!("design_doc_path 不是常规文件：{}", canon.display()));
+    }
+    if meta.len() == 0 {
+        return Err(format!("design_doc_path 为空文件：{}", canon.display()));
+    }
+    let repo_canon = std::fs::canonicalize(repo_root).unwrap_or_else(|_| repo_root.to_path_buf());
+    if !canon.starts_with(&repo_canon) {
+        return Err(format!(
+            "design_doc_path 跨仓：{} 不在仓根 {} 内",
+            canon.display(),
+            repo_canon.display()
+        ));
+    }
+    Ok(canon)
+}
+
+/// 读 seed 文本：`inline` 优先；否则从 `path` 读全文。
+///
+/// 目前 `dispatch_review_seed` 直接从 ctx.seed_review_inline / DB 行的 seed_review_path
+/// 读，未走此函数；保留供未来桌面端「预览 seed」/「在 preflight 提前读出 seed 文本」时复用。
+#[allow(dead_code)]
+fn load_seed_text(
+    seed_review_path: Option<&str>,
+    seed_review_inline: Option<&str>,
+) -> std::result::Result<String, String> {
+    if let Some(s) = seed_review_inline.filter(|s| !s.is_empty()) {
+        return Ok(s.to_string());
+    }
+    if let Some(p) = seed_review_path.filter(|s| !s.is_empty()) {
+        return std::fs::read_to_string(p)
+            .map_err(|e| format!("读 seed_review_path 失败 {}：{e}", p));
+    }
+    Err("缺少 seed_review_path / seed_review_inline".into())
+}
+
+/// inline seed 的短哈希前缀（sha256 前 16 字符 hex），供排错与去重。
+pub(super) fn seed_inline_hash(text: &str) -> String {
+    use sha2::{Digest, Sha256};
+    let mut h = Sha256::new();
+    h.update(text.as_bytes());
+    let out = h.finalize();
+    let hex: String = out.iter().take(8).map(|b| format!("{b:02x}")).collect();
+    hex
+}
+
 // ------------------------- 循环上下文 -------------------------
 
 /// 运行期上下文：解析好的两端 SessionRef + target 定位 + 配置 + 共享句柄。
@@ -177,6 +365,16 @@ struct LoopCtx {
     established_claude: bool,
     progress: Arc<Mutex<Value>>,
     seq: Arc<AtomicI64>,
+    // ----- 多入口（codeloop-multi-entry-design.md §6.3）-----
+    /// 入口类型（决定 round 1 在 `loop_main` 之前做什么）。
+    entry_kind: EntryKind,
+    /// Codex / Claude prompt 渲染时的 Locator 措辞角色。
+    target_role: TargetRole,
+    /// 仅 `RevisionCode` 用：规格依据文档绝对路径。
+    spec_doc: Option<PathBuf>,
+    /// `ReviewSeed` 入口的 inline seed 原文（与 DB 的 `seed_review_path` 互斥）。
+    /// DB 只存 hash 不存原文，故 inline 走通需 LoopCtx 透传。
+    seed_review_inline: Option<String>,
 }
 
 impl LoopCtx {
@@ -326,7 +524,17 @@ fn try_relocate_worktree(
 }
 
 /// 复核↔修订主循环。基础设施错 → Err（上层 emit error）；业务终态正常收尾。
-async fn drive(ctx: &LoopCtx) -> Result<()> {
+///
+/// `start_round`：循环主体的起点轮次。`DocReview` / `Implement` 入口传 1（首轮 = Codex 复核 round
+/// 1）；`ReviewSeed` 入口传 2（round 1 已由入口分发段以 seed + Claude 修订 round 1 顶替）。
+/// 见 docs/codeloop-multi-entry-design.md §6.2。
+async fn loop_main(ctx: &LoopCtx, start_round: u32) -> Result<()> {
+    // 临时别名，便于在过渡期保留既有 implement 首步逻辑可继续编译。
+    drive(ctx, start_round).await
+}
+
+/// 复核↔修订主循环（旧名）。`start_round` 决定首个 Codex 复核轮次。
+async fn drive(ctx: &LoopCtx, start_round: u32) -> Result<()> {
     if ctx.wait_for_claude_idle {
         log::info!("[codeloop] 先等 Claude 当前轮空闲（超时 {CLAUDE_IDLE_TIMEOUT:?}）…");
         if let Err(e) = watch::wait_for_idle(&ctx.store, &ctx.claude, CLAUDE_IDLE_TIMEOUT).await {
@@ -407,7 +615,7 @@ async fn drive(ctx: &LoopCtx) -> Result<()> {
             .await;
     }
 
-    for n in 1..=ctx.max_rounds {
+    for n in start_round..=ctx.max_rounds {
         // 0. 二轮起：让 Codex 基于上一轮 Claude 修订重新审核前，先确认（展示 Claude 本轮回复）。
         if n > 1 {
             match confirm_gate(
@@ -447,6 +655,8 @@ async fn drive(ctx: &LoopCtx) -> Result<()> {
             ctx.mode,
             n,
             codex_first_turn,
+            ctx.target_role,
+            ctx.spec_doc.as_deref(),
         );
         let review = match send_and_resolve(ctx, &codex, &codex_prompt).await? {
             Resolved::Reply(r) => r,
@@ -522,9 +732,10 @@ async fn drive(ctx: &LoopCtx) -> Result<()> {
         let mut claude_prompt = prompt::render_claude_prompt(
             prompt::DEFAULT_CLAUDE_TEMPLATE,
             &target,
-            ctx.mode,
             &review,
             claude_first_turn,
+            ctx.target_role,
+            ctx.spec_doc.as_deref(),
         );
         // worktree 模式且尚未建立：追加指令，让 Claude 自己用 worktree + 子 agent 实现并回报路径。
         if ctx.use_worktree && !worktree_established {
@@ -567,18 +778,136 @@ async fn drive(ctx: &LoopCtx) -> Result<()> {
     Ok(())
 }
 
-/// 循环顶层：跑 drive，基础设施错时 emit error；终态由 drive 自身 finish 处理。
+/// `ReviewSeed` 入口分发：
+/// 1. 读 seed（inline 优先 → 否则文件）。
+/// 2. wrap 成 EXTERNAL_REVIEW_SEED 区块 → 作为 round-1 `codex_review_seed`（verdict=needs_work）
+///    写入 `loop_messages`。
+/// 3. 立刻用包裹后的 seed 作为 `{REVIEW}` 渲染 Claude 修订模板 → 调 `send_and_resolve` 拿回复，
+///    写 round-1 `claude_revise`；并尝试 `try_relocate_worktree`（与 Implement 路径同形）。
+///
+/// 见 docs/codeloop-multi-entry-design.md §3.3 / §6.2。
+async fn dispatch_review_seed(ctx: &LoopCtx) -> Result<()> {
+    // 入口分发段读取 seed：inline 优先（由 LoopCtx 透传，DB 不存原文只存 hash）→ 否则
+    // 从 DB 行的 `seed_review_path` 读文件。
+    let seed = if let Some(inline) = ctx.seed_review_inline.as_deref().filter(|s| !s.is_empty()) {
+        inline.to_string()
+    } else {
+        let row = match ctx.db.get_loop(ctx.loop_id) {
+            Ok(Some(r)) => r,
+            Ok(None) => return Err(anyhow::anyhow!("loop {} 行丢失", ctx.loop_id)),
+            Err(e) => return Err(anyhow::anyhow!("读取 loop 行失败：{e}")),
+        };
+        let path = row.seed_review_path.as_deref().ok_or_else(|| {
+            anyhow::anyhow!(
+                "ReviewSeed 入口未提供 seed_review_path / seed_review_inline（loop_id={})",
+                ctx.loop_id
+            )
+        })?;
+        std::fs::read_to_string(path)
+            .map_err(|e| anyhow::anyhow!("读 seed_review_path 失败 {}：{e}", path))?
+    };
+    let wrapped = prompt::wrap_seed_for_claude(&seed);
+
+    // round-1 codex_review_seed（verdict=needs_work），与真实 Codex 复核分流但参与 round 计数。
+    ctx.log_msg(1, "codex_review_seed", Some("needs_work"), &wrapped);
+    ctx.report(json!({
+        "round": 1, "phase": "reviewed", "verdict": "needs_work", "source": "seed",
+    }))
+    .await;
+
+    // step-confirm 闸门：seed → Claude 第一次下发也走 codex_to_claude 同一闸门（§3.3）。
+    match confirm_gate(
+        ctx,
+        "codex_to_claude",
+        "把外部 seed 复核意见发给 Claude Code 修订？",
+        &wrapped,
+    )
+    .await
+    {
+        Gate::Approve => {}
+        Gate::Reject => {
+            ctx.finish(FinalVerdict::AbortedByUser, 0).await;
+            return Ok(());
+        }
+        Gate::Timeout => {
+            ctx.finish(FinalVerdict::AbortedTimeout, 0).await;
+            return Ok(());
+        }
+    }
+
+    // round-1 claude_revise：渲染 Claude 修订模板（target_role 已由调用方设置好）。
+    let mut target = ctx.target.clone();
+    let mut codex = ctx.codex.clone();
+    let mut worktree_established = ctx.resume_from_worktree;
+    let mut force_locator = false;
+    let claude_first_turn = !ctx.established_claude;
+    let mut claude_prompt = prompt::render_claude_prompt(
+        prompt::DEFAULT_CLAUDE_TEMPLATE,
+        &target,
+        &wrapped,
+        claude_first_turn,
+        ctx.target_role,
+        ctx.spec_doc.as_deref(),
+    );
+    if ctx.use_worktree && !worktree_established {
+        claude_prompt.push_str(prompt::WORKTREE_INSTRUCTION);
+    }
+    let claude_reply = match send_and_resolve(ctx, &ctx.claude, &claude_prompt).await? {
+        Resolved::Reply(r) => r,
+        Resolved::Timeout => {
+            ctx.finish(FinalVerdict::AbortedTimeout, 0).await;
+            return Ok(());
+        }
+    };
+    if ctx.use_worktree && !worktree_established {
+        try_relocate_worktree(
+            ctx,
+            &claude_reply,
+            1,
+            &mut target,
+            &mut codex,
+            &mut worktree_established,
+            &mut force_locator,
+        );
+    }
+    ctx.log_msg(1, "claude_revise", None, &claude_reply);
+    ctx.report(json!({ "round": 1, "phase": "revised" })).await;
+    Ok(())
+}
+
+/// 循环顶层：按 `entry_kind` 做入口分发（§6.2）→ 跑 `loop_main`，基础设施错时 emit error；
+/// 业务终态由 `loop_main` 自身 `finish` 处理。
 async fn run_loop(ctx: LoopCtx) {
     log::info!(
-        "[codeloop] 循环任务启动：claude={} codex={} target={} mode={:?} max_rounds={} wait_idle={}",
+        "[codeloop] 循环任务启动：claude={} codex={} target={} mode={:?} max_rounds={} \
+         wait_idle={} entry_kind={:?}",
         ctx.claude.session_id,
         ctx.codex.session_id,
         ctx.target.repo_rel,
         ctx.mode,
         ctx.max_rounds,
         ctx.wait_for_claude_idle,
+        ctx.entry_kind,
     );
-    if let Err(e) = drive(&ctx).await {
+    let start_round = match ctx.entry_kind {
+        // DocReview / Implement：从 round 1 起 Codex 复核。Implement 首步在 drive 内仍按
+        // 既有 mode=Implementation 分支处理（与今天一致），由 drive() 自身负责 implement 首步。
+        EntryKind::DocReview | EntryKind::Implement => 1,
+        EntryKind::ReviewSeed => {
+            // 入口分发段：把 seed 包成 round-1 的 codex_review_seed + Claude 修订 round 1。
+            // 之后由 loop_main 从 round 2 起接管真正的 Codex 复核。
+            match dispatch_review_seed(&ctx).await {
+                Ok(()) => 2,
+                Err(e) => {
+                    log::warn!("[codeloop] ReviewSeed 入口分发失败：{e:#}");
+                    ctx.report(json!({ "phase": "error", "error": format!("{e:#}") }))
+                        .await;
+                    return;
+                }
+            }
+        }
+    };
+    if let Err(e) = loop_main(&ctx, start_round).await {
         log::warn!("[codeloop] 基础设施错误，循环终止：{e:#}");
         // drive 返回 Err 不经 finish → 在此 finalize 为 failed（幂等 WHERE status='running'）。
         let total_rounds = ctx.db.recorded_rounds(ctx.loop_id).unwrap_or(0);
@@ -657,6 +986,14 @@ fn sync_implementation_from_claude(db: &db::Db, store: &Store, loop_id: i64) -> 
         return Ok(());
     };
     if row.mode != "implementation" {
+        return Ok(());
+    }
+    // 护栏 0（多入口 §5 兼容表）：触发条件加一层 entry_kind=implement 限定（NULL 时按今天行为
+    // 推断为 implement）。entry_kind='review_seed' 显式跳过此条 stopped_tracking 补录扫描——
+    // ReviewSeed 同 mode=implementation 也无 claude_implement,会被误命中并伪造消息。
+    let entry_kind_db = row.entry_kind.as_deref();
+    let is_implement_entry = matches!(entry_kind_db, None | Some("implement"));
+    if !is_implement_entry {
         return Ok(());
     }
     if db.has_message_kind(loop_id, "claude_implement")? {
@@ -802,6 +1139,22 @@ pub async fn codeloop_start(
 ) -> Result<i64, String> {
     let cs = &state.codeloop;
 
+    // ---- 多入口字段校验（§6.1）：失败直接返回错误，不写 loops 行 ----
+    let entry_kind = infer_entry_kind(input.entry_kind, input.mode);
+    validate_entry_fields(
+        entry_kind,
+        input.mode,
+        input.design_doc_path.as_deref(),
+        input.seed_review_path.as_deref(),
+        input.seed_review_inline.as_deref(),
+    )?;
+    if entry_kind == EntryKind::ReviewSeed {
+        validate_review_seed_inputs(
+            input.seed_review_path.as_deref(),
+            input.seed_review_inline.as_deref(),
+        )?;
+    }
+
     let store = Store::from_env()
         .map_err(|e| format!("定位会话存储失败（~/.codex / ~/.claude）：{e:#}"))?;
     let claude = resolve_ref(&store, Provider::Claude, &input.claude)
@@ -868,6 +1221,40 @@ pub async fn codeloop_start(
         codex.cwd = new_cwd;
     }
 
+    // ---- 多入口（§6.3）：target_role / spec_doc / seed 计算 ----
+    let spec_doc_abs: Option<PathBuf> = if entry_kind == EntryKind::ReviewSeed
+        && input.mode == ReviewMode::Implementation
+    {
+        match input.design_doc_path.as_deref().filter(|s| !s.is_empty()) {
+            Some(p) => Some(
+                resolve_design_doc(Path::new(&target.repo_root), p)
+                    .map_err(|e| format!("design_doc_path 校验失败：{e}"))?,
+            ),
+            None => None,
+        }
+    } else {
+        None
+    };
+    let target_role = match (entry_kind, input.mode) {
+        (EntryKind::DocReview, _) => TargetRole::RevisionDoc,
+        (EntryKind::Implement, _) => TargetRole::SpecDoc,
+        (EntryKind::ReviewSeed, ReviewMode::Design) => TargetRole::RevisionDoc,
+        (EntryKind::ReviewSeed, ReviewMode::Implementation) => TargetRole::RevisionCode,
+    };
+    let seed_inline_hash_val = input
+        .seed_review_inline
+        .as_deref()
+        .filter(|s| !s.is_empty())
+        .map(seed_inline_hash);
+    let design_doc_db = spec_doc_abs.as_ref().map(|p| {
+        // 落库存仓内相对路径（正斜杠），UI 直观。
+        let rel = p
+            .strip_prefix(Path::new(&target.repo_root))
+            .map(|q| q.to_path_buf())
+            .unwrap_or_else(|_| p.clone());
+        rel.to_string_lossy().replace('\\', "/")
+    });
+
     // 持久化为一条 running 记录（前端列表/详情据此呈现），拿到 loop_id。
     let db = cs.db.clone();
     let mode_str = match input.mode {
@@ -890,6 +1277,10 @@ pub async fn codeloop_start(
             step_confirm: input.step_confirm,
             use_worktree: input.use_worktree || resume_worktree_path.is_some(),
             parent_loop_id: input.parent_loop_id,
+            entry_kind: Some(entry_kind_str(entry_kind).to_string()),
+            design_doc_path: design_doc_db,
+            seed_review_path: input.seed_review_path.clone(),
+            seed_review_inline_hash: seed_inline_hash_val,
         })
         .map_err(|e| format!("写入复核记录失败：{e:#}"))?;
     if let Some(wt) = resume_worktree_path.as_deref() {
@@ -939,6 +1330,10 @@ pub async fn codeloop_start(
         established_claude: input.established.claude,
         progress: progress.clone(),
         seq,
+        entry_kind,
+        target_role,
+        spec_doc: spec_doc_abs,
+        seed_review_inline: input.seed_review_inline.clone(),
     };
 
     let handle = tokio::spawn(run_loop(ctx));
@@ -1015,6 +1410,52 @@ fn check(id: &str, label: &str, tier: &str, status: &str, detail: String) -> Che
 #[tauri::command]
 pub async fn codeloop_preflight(input: StartInput, live: bool) -> Result<Vec<CheckRow>, String> {
     let mut rows: Vec<CheckRow> = Vec::new();
+
+    // 多入口字段校验（§6.4 第 2 条）：放在最前面，作为 passive 自检的一部分。
+    let entry_kind = infer_entry_kind(input.entry_kind, input.mode);
+    match validate_entry_fields(
+        entry_kind,
+        input.mode,
+        input.design_doc_path.as_deref(),
+        input.seed_review_path.as_deref(),
+        input.seed_review_inline.as_deref(),
+    ) {
+        Ok(()) => rows.push(check(
+            "entry_kind",
+            "多入口字段一致性",
+            "passive",
+            "pass",
+            format!("entry_kind={:?} mode={:?}", entry_kind, input.mode),
+        )),
+        Err(e) => rows.push(check(
+            "entry_kind",
+            "多入口字段一致性",
+            "passive",
+            "fail",
+            e,
+        )),
+    }
+    if entry_kind == EntryKind::ReviewSeed {
+        match validate_review_seed_inputs(
+            input.seed_review_path.as_deref(),
+            input.seed_review_inline.as_deref(),
+        ) {
+            Ok(()) => rows.push(check(
+                "review_seed",
+                "ReviewSeed 输入可读且大小合规",
+                "passive",
+                "pass",
+                "seed_review_path/inline 一项有值，体积合规".into(),
+            )),
+            Err(e) => rows.push(check(
+                "review_seed",
+                "ReviewSeed 输入可读且大小合规",
+                "passive",
+                "fail",
+                e,
+            )),
+        }
+    }
 
     let store = match Store::from_env() {
         Ok(s) => s,
@@ -1407,6 +1848,14 @@ pub struct RunLoopInput {
     pub parent_loop_id: Option<i64>,
     pub resume_worktree_path: Option<String>,
     pub established: Established,
+    // ----- 多入口（codeloop-multi-entry-design.md §6.4 第 1 条）-----
+    /// 多入口标记；由调用方按 §6.1 校验后传入。
+    pub entry_kind: EntryKind,
+    /// 仅 `ReviewSeed(mode=implementation)`：规格依据文档绝对路径（已 canonicalize 落仓内）。
+    pub design_doc_path: Option<PathBuf>,
+    /// `ReviewSeed`：seed 来源（文件路径 + 文本，两者其一恰好有值；inline 时 path=None）。
+    pub seed_review_path: Option<String>,
+    pub seed_review_inline: Option<String>,
 }
 
 /// 引擎终态：DB 已 finalize，调用方可直接据此判定下一步。
@@ -1435,6 +1884,27 @@ pub async fn run_codeloop(deps: RunLoopDeps, input: RunLoopInput) -> Result<RunL
     let mut codex = input.codex;
     let claude = input.claude;
 
+    // ---- 多入口字段校验（§6.4 第 1 / 2 条）：与 Tauri 路径同形 ----
+    let entry_kind = input.entry_kind;
+    let seed_path_str = input.seed_review_path.as_deref();
+    let seed_inline_str = input.seed_review_inline.as_deref();
+    let design_doc_str = input.design_doc_path.as_ref().map(|p| {
+        // RunLoopInput.design_doc_path 已是 PathBuf,转字符串供字段校验复用。
+        p.to_string_lossy().to_string()
+    });
+    validate_entry_fields(
+        entry_kind,
+        input.mode,
+        design_doc_str.as_deref(),
+        seed_path_str,
+        seed_inline_str,
+    )
+    .map_err(|e| anyhow::anyhow!("{e}"))?;
+    if entry_kind == EntryKind::ReviewSeed {
+        validate_review_seed_inputs(seed_path_str, seed_inline_str)
+            .map_err(|e| anyhow::anyhow!("{e}"))?;
+    }
+
     // resume_worktree_path 已由调用方校验/规范化，这里只在非 None 时把 target/codex 迁过去。
     let resume_worktree_path = input
         .resume_worktree_path
@@ -1453,6 +1923,25 @@ pub async fn run_codeloop(deps: RunLoopDeps, input: RunLoopInput) -> Result<RunL
         target = new_target;
         codex.cwd = new_cwd;
     }
+
+    // target_role / spec_doc / 落库元数据计算（与 codeloop_start 同形）。
+    let target_role = match (entry_kind, input.mode) {
+        (EntryKind::DocReview, _) => TargetRole::RevisionDoc,
+        (EntryKind::Implement, _) => TargetRole::SpecDoc,
+        (EntryKind::ReviewSeed, ReviewMode::Design) => TargetRole::RevisionDoc,
+        (EntryKind::ReviewSeed, ReviewMode::Implementation) => TargetRole::RevisionCode,
+    };
+    let spec_doc_abs = input.design_doc_path.clone();
+    let design_doc_db = spec_doc_abs.as_ref().map(|p| {
+        let rel = p
+            .strip_prefix(Path::new(&target.repo_root))
+            .map(|q| q.to_path_buf())
+            .unwrap_or_else(|_| p.clone());
+        rel.to_string_lossy().replace('\\', "/")
+    });
+    let seed_inline_hash_val = seed_inline_str
+        .filter(|s| !s.is_empty())
+        .map(seed_inline_hash);
 
     let mode_str = match input.mode {
         ReviewMode::Design => "design",
@@ -1474,6 +1963,10 @@ pub async fn run_codeloop(deps: RunLoopDeps, input: RunLoopInput) -> Result<RunL
         step_confirm: false,
         use_worktree: input.use_worktree || resume_worktree_path.is_some(),
         parent_loop_id: input.parent_loop_id,
+        entry_kind: Some(entry_kind_str(entry_kind).to_string()),
+        design_doc_path: design_doc_db,
+        seed_review_path: input.seed_review_path.clone(),
+        seed_review_inline_hash: seed_inline_hash_val,
     })?;
     if let Some(wt) = resume_worktree_path.as_deref() {
         db.set_worktree(loop_id, wt)?;
@@ -1516,6 +2009,10 @@ pub async fn run_codeloop(deps: RunLoopDeps, input: RunLoopInput) -> Result<RunL
         established_claude: input.established.claude,
         progress,
         seq,
+        entry_kind,
+        target_role,
+        spec_doc: spec_doc_abs,
+        seed_review_inline: input.seed_review_inline.clone(),
     };
 
     // 直接 await，不 spawn —— smoke runner 串行编排，等本段终态再起下一段。

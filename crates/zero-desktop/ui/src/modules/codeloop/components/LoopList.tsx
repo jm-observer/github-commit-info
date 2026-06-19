@@ -1,5 +1,5 @@
 import { RefreshCw, Trash2, GitBranch } from 'lucide-react'
-import type { LoopRow } from '../api/tauri-client'
+import type { EntryKind, LoopRow } from '../api/tauri-client'
 
 interface Props {
   loops: LoopRow[]
@@ -24,6 +24,18 @@ const FINAL_LABELS: Record<string, string> = {
   aborted_parse: '解析失败',
   aborted_by_user: '用户中止',
   interrupted: '中断',
+}
+
+/** 入口徽标（旧数据 entry_kind=null 时按 mode 推断；见多入口设计 §5 兼容映射）。 */
+const ENTRY_META: Record<EntryKind, { icon: string; label: string; title: string }> = {
+  doc_review: { icon: '📄', label: '文档复核', title: '从文档复核开始（DocReview）' },
+  implement: { icon: '🛠', label: '实现', title: '从实现开始（Implement）' },
+  review_seed: { icon: '📝', label: '外部 seed', title: '从既有复核意见开始（ReviewSeed）' },
+}
+
+function inferEntryKind(loop: LoopRow): EntryKind {
+  if (loop.entry_kind) return loop.entry_kind
+  return loop.mode === 'design' ? 'doc_review' : 'implement'
 }
 
 function shortTime(iso: string): string {
@@ -54,6 +66,7 @@ export function LoopList(props: Props) {
         ) : (
           loops.map(l => {
             const ss = STATUS_STYLE[l.status] ?? { label: l.status, cls: 'bg-gray-100 text-gray-600' }
+            const entry = ENTRY_META[inferEntryKind(l)]
             return (
               <li
                 key={l.id}
@@ -66,6 +79,12 @@ export function LoopList(props: Props) {
               >
                 <div className="flex items-center gap-1.5">
                   <span className={`rounded px-1.5 py-0.5 text-[10px] ${ss.cls}`}>{ss.label}</span>
+                  <span
+                    className="rounded bg-gray-100 px-1 py-0.5 text-[10px] text-gray-600 dark:bg-gray-800 dark:text-gray-300"
+                    title={entry.title}
+                  >
+                    {entry.icon}
+                  </span>
                   <span
                     className="min-w-0 flex-1 truncate text-sm text-gray-800 dark:text-gray-100"
                     title={l.target_abs}

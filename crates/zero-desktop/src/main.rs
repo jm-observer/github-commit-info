@@ -85,6 +85,19 @@ enum Command {
         /// 全局 wall-clock 上限（如 `15m` / `1h`）。
         #[arg(long, default_value = "15m")]
         timeout: humantime::Duration,
+        /// 多入口标记（codeloop-multi-entry-design.md §6.4 第 3 点）：
+        /// `doc_review`（默认，兼容旧脚本） | `implement` | `review_seed`。
+        #[arg(long, default_value = "doc_review")]
+        entry_kind: String,
+        /// 仅 `--entry-kind=review_seed` 且 `mode=implementation` 时可选：规格依据文档路径。
+        #[arg(long)]
+        design_doc: Option<String>,
+        /// `--entry-kind=review_seed`：seed 文件路径。
+        #[arg(long)]
+        seed_review: Option<String>,
+        /// `--entry-kind=review_seed`：从文件读 inline seed 文本（避免 shell 引号陷阱）。
+        #[arg(long)]
+        seed_review_inline_file: Option<PathBuf>,
     },
 }
 
@@ -147,7 +160,22 @@ fn main() -> Result<()> {
             verify,
             json,
             timeout,
+            entry_kind,
+            design_doc,
+            seed_review,
+            seed_review_inline_file,
         } => {
+            let parsed_entry_kind = match entry_kind.as_str() {
+                "doc_review" => codeloop_core::prompt::EntryKind::DocReview,
+                "implement" => codeloop_core::prompt::EntryKind::Implement,
+                "review_seed" => codeloop_core::prompt::EntryKind::ReviewSeed,
+                other => {
+                    eprintln!(
+                        "[fatal] --entry-kind 取值非法：{other}（仅支持 doc_review / implement / review_seed）"
+                    );
+                    std::process::exit(modules::codeloop::smoke::EXIT_PREFLIGHT);
+                }
+            };
             let args = modules::codeloop::smoke::SmokeArgs {
                 repo,
                 target,
@@ -163,6 +191,10 @@ fn main() -> Result<()> {
                 verify,
                 json,
                 timeout: timeout.into(),
+                entry_kind: parsed_entry_kind,
+                design_doc,
+                seed_review,
+                seed_review_inline_file,
             };
             std::process::exit(modules::codeloop::smoke::run(args));
         }

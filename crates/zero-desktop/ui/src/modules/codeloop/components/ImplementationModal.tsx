@@ -26,6 +26,10 @@ export function ImplementationModal({ source, onStart, onClose }: Props) {
       codex: { session_id: source.codex_session },
       target_path: targetPath.trim(),
       mode: 'implementation',
+      // 多入口设计 §7：Design PASS → 开始实现 显式入口化为 Implement；
+      // 沿用上段 target_path（即把上段设计文档原样作为新 Implement loop 的 target_path）。
+      // 不写 design_doc_path（避免与 target_path 重复承担规格定位）。
+      entry_kind: 'implement',
       max_rounds: maxRounds,
       wait_for_claude_idle: waitIdle,
       step_confirm: stepConfirm,

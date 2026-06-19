@@ -62,6 +62,14 @@ export interface StatusSnapshot {
 
 export type ReviewMode = 'design' | 'implementation'
 
+/**
+ * 入口种类（codeloop 多入口设计 §3）：
+ * - doc_review：从文档复核开始（现有默认）。mode 必为 design。
+ * - implement：从实现开始（文档已定稿，进入实现 + 复核环）。mode 必为 implementation。
+ * - review_seed：从既有 review 产物开始，跳过 Codex 首轮。mode=design / implementation 二选一。
+ */
+export type EntryKind = 'doc_review' | 'implement' | 'review_seed'
+
 export interface StartInput {
   claude: { session_id: string; cwd?: string }
   codex: { session_id: string; cwd?: string }
@@ -78,6 +86,14 @@ export interface StartInput {
   parent_loop_id?: number
   /** 首轮预热：哪些端已在外部（预览台）发过首轮说明块，循环首轮即跳过其 STANDING_BLOCK。 */
   established?: { codex?: boolean; claude?: boolean }
+  /** 入口种类（缺省按 mode 推断，兼容旧客户端）。详见多入口设计 §3。 */
+  entry_kind?: EntryKind | null
+  /** 仅 review_seed + mode=implementation 允许：可选规格依据文档（相对/绝对路径，需在 target_path 仓内）。 */
+  design_doc_path?: string | null
+  /** review_seed 的 seed 路径（与 seed_review_inline 二选一）。 */
+  seed_review_path?: string | null
+  /** review_seed 的 seed 直接文本（与 seed_review_path 二选一）。 */
+  seed_review_inline?: string | null
 }
 
 // ── 复核循环记录（持久化）──────────────────────────────────────────────────
@@ -107,6 +123,14 @@ export interface LoopRow {
   error?: string | null
   /** 承接来源记录 id（design→implementation 血缘）。 */
   parent_loop_id?: number | null
+  /** 入口种类（NULL=旧数据，读侧按 mode 推断；新数据必填）。 */
+  entry_kind?: EntryKind | null
+  /** ReviewSeed(mode=implementation) 可选的规格依据文档路径。 */
+  design_doc_path?: string | null
+  /** ReviewSeed 的 seed 文件路径（与 inline 二选一）。 */
+  seed_review_path?: string | null
+  /** ReviewSeed inline seed 的 sm3 短哈希（持久化记录用，便于排错/去重）。 */
+  seed_review_inline_hash?: string | null
 }
 
 /** 一条自检结果（与后端 CheckRow 对齐）。 */
@@ -125,7 +149,7 @@ export interface LoopMessageRow {
   loop_id: number
   ts: string
   round: number
-  kind: 'codex_review' | 'claude_revise' | 'system'
+  kind: 'codex_review' | 'codex_review_seed' | 'claude_revise' | 'system'
   verdict?: string | null
   content: string
 }

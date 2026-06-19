@@ -1,11 +1,13 @@
 import { Eye, MessageSquare, Play, Square, Stethoscope } from 'lucide-react'
-import type { Progress, ReviewMode } from '../api/tauri-client'
+import type { EntryKind, Progress, ReviewMode } from '../api/tauri-client'
 
 interface Props {
   targetPath: string
   setTargetPath: (v: string) => void
+  /** 入口种类：决定 target_path 控件的 label 文案（多入口设计 §7）。 */
+  entryKind: EntryKind
+  /** ReviewSeed 时的二级 mode 子选；DocReview/Implement 时只读、由入口决定。 */
   mode: ReviewMode
-  setMode: (v: ReviewMode) => void
   maxRounds: number
   setMaxRounds: (v: number) => void
   waitIdle: boolean
@@ -71,36 +73,37 @@ function statusText(running: boolean, p: Progress | null): { text: string; cls: 
   return { text: '空闲', cls: 'text-gray-400' }
 }
 
+/** target_path 控件的 label 文案随入口 + mode 变化（§7 角色矩阵）。 */
+function targetPathLabel(entryKind: EntryKind, mode: ReviewMode): string {
+  switch (entryKind) {
+    case 'doc_review':
+      return '待复核 / 修订文档（仓库内路径）'
+    case 'implement':
+      return '设计/规格文档（仓库内路径）'
+    case 'review_seed':
+      return mode === 'implementation'
+        ? '待修订代码根（仓库内路径）'
+        : '待修订文档（仓库内路径）'
+  }
+}
+
 export function LoopStatusBar(props: Props) {
-  const { running, canStart, onStart, onStop, progress: p } = props
+  const { running, canStart, onStart, onStop, progress: p, entryKind, mode } = props
   const st = statusText(running, p)
 
   return (
     <div className="flex flex-col gap-2 rounded-md border border-gray-200 bg-gray-50 p-3 dark:border-gray-800 dark:bg-gray-900">
       <div className="flex flex-wrap items-end gap-3">
         <div className="flex flex-1 flex-col gap-1" style={{ minWidth: 220 }}>
-          <label className="text-xs text-gray-500 dark:text-gray-400">复核目标（仓库内文件/目录路径）</label>
+          <label className="text-xs text-gray-500 dark:text-gray-400">{targetPathLabel(entryKind, mode)}</label>
           <input
             type="text"
             value={props.targetPath}
             onChange={e => props.setTargetPath(e.target.value)}
             disabled={running}
-            placeholder="docs/foo.md"
+            placeholder={entryKind === 'review_seed' && mode === 'implementation' ? 'src/' : 'docs/foo.md'}
             className="rounded-md border border-gray-300 bg-white px-2 py-1.5 text-sm outline-none focus:border-blue-400 disabled:opacity-60 dark:border-gray-600 dark:bg-gray-800 dark:text-gray-100"
           />
-        </div>
-
-        <div className="flex flex-col gap-1">
-          <label className="text-xs text-gray-500 dark:text-gray-400">模式</label>
-          <select
-            value={props.mode}
-            onChange={e => props.setMode(e.target.value as ReviewMode)}
-            disabled={running}
-            className="rounded-md border border-gray-300 bg-white px-2 py-1.5 text-sm outline-none focus:border-blue-400 disabled:opacity-60 dark:border-gray-600 dark:bg-gray-800 dark:text-gray-100"
-          >
-            <option value="design">设计复核</option>
-            <option value="implementation">实现复核</option>
-          </select>
         </div>
 
         <div className="flex flex-col gap-1">

@@ -11,7 +11,7 @@ use std::time::Duration;
 use agent_session::store::Store;
 use agent_session::{driver, Provider, SessionRef, SessionStatus, SessionSummary};
 use anyhow::{anyhow, bail, Context, Result};
-use codeloop_core::prompt::{self, ReviewMode, TargetSpec};
+use codeloop_core::prompt::{self, EntryKind, ReviewMode, TargetSpec};
 use codeloop_core::validate;
 use serde_json::{json, Value};
 
@@ -48,6 +48,15 @@ pub struct SmokeArgs {
     pub verify: bool,
     pub json: bool,
     pub timeout: Duration,
+    // ----- 多入口（codeloop-multi-entry-design.md §6.4 第 3 点）-----
+    /// 入口类型；默认 `doc_review` 兼容旧脚本。
+    pub entry_kind: EntryKind,
+    /// 仅 `ReviewSeed(mode=implementation)`：规格依据文档路径（绝对或相对仓根）。
+    pub design_doc: Option<String>,
+    /// `ReviewSeed`：seed 文件路径。
+    pub seed_review: Option<String>,
+    /// `ReviewSeed`：从文件读 inline seed 文本（避免 shell 引号陷阱）。
+    pub seed_review_inline_file: Option<PathBuf>,
 }
 
 // ---------- 入口 ----------
@@ -183,6 +192,10 @@ async fn run_inner(
             use_worktree: false,
             parent_loop_id: None,
             resume_worktree_path: None,
+            entry_kind: EntryKind::DocReview,
+            design_doc_path: None,
+            seed_review_path: None,
+            seed_review_inline: None,
         },
     )
     .await
@@ -214,6 +227,10 @@ async fn run_inner(
             use_worktree: true,
             parent_loop_id: Some(design.loop_id),
             resume_worktree_path: None,
+            entry_kind: EntryKind::Implement,
+            design_doc_path: None,
+            seed_review_path: None,
+            seed_review_inline: None,
         },
     )
     .await
@@ -260,6 +277,10 @@ async fn run_inner(
             use_worktree: true,
             parent_loop_id: Some(impl_.loop_id),
             resume_worktree_path: Some(resume.clone()),
+            entry_kind: EntryKind::Implement,
+            design_doc_path: None,
+            seed_review_path: None,
+            seed_review_inline: None,
         },
     )
     .await
@@ -328,6 +349,14 @@ fn is_pass(r: &RunLoopResult) -> bool {
     r.status == "done" && r.final_verdict.as_deref() == Some("pass")
 }
 
+fn entry_kind_label(k: EntryKind) -> &'static str {
+    match k {
+        EntryKind::DocReview => "doc_review",
+        EntryKind::Implement => "implement",
+        EntryKind::ReviewSeed => "review_seed",
+    }
+}
+
 // ---------- preflight ----------
 
 struct Preflight {
@@ -338,6 +367,22 @@ struct Preflight {
     claude: SessionRef,
     codex: SessionRef,
     ask_answers: Option<HashMap<String, String>>,
+    // ----- 多入口（codeloop-multi-entry-design.md §6.4 第 3 点）-----
+    /// CLI 传入的入口类型（影响 preflight_done JSON 输出）。
+    entry_kind: EntryKind,
+    /// `ReviewSeed(mode=implementation)`：规格依据文档绝对路径（已 canonicalize）。
+    design_doc_path: Option<PathBuf>,
+    /// `ReviewSeed`：seed 文件路径（args 透传）。
+    seed_review_path: Option<String>,
+    /// `ReviewSeed`：inline seed 文本（运行前由 inline_file 读入）。
+    ///
+    /// 当前 smoke runner 跑固定三段（design → impl → review），尚未支持以 ReviewSeed 起点的
+    /// 自定义编排，本字段挂在 Preflight 上仅用于 `preflight_done` 事件日志（hash 已抽出）；
+    /// 待新增 `--entry-kind=review_seed` 编排实现时直接喂给 stage。
+    #[allow(dead_code)]
+    seed_review_inline: Option<String>,
+    /// inline seed 文本短哈希前缀（便于无头日志判读）。
+    seed_review_inline_hash: Option<String>,
 }
 
 async fn preflight(args: &SmokeArgs, db: Arc<db::Db>) -> Result<Preflight> {
@@ -420,6 +465,27 @@ async fn preflight(args: &SmokeArgs, db: Arc<db::Db>) -> Result<Preflight> {
     validate::validate_three_way(&claude.cwd, &codex.cwd, &args.target)
         .map_err(|e| anyhow!("三方仓库一致性校验失败：{e:#}"))?;
 
+    // 多入口（§6.4 第 3 点）：CLI seed_review_inline_file → 文本 + 短哈希；design_doc 路径
+    // 解析为仓内绝对路径（与 codeloop_start 同形校验）。
+    let seed_review_inline_text = match args.seed_review_inline_file.as_deref() {
+        Some(p) => Some(
+            std::fs::read_to_string(p)
+                .with_context(|| format!("读 --seed-review-inline-file 失败：{}", p.display()))?,
+        ),
+        None => None,
+    };
+    let seed_review_inline_hash = seed_review_inline_text
+        .as_deref()
+        .filter(|s| !s.is_empty())
+        .map(super::seed_inline_hash);
+    let design_doc_path = match args.design_doc.as_deref().filter(|s| !s.is_empty()) {
+        Some(p) => Some(
+            super::resolve_design_doc(&repo_root, p)
+                .map_err(|e| anyhow!("--design-doc 校验失败：{e}"))?,
+        ),
+        None => None,
+    };
+
     Ok(Preflight {
         store,
         db,
@@ -428,6 +494,11 @@ async fn preflight(args: &SmokeArgs, db: Arc<db::Db>) -> Result<Preflight> {
         claude,
         codex,
         ask_answers,
+        entry_kind: args.entry_kind,
+        design_doc_path,
+        seed_review_path: args.seed_review.clone(),
+        seed_review_inline: seed_review_inline_text,
+        seed_review_inline_hash,
     })
 }
 
@@ -588,6 +659,14 @@ struct StageInput {
     use_worktree: bool,
     parent_loop_id: Option<i64>,
     resume_worktree_path: Option<String>,
+    /// 多入口：当前阶段对应的 entry_kind。
+    entry_kind: EntryKind,
+    /// `ReviewSeed(mode=implementation)`：规格依据文档绝对路径（已 canonicalize）。
+    design_doc_path: Option<PathBuf>,
+    /// `ReviewSeed`：seed 文件路径。
+    seed_review_path: Option<String>,
+    /// `ReviewSeed`：inline seed 文本（运行前已从 inline_file 读出）。
+    seed_review_inline: Option<String>,
 }
 
 async fn run_stage(
@@ -634,6 +713,10 @@ async fn run_stage(
         parent_loop_id: s.parent_loop_id,
         resume_worktree_path: s.resume_worktree_path,
         established: Established::default(),
+        entry_kind: s.entry_kind,
+        design_doc_path: s.design_doc_path.clone(),
+        seed_review_path: s.seed_review_path.clone(),
+        seed_review_inline: s.seed_review_inline.clone(),
     };
     run_codeloop(deps, input).await
 }
@@ -696,6 +779,10 @@ impl Output {
                 "event": "preflight_done",
                 "repo": pf.repo_root.display().to_string(),
                 "target": &args.target,
+                "entry_kind": entry_kind_label(pf.entry_kind),
+                "design_doc_path": pf.design_doc_path.as_ref().map(|p| p.display().to_string()),
+                "seed_review_path": pf.seed_review_path.clone(),
+                "seed_review_inline_hash": pf.seed_review_inline_hash.clone(),
             }));
             self.emit_json(json!({
                 "event": "sessions_resolved",
@@ -704,9 +791,10 @@ impl Output {
             }));
         }
         self.emit_plain(&format!(
-            "[preflight] repo={} target={}",
+            "[preflight] repo={} target={} entry_kind={}",
             pf.repo_root.display(),
-            args.target
+            args.target,
+            entry_kind_label(pf.entry_kind),
         ));
         self.emit_plain(&format!(
             "[sessions] claude={} codex={}",
