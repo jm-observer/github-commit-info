@@ -1,8 +1,8 @@
 {
   "$schema": "../gen/schemas/desktop-schema.json",
   "identifier": "default",
-  "description": "main 窗口的默认权限。",
-  "windows": ["main"],
+  "description": "main 窗口 + 截图叠加窗的默认权限。",
+  "windows": ["main", "screenshot-overlay"],
   "permissions": [
     "core:default",
     "core:window:default",
@@ -44,6 +44,7 @@
     "shell:default",
     "clipboard-manager:default",
     "notification:default",
-    "core:tray:default"
+    "core:tray:default",
+    "global-shortcut:default"
   ]
 }

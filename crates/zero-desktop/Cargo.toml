@@ -15,6 +15,10 @@ tauri-plugin-dialog = "2"
 tauri-plugin-shell = "2"
 tauri-plugin-clipboard-manager = "2"
 tauri-plugin-notification = "2"
+# screenshot 模块：全局热键唤起截图
+tauri-plugin-global-shortcut = "2"
+# screenshot 模块：把抓屏 BGRA 像素编码成 PNG（轻量，不引整套 image）
+png = "0.17"
 serde = { workspace = true }
 serde_json = { workspace = true }
 # codeloop 模块：采集层 agent-session + 协议层 codeloop-core（与 toolkit-server 共享）
@@ -63,6 +67,10 @@ windows-sys = { version = "0.59", features = [
     "Win32_UI_Input_KeyboardAndMouse",
     "Win32_System_Diagnostics_Debug",
     "Win32_System_Threading",
+    # screenshot 模块：GDI 抓屏 + 显示器定位（BitBlt/GetDIBits/MonitorFromPoint…）
+    "Win32_Graphics_Gdi",
+    # screenshot 模块：高 DPI 感知（P2 缩放打磨用，先纳入）
+    "Win32_UI_HiDpi",
 ] }
 wasapi = "0.23"
 

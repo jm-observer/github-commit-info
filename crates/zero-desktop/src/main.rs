@@ -192,6 +192,7 @@ fn run_gui(workspace: PathBuf) -> Result<()> {
         .plugin(tauri_plugin_shell::init())
         .plugin(tauri_plugin_clipboard_manager::init())
         .plugin(tauri_plugin_notification::init())
+        .plugin(tauri_plugin_global_shortcut::Builder::new().build())
         .manage(state.clone())
         .on_window_event(|window, event| {
             // 窗口重新聚焦时失效活动端点探测缓存：用户可能刚切换了网络（回家/外出），
@@ -310,6 +311,16 @@ fn run_gui(workspace: PathBuf) -> Result<()> {
             modules::music::music_set_shuffle,
             modules::music::music_set_output_mode,
             modules::music::music_get_state,
+            // screenshot 模块（全局热键截图 → 框选标注 → 剪贴板 + 落盘）
+            modules::screenshot::screenshot_capture,
+            modules::screenshot::screenshot_commit,
+            modules::screenshot::screenshot_cancel,
+            modules::screenshot::screenshot_get_settings,
+            modules::screenshot::screenshot_save_settings,
+            modules::screenshot::screenshot_list_history,
+            modules::screenshot::screenshot_open_folder,
+            modules::screenshot::screenshot_delete,
+            modules::screenshot::screenshot_copy_to_clipboard,
         ])
         .setup(move |app| {
             modules::english::setup(app.handle(), state.english.clone())
@@ -319,6 +330,7 @@ fn run_gui(workspace: PathBuf) -> Result<()> {
             modules::net_policy::setup(app.handle(), state.net_policy.clone())
                 .context("net_policy::setup")?;
             modules::music::setup(app.handle(), state.music.clone()).context("music::setup")?;
+            modules::screenshot::setup(app.handle()).context("screenshot::setup")?;
             Ok(())
         })
         .run(tauri::generate_context!())
