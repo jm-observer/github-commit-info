@@ -12,7 +12,6 @@ members = [
     "crates/toolkit-tasks",
     "crates/toolkit-llm",
     "crates/toolkit-server",
-    "crates/toolkit-desktop",
     "crates/zero-desktop",
     "crates/orchestrator",
 ]

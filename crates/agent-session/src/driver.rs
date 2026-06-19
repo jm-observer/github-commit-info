@@ -290,6 +290,13 @@ async fn run_capture(program: &str, argv: &[String], cwd: Option<&Path>) -> Resu
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .kill_on_drop(true);
+    // Windows：npm 垫片被解析成直接跑 node.exe（控制台子系统程序），GUI 父进程拉起它时
+    // Windows 会新分配一个黑色控制台窗口。加 CREATE_NO_WINDOW 抑制（不影响 stdout 管道重定向）。
+    #[cfg(windows)]
+    {
+        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+        cmd.creation_flags(CREATE_NO_WINDOW);
+    }
     if let Some(dir) = cwd {
         cmd.current_dir(dir);
     }

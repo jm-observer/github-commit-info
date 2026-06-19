@@ -10,13 +10,15 @@ default_to_workspace = false
 
 # ── zero-desktop ──────────────────────────────────────────────────────────────
 
-[tasks.zero-desktop-ui-install]
+[tasks.install]
 description = "安装 zero-desktop 前端依赖（依赖变更时跑一次即可；cargo tauri build 的 beforeBuildCommand 需要 node_modules）"
 cwd = "crates/zero-desktop/ui"
-command = "npm"
-args = ["install"]
+# Windows 上 npm 是 npm.cmd（非 .exe），cargo-make 的进程调用不会自动补 .cmd 后缀，
+# 直接 command="npm" 会报 program not found；走 @shell 由 shell 解析即可。
+script_runner = "@shell"
+script = "npm install"
 
-[tasks.release]
+[tasks.build]
 description = "release 编译 zero-desktop（cargo tauri build：前端构建 + Rust release + 安装包）"
 cwd = "crates/zero-desktop"
 command = "cargo"
@@ -26,3 +28,7 @@ args = ["tauri", "build"]
 cwd = "crates/zero-desktop"
 command = "cargo"
 args = ["tauri", "dev"]
+[tasks.dev-no]
+cwd = "crates/zero-desktop"
+command = "cargo"
+args = ["tauri", "dev", "--no-watch"]

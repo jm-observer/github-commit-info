@@ -17,7 +17,7 @@ engine, HTTP API, desktop cookie harvester) plus a few standalone CLI tools, dep
 | `toolkit-core` | Domain types, SQLite schema + migrations, URL classification. |
 | `toolkit-tasks` | Generic long-task engine: `TaskKind` registry, submit→spawn→state machine, SQLite persistence. |
 | `toolkit-server` | axum daemon assembling core/tasks + business modules; HTTP API + web console; systemd install/self-update. |
-| `toolkit-desktop` | Tauri desktop app: Douyin/THS login window, msToken harvest, auto-upload cookies to G10. |
+| `zero-desktop` | Unified Tauri desktop shell: cookie capture (Douyin/THS), speech, English, codeloop, G10 deploy. |
 | `douyin` | Douyin web tools: a-bogus signing, creator/works/tags API, download + ASR pipeline, knowledge md. |
 | `rag` | Semantic search over Douyin knowledge md → sqlite-vec (CLI `ingest`/`search`, HTTP `serve`). |
 | `github-commit-info` | Standalone CLI tool: fetch GitHub repo commits within a time range (see below). |
@@ -27,7 +27,7 @@ engine, HTTP API, desktop cookie harvester) plus a few standalone CLI tools, dep
 
 ```bash
 cargo check --workspace
-cargo test  --workspace        # toolkit-desktop needs Tauri toolchain; exclude on CI-like envs
+cargo test  --workspace        # zero-desktop needs Tauri toolchain; exclude on CI-like envs
 cargo run -p toolkit-server -- serve --workspace ./data --bind 127.0.0.1:8788
 ```
 

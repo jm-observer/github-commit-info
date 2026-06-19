@@ -143,6 +143,46 @@ fn normalized_abs(raw: &Path) -> PathBuf {
     }
 }
 
+/// 解析 repo root 对应的 git **common dir**（绝对、canonicalize 后），用于判定两个工作树
+/// 是否同属一个仓库。
+///
+/// - 普通仓：`<root>/.git` 是目录，common dir 即它本身（除非其下有 `commondir` 文件）。
+/// - linked worktree：`<root>/.git` 是文件，内容 `gitdir: <main>/.git/worktrees/<name>`；
+///   该 gitdir 下的 `commondir` 文件指回主仓 `.git`。
+///
+/// 纯文件系统解析，不起 git 进程（与 `find_repo_root` 一致）。任一步失败返回 `None`。
+pub fn git_common_dir(repo_root: &Path) -> Option<PathBuf> {
+    let dot_git = repo_root.join(".git");
+    let meta = std::fs::metadata(&dot_git).ok()?;
+    let git_dir = if meta.is_dir() {
+        dot_git
+    } else {
+        // `.git` 文件：`gitdir: <path>`（可为相对 repo_root 的路径）。
+        let content = std::fs::read_to_string(&dot_git).ok()?;
+        let rest = content.lines().find_map(|l| l.strip_prefix("gitdir:"))?;
+        let p = Path::new(rest.trim());
+        if p.is_absolute() {
+            p.to_path_buf()
+        } else {
+            repo_root.join(p)
+        }
+    };
+    // git_dir 下若有 `commondir`（worktree 情形），据它回溯到主仓 git dir；否则 git_dir 即 common。
+    let common = match std::fs::read_to_string(git_dir.join("commondir")) {
+        Ok(rel) => git_dir.join(rel.trim()),
+        Err(_) => git_dir,
+    };
+    Some(canon(&normalize_lexical(&common)))
+}
+
+/// 两个工作树是否同属一个 git 仓库（common dir 相等）。任一侧解析失败 → `false`（fail-closed）。
+pub fn same_repo(a: &Path, b: &Path) -> bool {
+    match (git_common_dir(a), git_common_dir(b)) {
+        (Some(x), Some(y)) => x == y,
+        _ => false,
+    }
+}
+
 /// 去掉 Windows `\\?\` 扩展长度前缀，得到适合显示 / 传给子进程 `--cd` 的常规路径。
 /// 非 Windows / 无前缀时原样返回。
 pub fn display_path(p: &Path) -> PathBuf {
@@ -244,6 +284,50 @@ mod tests {
         let err =
             validate_three_way(tmp.path(), tmp.path(), &outside.to_string_lossy()).unwrap_err();
         assert!(format!("{err}").contains("repo root"));
+    }
+
+    /// 在 `main/.git/worktrees/<name>` 下造 commondir，并返回一个独立的 worktree 目录，
+    /// 其 `.git` 文件 `gitdir:` 指向该 worktree git dir。
+    fn make_linked_worktree(main_root: &Path, name: &str) -> tempfile::TempDir {
+        let wt_git = main_root.join(".git").join("worktrees").join(name);
+        fs::create_dir_all(&wt_git).unwrap();
+        // commondir 指回主仓 .git（git 的标准布局：worktrees/<name> 的上两级即 .git）。
+        fs::write(wt_git.join("commondir"), "../..\n").unwrap();
+        let wt = tempfile::tempdir().unwrap();
+        fs::write(
+            wt.path().join(".git"),
+            format!("gitdir: {}\n", wt_git.display()),
+        )
+        .unwrap();
+        wt
+    }
+
+    #[test]
+    fn same_repo_true_for_self() {
+        let tmp = make_repo();
+        assert!(same_repo(tmp.path(), tmp.path()));
+    }
+
+    #[test]
+    fn same_repo_true_for_linked_worktree() {
+        let main = make_repo();
+        let wt = make_linked_worktree(main.path(), "wt1");
+        assert!(same_repo(main.path(), wt.path()));
+        assert!(same_repo(wt.path(), main.path()));
+    }
+
+    #[test]
+    fn same_repo_false_for_different_repos() {
+        let a = make_repo();
+        let b = make_repo();
+        assert!(!same_repo(a.path(), b.path()));
+    }
+
+    #[test]
+    fn same_repo_false_when_no_git() {
+        let tmp = tempfile::tempdir().unwrap();
+        let repo = make_repo();
+        assert!(!same_repo(repo.path(), tmp.path()));
     }
 
     #[test]

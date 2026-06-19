@@ -57,6 +57,16 @@ const KEY_VOLUME = 'volume'
 const KEY_REPEAT = 'repeat'
 const KEY_SHUFFLE = 'shuffle'
 const KEY_OUTPUT_MODE = 'output_mode'
+// 上次播放会话：队列（路径数组）+ 起始下标 + 当前曲目元信息。
+// 启动时后端引擎是空的（无「只加载不播放」命令），靠这两项回填底栏，
+// 让播放键冷启动即可点 → 点一下从该曲开头续播。
+const KEY_LAST_QUEUE = 'last_queue'
+const KEY_LAST_TRACK = 'last_track'
+
+interface LastQueue {
+  queue: string[]
+  index: number
+}
 
 interface PlayerContextValue {
   // 状态（事件驱动 + 首屏拉取）
@@ -78,6 +88,10 @@ interface PlayerContextValue {
   // 输出模式（auto=独占 bit-perfect / shared=共享兼容），持久化 + 同步后端
   outputMode: OutputMode
   setOutputMode: (mode: OutputMode) => void
+
+  // 待恢复的上次会话：非 null 表示底栏显示的是回填曲目（尚未真正播放），
+  // 此时点播放键应 play(queue, index) 续播，而非 toggle()。
+  pendingResume: LastQueue | null
 
   // 控制（全 invoke）
   play: (paths: string[], start: number) => Promise<void>
@@ -114,19 +128,25 @@ export function MusicPlayerProvider({ children }: { children: ReactNode }) {
   const [error, setError] = useState<string | null>(null)
   const [folder, setFolderState] = useState<string | null>(null)
   const [outputMode, setOutputModeState] = useState<OutputMode>('auto')
+  const [pendingResume, setPendingResume] = useState<LastQueue | null>(null)
 
   const storeRef = useRef<Store | null>(null)
+  // 与 applyState（[] 依赖、闭包固定）共享的待恢复标志，避免周期兜底拉取
+  // 用后端空快照覆盖掉回填的曲目展示。
+  const resumingRef = useRef(false)
 
   // 应用后端权威快照到本地 state。
   const applyState = useCallback((s: PlaybackState) => {
     setStatus(s.status)
+    setVolumeState(s.volume)
+    setRepeatState(s.repeat)
+    setShuffleState(s.shuffle)
+    // 待恢复态下，后端是空快照（stopped/null）；保留回填的曲目，等用户点播放再续播。
+    if (resumingRef.current && s.track === null && s.status === 'stopped') return
     setIndex(s.index)
     setTrack(s.track)
     setPositionSecs(s.position_secs)
     setDurationSecs(s.duration_secs)
-    setVolumeState(s.volume)
-    setRepeatState(s.repeat)
-    setShuffleState(s.shuffle)
   }, [])
 
   // ── 持久化加载 + 事件订阅 + 首屏拉取 ───────────────────────────────────────
@@ -195,11 +215,39 @@ export function MusicPlayerProvider({ children }: { children: ReactNode }) {
       }
 
       // 3) 首屏拉初值（自愈启动竞态）
+      let backendHasTrack = false
       try {
         const s = await musicGetState()
         if (mounted) applyState(s)
+        backendHasTrack = s.track !== null
       } catch {
         /* 后端尚未就绪则忽略，后续事件会补 */
+      }
+
+      // 4) 后端冷启动无曲目时，回填上次会话 → 底栏可见曲目、播放键可点。
+      //    点播放键时（见 MiniPlayer）走 play(queue,index) 从该曲开头续播。
+      if (mounted && !backendHasTrack) {
+        try {
+          const store = storeRef.current
+          const lastQueue = await store?.get<LastQueue>(KEY_LAST_QUEUE)
+          const lastTrack = await store?.get<Track>(KEY_LAST_TRACK)
+          if (
+            mounted &&
+            lastQueue &&
+            Array.isArray(lastQueue.queue) &&
+            lastQueue.queue.length > 0 &&
+            lastTrack
+          ) {
+            resumingRef.current = true
+            setPendingResume(lastQueue)
+            setTrack(lastTrack)
+            setIndex(lastQueue.index)
+            setPositionSecs(0)
+            setDurationSecs(lastTrack.duration_secs ?? 0)
+          }
+        } catch (e) {
+          console.error('[MusicPlayer] 上次会话恢复失败:', e)
+        }
       }
     }
 
@@ -232,6 +280,11 @@ export function MusicPlayerProvider({ children }: { children: ReactNode }) {
     }
   }, [])
 
+  // 当前曲目变化时持久化元信息（供下次启动回填底栏）。
+  useEffect(() => {
+    if (track) void persist(KEY_LAST_TRACK, track)
+  }, [track, persist])
+
   // ── 已选目录 ───────────────────────────────────────────────────────────────
   const setFolder = useCallback(
     (dir: string | null) => {
@@ -254,7 +307,16 @@ export function MusicPlayerProvider({ children }: { children: ReactNode }) {
   )
 
   // ── 控制方法（全 invoke，乐观更新本地控件态再以后端事件为准） ───────────────
-  const play = useCallback((paths: string[], start: number) => musicPlayQueue(paths, start), [])
+  const play = useCallback(
+    (paths: string[], start: number) => {
+      // 真正开播：清掉待恢复态，持久化队列供下次启动回填。
+      resumingRef.current = false
+      setPendingResume(null)
+      void persist(KEY_LAST_QUEUE, { queue: paths, index: start } as LastQueue)
+      return musicPlayQueue(paths, start)
+    },
+    [persist],
+  )
   const pause = useCallback(() => musicPause(), [])
   const resume = useCallback(() => musicResume(), [])
   const toggle = useCallback(() => musicToggle(), [])
@@ -309,6 +371,7 @@ export function MusicPlayerProvider({ children }: { children: ReactNode }) {
       setFolder,
       outputMode,
       setOutputMode,
+      pendingResume,
       play,
       pause,
       resume,
@@ -336,6 +399,7 @@ export function MusicPlayerProvider({ children }: { children: ReactNode }) {
       setFolder,
       outputMode,
       setOutputMode,
+      pendingResume,
       play,
       pause,
       resume,

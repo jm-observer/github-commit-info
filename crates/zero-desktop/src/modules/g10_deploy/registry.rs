@@ -189,11 +189,23 @@ pub fn builtin() -> Vec<ServiceDef> {
             remote_service: Some("zero.service".into()),
             // 控制台挂在 gateway server（随 ZERO_BIND 绑 0.0.0.0:9001）的 /console 前缀。
             web_url: "http://192.168.0.68:9001/console".into(),
-            env: vec![EnvVar {
-                key: "ZERO_BIND".into(),
-                value: "0.0.0.0:9001".into(),
-                note: bind_note(),
-            }],
+            env: vec![
+                EnvVar {
+                    key: "ZERO_BIND".into(),
+                    value: "0.0.0.0:9001".into(),
+                    note: bind_note(),
+                },
+                EnvVar {
+                    key: "ALARM_SERVER_URL".into(),
+                    value: "http://127.0.0.1:8080".into(),
+                    note: "alarm-server 基址（agent 调 alarm-cli 设闹钟用；未设则回退 alarm-cli 默认）".into(),
+                },
+                EnvVar {
+                    key: "TRACE_HUB_ENDPOINT".into(),
+                    value: "http://127.0.0.1:9100/v1/spans".into(),
+                    note: "trace-hub 宿主端点（未设则零追踪）".into(),
+                },
+            ],
             deploy: Some(DeployDef {
                 script: "deploy-g10.ps1".into(),
                 args: vec!["-Service".into(), "zero.service".into()],

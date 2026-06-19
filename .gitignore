@@ -6,4 +6,5 @@ dist/
 .cargo-cache-aarch64
 target-aarch64
 /data/
-crates/toolkit-desktop/gen/
+crates/zero-desktop/gen/
+target-smoke

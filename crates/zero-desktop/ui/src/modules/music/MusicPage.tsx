@@ -173,9 +173,9 @@ export default function MusicPage() {
   }
 
   return (
-    <div className="flex flex-col gap-4">
+    <div className="flex h-full min-h-0 flex-col gap-4">
       {/* 顶部：标题 + 文件夹 + 选择/重扫 + 格式徽标 */}
-      <div className="flex flex-col gap-3">
+      <div className="flex flex-shrink-0 flex-col gap-3">
         <div className="flex items-center justify-between gap-3">
           <h1 className="text-xl font-semibold">音乐</h1>
           <FormatBadge />
@@ -230,7 +230,7 @@ export default function MusicPage() {
       </div>
 
       {/* 搜索 */}
-      <div className="relative max-w-sm">
+      <div className="relative max-w-sm flex-shrink-0">
         <Search size={15} className="absolute left-3 top-1/2 -translate-y-1/2 text-gray-400" />
         <input
           value={query}
@@ -241,14 +241,14 @@ export default function MusicPage() {
       </div>
 
       {error && (
-        <div className="flex items-start gap-2 rounded-md bg-red-50 px-3 py-2 text-xs text-red-600 dark:bg-red-900/20 dark:text-red-400">
+        <div className="flex flex-shrink-0 items-start gap-2 rounded-md bg-red-50 px-3 py-2 text-xs text-red-600 dark:bg-red-900/20 dark:text-red-400">
           <XCircle size={13} className="mt-0.5 flex-shrink-0" />
           <span>{error}</span>
         </div>
       )}
 
-      {/* 曲库列表 */}
-      <section className="overflow-hidden rounded-md border border-gray-200 dark:border-gray-700">
+      {/* 曲库列表（独立滚动区，顶部控制 / 底部统计常驻不动） */}
+      <section className="min-h-0 flex-1 overflow-auto rounded-md border border-gray-200 dark:border-gray-700">
         {filtered.length === 0 ? (
           <div className="flex flex-col items-center gap-2 px-4 py-12 text-sm text-gray-400">
             <Music size={28} className="opacity-50" />
@@ -319,7 +319,7 @@ export default function MusicPage() {
         )}
       </section>
 
-      <p className="text-xs text-gray-400">
+      <p className="flex-shrink-0 text-xs text-gray-400">
         共 {filtered.length} 首{query && tracks.length !== filtered.length ? `（已过滤，全部 ${tracks.length} 首）` : ''}。
         点击封面或双击行播放；播放、解码、输出全部在后端原生引擎完成（非浏览器音频）。
       </p>
