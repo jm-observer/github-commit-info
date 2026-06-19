@@ -114,15 +114,23 @@ export default function G10DeployPage() {
   }, [loadAll])
 
   // ── 订阅部署事件 ──────────────────────────────────────────────────────────
+  // 注：StrictMode 下 effect 会跑两遍，cleanup 必须 await Promise 才能拿到 unlisten；
+  // 否则第一次订阅会泄漏，导致每条日志触发两次（"Compiling X" 出现两遍即此原因）。
   useEffect(() => {
-    let unlistenLog: (() => void) | null = null
-    let unlistenDone: (() => void) | null = null
+    let cancelled = false
+    const unlistens: Array<() => void> = []
+    const track = (p: Promise<() => void>) => {
+      p.then(fn => {
+        if (cancelled) fn()
+        else unlistens.push(fn)
+      })
+    }
 
-    onDeployLog(log => {
+    track(onDeployLog(log => {
       setLogsByName(prev => ({ ...prev, [log.name]: [...(prev[log.name] ?? []), log] }))
-    }).then(fn => { unlistenLog = fn })
+    }))
 
-    onDeployDone(done => {
+    track(onDeployDone(done => {
       setDeployingNames(prev => {
         const next = new Set(prev)
         next.delete(done.name)
@@ -136,11 +144,11 @@ export default function G10DeployPage() {
       }))
       // 部署完成后刷新该服务的连通性/版本
       void refreshOne(done.name)
-    }).then(fn => { unlistenDone = fn })
+    }))
 
     return () => {
-      unlistenLog?.()
-      unlistenDone?.()
+      cancelled = true
+      unlistens.forEach(fn => fn())
     }
   }, [refreshOne])
 

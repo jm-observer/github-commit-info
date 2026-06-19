@@ -12,17 +12,21 @@ import EnvConfigService from '../services/EnvConfigService'
 import HtmlAudioAdapter from '../adapters/HtmlAudioAdapter'
 import type { Sentence } from '../types'
 import { Button } from '../../speech/components/ui/Button'
+import { readAutoStartPref } from '../autoStartPref'
 
 interface AnnotationPlayerProps {
   autoStart?: boolean
   dataSource?: 'annotated' | 'all'
 }
 
-// 跨 React Strict Mode 挂载周期的全局初始化状态
+// 跨路由切换 / Strict Mode 挂载的全局会话状态。
+// AudioPlayerService 是真单例(其内 HtmlAudioAdapter 持有 `new Audio()`,脱离 React DOM,
+// 不随 mount 销毁),所以切菜单回来时不应再 reset/重建——只要 dataSource 没变就直接复用,
+// 列表 fetch / 音频缓存 / 自动播放都跳过,播放从离开时的位置继续。
 const componentInstanceState = {
-  lastDataSource: null as string | null,
-  lastInitTime: 0,
-  isInitializing: false
+  initializedDataSource: null as string | null,
+  isInitializing: false,
+  sentences: [] as Sentence[],
 }
 
 export default function AnnotationPlayer({ autoStart = true, dataSource = 'annotated' }: AnnotationPlayerProps) {
@@ -34,50 +38,48 @@ export default function AnnotationPlayer({ autoStart = true, dataSource = 'annot
   const initStartedRef = useRef(false)
   const autoPlayStartedRef = useRef(false)
   const backgroundDownloadCancelRef = useRef(false)
-  const cleanupExecutedRef = useRef(false)
 
   useEffect(() => {
-    const now = Date.now()
+    // 同 dataSource 已经初始化过 → 切菜单回来,直接挂回单例 UI,不停播放、不重拉列表。
+    if (
+      componentInstanceState.initializedDataSource === dataSource &&
+      componentInstanceState.sentences.length > 0
+    ) {
+      setSentences(componentInstanceState.sentences)
+      setInitialized(true)
+      setLoading(false)
+      setError(null)
+      return  // 注意:不返回 cleanup,unmount 时不停播放。
+    }
 
-    if (componentInstanceState.lastDataSource === dataSource && componentInstanceState.isInitializing) return
-    if (componentInstanceState.lastDataSource === dataSource && now - componentInstanceState.lastInitTime < 500) return
+    // 任意 dataSource 正在初始化中 → 直接等(防 Strict Mode 双 mount 触发两次 init,
+    // 否则会建出两个 HtmlAudioAdapter 同时播 → "两个声音" 的根因)。这里**不**要求
+    // initializedDataSource === dataSource,因为首次 mount 时 init 还没完成,
+    // initializedDataSource 还是 null,加 dataSource 比较守卫就失效了。
+    if (componentInstanceState.isInitializing) {
+      return
+    }
 
-    componentInstanceState.isInitializing = true
-    componentInstanceState.lastDataSource = dataSource
-    componentInstanceState.lastInitTime = now
-
-    // 切换 dataSource 时先停止播放
+    // dataSource 真的变了(切 annotated <-> all)或首次 → 停旧播放,做全套初始化。
+    // 显式 stopAudio() 兜底:即便上一次 init 因故漏调 stop,这里把残留 adapter 的音也停掉。
     try { AudioPlayerService.getInstance().stopAudio() } catch { /* not yet initialized */ }
 
-    backgroundDownloadCancelRef.current = true
+    componentInstanceState.isInitializing = true
+    backgroundDownloadCancelRef.current = false
     initStartedRef.current = false
     autoPlayStartedRef.current = false
-    cleanupExecutedRef.current = false
     setInitialized(false)
     setSentences([])
     setError(null)
-    backgroundDownloadCancelRef.current = false
 
     void init().finally(() => { componentInstanceState.isInitializing = false })
 
+    // unmount cleanup:只取消后台下载,**不**停播放——单例继续在后台跑,切菜单回来无缝接续。
     return () => {
-      if (cleanupExecutedRef.current) return
-      cleanupExecutedRef.current = true
       backgroundDownloadCancelRef.current = true
-      try { AudioPlayerService.getInstance().stopAudio() } catch { /* ignore */ }
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [dataSource])
-
-  useEffect(() => {
-    cleanupExecutedRef.current = false
-    return () => {
-      if (cleanupExecutedRef.current) return
-      cleanupExecutedRef.current = true
-      try { AudioPlayerService.getInstance().stopAudio() } catch { /* ignore */ }
-      backgroundDownloadCancelRef.current = true
-    }
-  }, [])
 
   const init = async () => {
     if (initStartedRef.current) return
@@ -97,6 +99,9 @@ export default function AnnotationPlayer({ autoStart = true, dataSource = 'annot
 
       setLoading(false)
       setInitialized(true)
+      // 标记初始化完成 + 缓存列表,下次同 dataSource mount 走 fast-path 直接复用。
+      componentInstanceState.initializedDataSource = dataSource
+      componentInstanceState.sentences = sentencesList
     } catch (err: any) {
       console.error('播放器初始化失败:', err)
       setLoading(false)
@@ -188,7 +193,10 @@ export default function AnnotationPlayer({ autoStart = true, dataSource = 'annot
     const cacheManager = FileCacheManager.getInstance()
     const audioAdapter = new HtmlAudioAdapter()
 
-    // 重置单例，允许以新 envConfig 重新初始化
+    // 创建新单例前先把残留单例的 audio 显式停掉。HtmlAudioAdapter 的 <audio> 是
+    // `new Audio()` 脱离 DOM 的元素,resetInstance 只断 service 引用,旧 <audio> 还在
+    // 内存里继续响——必须主动 stop。
+    try { AudioPlayerService.getInstance().stopAudio() } catch { /* no prior instance */ }
     AudioPlayerService.resetInstance()
     const audioService = AudioPlayerService.getInstance(audioAdapter, cacheManager, envConfig)
 
@@ -196,7 +204,8 @@ export default function AnnotationPlayer({ autoStart = true, dataSource = 'annot
     audioService.setMaxPlayCount(4)
     audioService.resetPlayer()
 
-    if (autoStart && !autoPlayStartedRef.current) {
+    // prop 上的 autoStart 是默认值;用户偏好(localStorage)进一步覆盖,关掉就不自动播。
+    if (autoStart && readAutoStartPref() && !autoPlayStartedRef.current) {
       autoPlayStartedRef.current = true
       setTimeout(() => {
         try { void audioService.playCurrentAudio() }
@@ -206,10 +215,15 @@ export default function AnnotationPlayer({ autoStart = true, dataSource = 'annot
   }
 
   const handleReload = () => {
+    // 主动重试 = 用户明确要求重建,清掉 fast-path 缓存 + 停旧播放。
+    componentInstanceState.initializedDataSource = null
+    componentInstanceState.sentences = []
+    try { AudioPlayerService.getInstance().stopAudio() } catch { /* ignore */ }
     setInitialized(false)
     setSentences([])
     setError(null)
     initStartedRef.current = false
+    autoPlayStartedRef.current = false
     void init()
   }
 

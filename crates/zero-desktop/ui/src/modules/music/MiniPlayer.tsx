@@ -41,6 +41,8 @@ export default function MiniPlayer() {
     volume,
     repeat,
     shuffle,
+    pendingResume,
+    play,
     toggle,
     next,
     prev,
@@ -65,8 +67,9 @@ export default function MiniPlayer() {
 
   const coverSrc = track?.cover_path ? convertFileSrc(track.cover_path) : null
 
+  // 「内嵌 body」形态: 不带外层 h-16/border-t/bg/padding, 由 BottomPlayerBar 统一包裹。
   return (
-    <div className="flex h-16 items-center gap-3 border-t border-gray-200 bg-white px-4 dark:border-gray-800 dark:bg-gray-950">
+    <div className="flex h-full w-full items-center gap-3 px-4">
       {/* 封面 + 标题/歌手 */}
       <div className="flex w-56 min-w-0 flex-shrink-0 items-center gap-3">
         <div className="flex h-11 w-11 flex-shrink-0 items-center justify-center overflow-hidden rounded bg-gray-100 dark:bg-gray-800">
@@ -115,7 +118,11 @@ export default function MiniPlayer() {
 
           <button
             type="button"
-            onClick={() => void toggle()}
+            onClick={() =>
+              pendingResume
+                ? void play(pendingResume.queue, pendingResume.index)
+                : void toggle()
+            }
             disabled={!hasTrack}
             title={playing ? '暂停' : '播放'}
             className="flex h-9 w-9 items-center justify-center rounded-full bg-blue-500 text-white transition-colors hover:bg-blue-600 disabled:opacity-40"

@@ -78,6 +78,7 @@ export default function SpeechPage() {
   const [wantSecondary, setWantSecondary] = useState(false);
   const [notifySound, setNotifySound] = useState(true);
   const [autoPaste, setAutoPaste] = useState(false);
+  const [autoPasteRewriteRetype, setAutoPasteRewriteRetype] = useState(false);
   const [autoStart, setAutoStart] = useState(false);
   const [settingsLoaded, setSettingsLoaded] = useState(false);
   const autoStartFiredRef = useRef(false);
@@ -94,6 +95,7 @@ export default function SpeechPage() {
         setWantSecondary(!!s.want_secondary);
         setNotifySound(s.notify_sound !== false);
         setAutoPaste(!!s.auto_paste);
+        setAutoPasteRewriteRetype(!!s.auto_paste_rewrite_retype);
         setAutoStart(!!s.auto_start);
       })
       .catch((err) => console.warn('Load settings failed', err))
@@ -365,6 +367,7 @@ export default function SpeechPage() {
       want_secondary: wantSecondary,
       notify_sound: notifySound,
       auto_paste: autoPaste,
+      auto_paste_rewrite_retype: autoPasteRewriteRetype,
       auto_start: autoStart,
     };
     persistAndMaybeReconnect(next, true);
@@ -388,6 +391,7 @@ export default function SpeechPage() {
       want_secondary: wantSecondary,
       notify_sound: notifySound,
       auto_paste: autoPaste,
+      auto_paste_rewrite_retype: autoPasteRewriteRetype,
       auto_start: autoStart,
     };
     persistAndMaybeReconnect(next, urlChanged);
@@ -405,6 +409,7 @@ export default function SpeechPage() {
       want_secondary: wantSecondary,
       notify_sound: val,
       auto_paste: autoPaste,
+      auto_paste_rewrite_retype: autoPasteRewriteRetype,
       auto_start: autoStart,
     };
     SpeechAPI.applySettings(next).catch((err) =>
@@ -424,10 +429,31 @@ export default function SpeechPage() {
       want_secondary: wantSecondary,
       notify_sound: notifySound,
       auto_paste: val,
+      auto_paste_rewrite_retype: autoPasteRewriteRetype,
       auto_start: autoStart,
     };
     SpeechAPI.applySettings(next).catch((err) =>
       console.error('apply auto_paste failed', err)
+    );
+  };
+
+  const handleAutoPasteRewriteRetypeChange = (val: boolean) => {
+    if (val === autoPasteRewriteRetype) return;
+    setAutoPasteRewriteRetype(val);
+    const next: AppSettings = {
+      asr_language: asrLanguage,
+      auto_copy_mode: autoCopyMode,
+      merge_window_ms: mergeWindowMs,
+      remote_url: remoteUrl,
+      remote_url_presets: remoteUrlPresets,
+      want_secondary: wantSecondary,
+      notify_sound: notifySound,
+      auto_paste: autoPaste,
+      auto_paste_rewrite_retype: val,
+      auto_start: autoStart,
+    };
+    SpeechAPI.applySettings(next).catch((err) =>
+      console.error('apply auto_paste_rewrite_retype failed', err)
     );
   };
 
@@ -443,6 +469,7 @@ export default function SpeechPage() {
       want_secondary: wantSecondary,
       notify_sound: notifySound,
       auto_paste: autoPaste,
+      auto_paste_rewrite_retype: autoPasteRewriteRetype,
       auto_start: val,
     };
     SpeechAPI.applySettings(next).catch((err) =>
@@ -462,6 +489,7 @@ export default function SpeechPage() {
       want_secondary: val,
       notify_sound: notifySound,
       auto_paste: autoPaste,
+      auto_paste_rewrite_retype: autoPasteRewriteRetype,
       auto_start: autoStart,
     };
     persistAndMaybeReconnect(next, true);
@@ -482,6 +510,7 @@ export default function SpeechPage() {
       want_secondary: wantSecondary,
       notify_sound: notifySound,
       auto_paste: autoPaste,
+      auto_paste_rewrite_retype: autoPasteRewriteRetype,
       auto_start: autoStart,
     };
     persistAndMaybeReconnect(next, urlChanged);
@@ -554,6 +583,7 @@ export default function SpeechPage() {
               want_secondary: wantSecondary,
               notify_sound: notifySound,
               auto_paste: autoPaste,
+              auto_paste_rewrite_retype: autoPasteRewriteRetype,
               auto_start: autoStart,
             };
             SpeechAPI.applySettings(next).catch((err) => console.error('apply asr_language failed', err));
@@ -570,12 +600,15 @@ export default function SpeechPage() {
               want_secondary: wantSecondary,
               notify_sound: notifySound,
               auto_paste: autoPaste,
+              auto_paste_rewrite_retype: autoPasteRewriteRetype,
               auto_start: autoStart,
             };
             SpeechAPI.applySettings(next).catch((err) => console.error('apply auto_copy_mode failed', err));
           }}
           autoPaste={autoPaste}
           onAutoPasteChange={handleAutoPasteChange}
+          autoPasteRewriteRetype={autoPasteRewriteRetype}
+          onAutoPasteRewriteRetypeChange={handleAutoPasteRewriteRetypeChange}
           autoStart={autoStart}
           onAutoStartChange={handleAutoStartChange}
           mergeWindowMs={mergeWindowMs}
@@ -590,6 +623,7 @@ export default function SpeechPage() {
               want_secondary: wantSecondary,
               notify_sound: notifySound,
               auto_paste: autoPaste,
+              auto_paste_rewrite_retype: autoPasteRewriteRetype,
               auto_start: autoStart,
             };
             SpeechAPI.applySettings(next).catch((err) => console.error('apply merge_window_ms failed', err));

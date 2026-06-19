@@ -44,6 +44,7 @@ export interface AppSettings {
   want_secondary: boolean;
   notify_sound: boolean;
   auto_paste: boolean;
+  auto_paste_rewrite_retype: boolean;
   auto_start: boolean;
 }
 

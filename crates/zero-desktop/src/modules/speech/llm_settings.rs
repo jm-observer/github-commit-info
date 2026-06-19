@@ -37,6 +37,12 @@ pub struct LlmSettings {
     /// 仅在 `auto_copy_mode` 选了具体内容（中文优化/英文翻译）时才有意义。
     #[serde(default)]
     pub auto_paste: bool,
+    /// 自动粘贴时，若同一段（ref）的优化稿被 LLM 改写（新文本不是旧文本的前缀），
+    /// 是否按公共前缀长度发退格键回退已输入字符、再补打新尾巴。
+    /// 关闭 → 改写保守跳过，剩余文本留给剪贴板兜底。
+    /// 开启 → 输入更跟手，但若焦点已被切走会误删别处的内容，谨慎使用。
+    #[serde(default)]
+    pub auto_paste_rewrite_retype: bool,
     /// 程序启动（语音页就绪）时是否自动开始识别录音。
     #[serde(default)]
     pub auto_start: bool,
@@ -50,6 +56,7 @@ impl Default for LlmSettings {
             want_secondary: false,
             notify_sound: true,
             auto_paste: false,
+            auto_paste_rewrite_retype: false,
             auto_start: false,
         }
     }

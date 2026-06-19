@@ -27,11 +27,11 @@
     {
       "identifier": "http:allow-fetch",
       "allow": [
-        { "url": "https://www.for-memory.cloud:28080/*" },
-        { "url": "http://www.for-memory.cloud:28080/*" },
-        { "url": "http://192.168.50.8:8080/*" },
+        { "url": "http://*:8788/*" },
+        { "url": "https://*:28080/*" },
         { "url": "http://localhost:*" },
-        { "url": "http://127.0.0.1:*" }
+        { "url": "http://127.0.0.1:*" },
+        { "url": "http://192.168.50.8:8080/*" }
       ]
     },
     "store:default",

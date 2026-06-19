@@ -9,6 +9,7 @@ import ApiService from '../services/ApiService'
 import type { Sentence } from '../types'
 import { Button } from '../../speech/components/ui/Button'
 import ReplaceAudioModal from './ReplaceAudioModal'
+import { readAutoStartPref, writeAutoStartPref } from '../autoStartPref'
 
 interface AudioPlayerProps {
   showAnnotation?: boolean
@@ -36,6 +37,7 @@ export default function AudioPlayer({
   const [currentSentence, setCurrentSentence] = useState<Sentence | null>(null)
   const [actionError, setActionError] = useState<string | null>(null)
   const [replaceOpen, setReplaceOpen] = useState(false)
+  const [autoStartPref, setAutoStartPref] = useState<boolean>(readAutoStartPref)
 
   const audioService = AudioPlayerService.getInstance()
 
@@ -126,8 +128,17 @@ export default function AudioPlayer({
         </div>
       )}
 
-      {/* 状态 */}
-      <div className="text-sm text-gray-500 dark:text-gray-400">{statusText}</div>
+      {/* 状态(播放时左侧补一组频谱条做"跳动"指示,直观判断 service 状态有没有同步) */}
+      <div className="flex items-center gap-2 text-sm text-gray-500 dark:text-gray-400">
+        {isPlaying && (
+          <span className="flex items-end gap-0.5 text-amber-500 dark:text-amber-400" aria-label="正在播放">
+            <span className="eq-bar" />
+            <span className="eq-bar" />
+            <span className="eq-bar" />
+          </span>
+        )}
+        <span>{statusText}</span>
+      </div>
 
       {/* 当前句子 */}
       <div className="min-h-12 rounded-lg bg-gray-50 px-4 py-3 dark:bg-gray-800">
@@ -150,16 +161,22 @@ export default function AudioPlayer({
         </div>
       </div>
 
-      {/* 控制按钮 */}
+      {/* 控制按钮(播放时给主按钮外圈一圈 ping 涟漪,跟左上"跳动"指示对应,
+          失同步时一眼看出来) */}
       <div className="flex items-center justify-center gap-3">
         <Button variant="outline" size="sm" onClick={() => audioService.previousSentence()} title="上一句">
           <ChevronLeft size={16} />
           上一个
         </Button>
-        <Button variant="primary" size="md" onClick={() => audioService.togglePlayPause()} title={isPlaying ? '暂停' : '播放'}>
-          {isPlaying ? <Pause size={16} /> : <Play size={16} />}
-          {isPlaying ? '暂停' : '播放'}
-        </Button>
+        <span className="relative inline-flex">
+          {isPlaying && (
+            <span className="absolute inset-0 -m-1 inline-flex animate-ping rounded-md bg-blue-400 opacity-30" />
+          )}
+          <Button variant="primary" size="md" onClick={() => audioService.togglePlayPause()} title={isPlaying ? '暂停' : '播放'}>
+            {isPlaying ? <Pause size={16} /> : <Play size={16} />}
+            {isPlaying ? '暂停' : '播放'}
+          </Button>
+        </span>
         <Button variant="outline" size="sm" onClick={() => audioService.nextSentence()} title="下一句">
           下一个
           <ChevronRight size={16} />
@@ -239,6 +256,22 @@ export default function AudioPlayer({
               className="rounded"
             />
             半小时后停止
+          </label>
+
+          {/* 启动 / 首次进入页面时自动播放(写 localStorage,跨重启保留)。
+              下次软件启动 / 切换 annotated <-> all 触发的全套 init 才会读这个值。 */}
+          <label className="flex items-center gap-2 text-xs text-gray-700 dark:text-gray-300">
+            <input
+              type="checkbox"
+              checked={autoStartPref}
+              onChange={e => {
+                const v = e.target.checked
+                setAutoStartPref(v)
+                writeAutoStartPref(v)
+              }}
+              className="rounded"
+            />
+            启动时自动播放
           </label>
         </div>
       )}

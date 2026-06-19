@@ -27,6 +27,8 @@ interface ControlPanelProps {
   onAutoCopyModeChange: (val: AutoCopyMode) => void;
   autoPaste: boolean;
   onAutoPasteChange: (val: boolean) => void;
+  autoPasteRewriteRetype: boolean;
+  onAutoPasteRewriteRetypeChange: (val: boolean) => void;
   autoStart: boolean;
   onAutoStartChange: (val: boolean) => void;
   mergeWindowMs: number;
@@ -80,6 +82,8 @@ export const ControlPanel: React.FC<ControlPanelProps> = ({
   onAutoCopyModeChange,
   autoPaste,
   onAutoPasteChange,
+  autoPasteRewriteRetype,
+  onAutoPasteRewriteRetypeChange,
   autoStart,
   onAutoStartChange,
   mergeWindowMs,
@@ -176,6 +180,20 @@ export const ControlPanel: React.FC<ControlPanelProps> = ({
           checked={autoPaste}
           onCheckedChange={onAutoPasteChange}
           disabled={disabled || autoCopyMode === 'off'}
+        />
+      </div>
+
+      <div className="flex items-center justify-between">
+        <div className="flex flex-col pr-3">
+          <span className="text-[13px] font-medium text-[var(--ink-2)]">改写时回退重打</span>
+          <span className="text-[11px] text-[var(--ink-4)]">
+            同段优化稿被 LLM 改写时，按公共前缀长度发退格回退已输入字符再补打新尾巴。关闭则保守跳过，剩余内容留给剪贴板（Ctrl+V）兜底。开启更跟手，但焦点若已切走会误删别处内容
+          </span>
+        </div>
+        <Switch
+          checked={autoPasteRewriteRetype}
+          onCheckedChange={onAutoPasteRewriteRetypeChange}
+          disabled={disabled || autoCopyMode === 'off' || !autoPaste}
         />
       </div>
 

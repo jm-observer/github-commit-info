@@ -40,13 +40,21 @@ pub fn start_paste_watcher() {
 ///
 /// 返回是否实际向外部窗口输入了文本。非 Windows 平台恒为 no-op。
 pub fn type_text_to_foreground(text: &str) -> bool {
+    type_text_with_backspaces_to_foreground(0, text)
+}
+
+/// 与 [`type_text_to_foreground`] 同语义，但在打字前先发 `backspaces` 个退格键，
+/// 用于「同段优化稿被 LLM 改写」时按公共前缀长度回退已输入字符再补打新尾巴。
+///
+/// 与普通自动粘贴共用「前台属于本进程时不动」的安全闸；退格只在外部窗口发生。
+pub fn type_text_with_backspaces_to_foreground(backspaces: usize, text: &str) -> bool {
     #[cfg(windows)]
     {
-        win::type_text(text)
+        win::type_text_with_backspaces(backspaces, text)
     }
     #[cfg(not(windows))]
     {
-        let _ = text;
+        let _ = (backspaces, text);
         false
     }
 }
@@ -58,7 +66,7 @@ mod win {
     use std::sync::atomic::Ordering;
     use tracing::{error, info};
     use windows_sys::Win32::Foundation::{LPARAM, LRESULT, WPARAM};
-    use windows_sys::Win32::UI::Input::KeyboardAndMouse::{GetAsyncKeyState, VK_CONTROL};
+    use windows_sys::Win32::UI::Input::KeyboardAndMouse::{GetAsyncKeyState, VK_BACK, VK_CONTROL};
     use windows_sys::Win32::UI::WindowsAndMessaging::{
         CallNextHookEx, GetMessageW, SetWindowsHookExW, HC_ACTION, KBDLLHOOKSTRUCT, MSG,
         WH_KEYBOARD_LL, WM_KEYDOWN, WM_SYSKEYDOWN,
@@ -112,8 +120,29 @@ mod win {
         }
     }
 
-    pub fn type_text(text: &str) -> bool {
-        if text.is_empty() {
+    /// 构造一个虚拟键（如退格）的「按下/抬起」事件。`wVk` 非 0 时 Windows 将其作为
+    /// 普通按键处理，目标控件按自身规则消费（输入框退格 = 删一个字符或一个组合字符）。
+    fn vk_input(vk: u16, key_up: bool) -> INPUT {
+        let mut flags: u32 = 0;
+        if key_up {
+            flags |= KEYEVENTF_KEYUP;
+        }
+        INPUT {
+            r#type: INPUT_KEYBOARD,
+            Anonymous: INPUT_0 {
+                ki: KEYBDINPUT {
+                    wVk: vk,
+                    wScan: 0,
+                    dwFlags: flags,
+                    time: 0,
+                    dwExtraInfo: 0,
+                },
+            },
+        }
+    }
+
+    pub fn type_text_with_backspaces(backspaces: usize, text: &str) -> bool {
+        if backspaces == 0 && text.is_empty() {
             return false;
         }
         unsafe {
@@ -121,14 +150,19 @@ mod win {
             if fg.is_null() {
                 return false;
             }
-            // 前台是本应用自己的窗口时不自动输入，避免打进自己的界面。
+            // 前台是本应用自己的窗口时不自动输入（也不退格），避免误删自己的界面文本。
             let mut pid: u32 = 0;
             GetWindowThreadProcessId(fg, &mut pid);
             if pid == GetCurrentProcessId() {
                 return false;
             }
+            let mut inputs: Vec<INPUT> =
+                Vec::with_capacity(backspaces * 2 + text.encode_utf16().count() * 2);
+            for _ in 0..backspaces {
+                inputs.push(vk_input(VK_BACK, false));
+                inputs.push(vk_input(VK_BACK, true));
+            }
             // 每个 UTF-16 码元发「按下 + 抬起」两个事件；代理对（emoji 等）按序发亦可。
-            let mut inputs: Vec<INPUT> = Vec::with_capacity(text.len() * 2);
             for unit in text.encode_utf16() {
                 inputs.push(unicode_input(unit, false));
                 inputs.push(unicode_input(unit, true));

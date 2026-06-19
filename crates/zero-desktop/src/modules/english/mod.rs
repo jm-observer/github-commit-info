@@ -29,11 +29,35 @@ pub fn english_ping() -> &'static str {
     "ok"
 }
 
-/// 返回当前生效路径的 g10_base（用于 ApiService 的 apiBase）；按局域网/外网模式解析。
-/// 若未配置返回空字符串，前端应抛错引导用户到设置页配置。
+/// 返回 english 后端的 API base（用于 ApiService）。
+///
+/// english 独立监听 `:28080` 自签 HTTPS。两条路径取舍:
+/// - **LAN**: 走 toolkit-server 的 `/api/english/*` 反代(`http://<lan_host>:8788/api/english`)。
+///   reqwest 在服务端跳过证书校验,前端是明文,避开 Tauri plugin-http 的自签拒绝。
+/// - **WAN**: 直连 `https://<wan_host>:28080`,域名有真证书,不需要绕。
+///
+/// 未配置时返回空字符串,前端应抛错引导到设置页。
 #[tauri::command]
 pub async fn english_get_g10_base(state: State<'_, AppState>) -> Result<String, String> {
-    Ok(state.net.resolve(&state.workspace).await.g10_base)
+    use crate::shared::settings::NetMode;
+    let resolved = state.net.resolve(&state.workspace).await;
+    if !resolved.is_configured() {
+        return Ok(String::new());
+    }
+    let base = match resolved.picked {
+        NetMode::Lan => format!("{}/api/english", resolved.g10_base.trim_end_matches('/')),
+        // Wan / Auto-探测后回退到 Wan: 直连 english 域名。
+        NetMode::Wan | NetMode::Auto => {
+            let no_scheme = resolved
+                .g10_base
+                .split("://")
+                .last()
+                .unwrap_or(&resolved.g10_base);
+            let host = no_scheme.split(':').next().unwrap_or(no_scheme);
+            format!("https://{host}:28080")
+        }
+    };
+    Ok(base)
 }
 
 /// 返回 english 音频缓存目录的绝对路径（用于 FileCacheManager 的根路径）。

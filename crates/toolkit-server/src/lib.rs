@@ -117,7 +117,9 @@ pub fn build_router(state: AppState, web_dir: &std::path::Path) -> axum::Router 
         .nest("/api/web/douyin", douyin_mod::routes::router())
         .nest("/api/web/llm", llm::routes::router())
         .nest("/api/agent", routes::agent::router())
-        .nest("/api/browser", routes::browser::router());
+        .nest("/api/browser", routes::browser::router())
+        // english 后端反代:LAN 模式桌面端走 http://<host>:8788/api/english/* 绕开自签证书。
+        .nest("/api/english", routes::english::router());
 
     if web_dir.exists() {
         log::info!("serving static web/ from {}", web_dir.display());

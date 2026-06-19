@@ -29,3 +29,20 @@
   --danger-soft: #fee2e2;
   --warning: #d97706;
 }
+
+/* 「正在播放」频谱条:三根高度循环跳动的小柱,用于让用户一眼看出音频正在播放/暂停。 */
+@keyframes eq-bounce {
+  0%, 100% { transform: scaleY(0.35); }
+  50%      { transform: scaleY(1); }
+}
+.eq-bar {
+  display: inline-block;
+  width: 3px;
+  height: 14px;
+  background: currentColor;
+  border-radius: 2px;
+  transform-origin: bottom;
+  animation: eq-bounce 0.9s ease-in-out infinite;
+}
+.eq-bar:nth-child(2) { animation-delay: 0.15s; }
+.eq-bar:nth-child(3) { animation-delay: 0.30s; }

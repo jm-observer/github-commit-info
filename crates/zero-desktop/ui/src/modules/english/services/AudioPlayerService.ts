@@ -60,12 +60,27 @@ export class AudioPlayerService {
       }
       AudioPlayerService.instance = new AudioPlayerService(audioAdapter, fileCacheManager, envConfig)
       AudioPlayerService.instance._init()
+      AudioPlayerService._notifyInstanceChanged()
     }
     return AudioPlayerService.instance
   }
 
   static resetInstance(): void {
     AudioPlayerService.instance = null
+    AudioPlayerService._notifyInstanceChanged()
+  }
+
+  /** 当前是否已有可用单例（供底栏 MiniPlayer 判断是否渲染英语条）。 */
+  static hasInstance(): boolean {
+    return AudioPlayerService.instance !== null
+  }
+
+  /** 单例创建/销毁通知 channel；前端订阅可在英语初始化/重置时同步隐藏/显示底栏控件。 */
+  static readonly INSTANCE_CHANGE_EVENT = 'english-audio-instance-changed'
+  private static _notifyInstanceChanged(): void {
+    if (typeof window !== 'undefined') {
+      window.dispatchEvent(new CustomEvent(AudioPlayerService.INSTANCE_CHANGE_EVENT))
+    }
   }
 
   private _init(): void {
