@@ -21,14 +21,46 @@ use serde_json::Value;
 use std::path::Path;
 use std::process::Stdio;
 use std::time::Duration;
+use tokio::io::{AsyncBufReadExt, BufReader};
 
 /// stdout 末段保留长度（排障用），避免把超长输出整段塞进 TurnResult。
 const RAW_TAIL_MAX: usize = 4096;
 
-/// 单轮 CLI 执行硬超时：codex / claude 网络卡死、等交互、子进程不退出时兜底，
+/// 单轮 CLI 执行硬超时（默认）：codex / claude 网络卡死、等交互、子进程不退出时兜底，
 /// 防止任务永久 running。超时后 kill 子进程并返回基础设施错（→ 任务 failed）。
 /// 取较宽松值（含 agent 真实改文件的耗时），仅防真正的 hang。
-const TURN_TIMEOUT: Duration = Duration::from_secs(1200);
+pub const TURN_TIMEOUT_DEFAULT: Duration = Duration::from_secs(1200);
+
+/// implementation 首步专用超时：worktree 模式下 Claude 子 agent 跑多文件实现 + cargo check
+/// 常态 30–60 分钟，1200s 会被中途切断（见 docs/codeloop-attempt-model-design.md §5）。
+pub const TURN_TIMEOUT_IMPL: Duration = Duration::from_secs(3600);
+
+/// 兼容旧 API：单常量 [`TURN_TIMEOUT`] 等于 [`TURN_TIMEOUT_DEFAULT`]，给老调用方继续用。
+pub const TURN_TIMEOUT: Duration = TURN_TIMEOUT_DEFAULT;
+
+/// 行回调：driver 流式读到一行 stdout 即调一次。
+/// 用于上层把 CLI 输出实时 emit 到前端 / 节流落库（见 docs/codeloop-attempt-model-design.md §4.4）。
+pub type LineCallback = Box<dyn FnMut(&str) + Send + 'static>;
+
+/// 单轮 send 的可选项：自定义超时 + 实时行回调。
+#[derive(Default)]
+pub struct SendOpts {
+    /// None → 用 [`TURN_TIMEOUT_DEFAULT`]。
+    pub timeout: Option<Duration>,
+    /// None → 不发行回调；stdout 仍按整段返回。
+    pub on_line: Option<LineCallback>,
+}
+
+impl SendOpts {
+    pub fn with_timeout(mut self, t: Duration) -> Self {
+        self.timeout = Some(t);
+        self
+    }
+    pub fn with_on_line(mut self, cb: LineCallback) -> Self {
+        self.on_line = Some(cb);
+        self
+    }
+}
 
 /// 构造 Codex `exec resume` 的 argv（不含 `codex` 程序名本身）。
 ///
@@ -179,17 +211,27 @@ fn tail(s: &str) -> String {
 /// 发一轮消息到指定会话，阻塞至本轮完成，返回解析后的回复。
 ///
 /// **会真实调用 codex / claude CLI 并消耗额度**——不要在单测中调用。
+///
+/// 默认超时 [`TURN_TIMEOUT_DEFAULT`]，不带行回调；需要自定义请用 [`send_with`]。
 pub async fn send(s: &SessionRef, prompt: &str) -> Result<TurnResult> {
+    send_with(s, prompt, SendOpts::default()).await
+}
+
+/// 同 [`send`]，但接受 [`SendOpts`]：可自定义超时 + 接收 stdout 行回调（实时上推前端 /
+/// 节流落库；解析 WORKTREE/verdict 等关键信号也可借此提前介入）。
+pub async fn send_with(s: &SessionRef, prompt: &str, opts: SendOpts) -> Result<TurnResult> {
+    let SendOpts { timeout, on_line } = opts;
+    let timeout = timeout.unwrap_or(TURN_TIMEOUT_DEFAULT);
     let turn = match s.provider {
         Provider::Codex => {
             let argv = codex_argv(&s.cwd, &s.session_id, prompt);
-            let stdout = run_capture("codex", &argv, None).await?;
+            let stdout = run_capture_with("codex", &argv, None, timeout, on_line).await?;
             parse_codex_stdout(&stdout)
         }
         Provider::Claude => {
             let argv = claude_argv(&s.session_id, prompt);
             // Claude resume 必须在会话原始 cwd 下执行。
-            let stdout = run_capture("claude", &argv, Some(&s.cwd)).await?;
+            let stdout = run_capture_with("claude", &argv, Some(&s.cwd), timeout, on_line).await?;
             parse_claude_stdout(&stdout)
         }
     };
@@ -279,9 +321,22 @@ pub async fn probe_claude_synthetic(cwd: &Path, prompt: &str) -> Result<String> 
 
 /// 起子进程并捕获 stdout；非零退出码视为基础设施错误（`Err`）。
 ///
-/// 带 [`TURN_TIMEOUT`] 硬超时：`stdin` 接 null（CLI 误等交互时立即 EOF），`kill_on_drop`
-/// 保证超时丢弃 future 时子进程被杀，避免僵尸进程 / 任务永久 running。
+/// 老 API：默认超时 + 无行回调。新代码请用 [`run_capture_with`]。
 async fn run_capture(program: &str, argv: &[String], cwd: Option<&Path>) -> Result<String> {
+    run_capture_with(program, argv, cwd, TURN_TIMEOUT_DEFAULT, None).await
+}
+
+/// 起子进程，按行读 stdout（每行调一次 `on_line`），同时累积成完整 stdout 返回。
+///
+/// 带显式 `timeout` 硬超时：`stdin` 接 null（CLI 误等交互时立即 EOF），`kill_on_drop`
+/// 保证超时丢弃 future 时子进程被杀，避免僵尸进程 / 任务永久 running。
+async fn run_capture_with(
+    program: &str,
+    argv: &[String],
+    cwd: Option<&Path>,
+    timeout: Duration,
+    mut on_line: Option<LineCallback>,
+) -> Result<String> {
     let (resolved, prefix) = resolve_program(program);
     let mut cmd = tokio::process::Command::new(&resolved);
     cmd.args(&prefix)
@@ -301,41 +356,90 @@ async fn run_capture(program: &str, argv: &[String], cwd: Option<&Path>) -> Resu
         cmd.current_dir(dir);
     }
     log::info!(
-        "[driver] spawn {program}（resolved={:?}, prefix={} 项, argv={} 项, cwd={:?}）",
+        "[driver] spawn {program}（resolved={:?}, prefix={} 项, argv={} 项, cwd={:?}, timeout={:?}）",
         resolved,
         prefix.len(),
         argv.len(),
         cwd,
+        timeout,
     );
     let started = std::time::Instant::now();
-    let child = cmd
+    let mut child = cmd
         .spawn()
         .with_context(|| format!("spawn {program} 失败（CLI 是否已安装并在 PATH 中？）"))?;
-    let output = match tokio::time::timeout(TURN_TIMEOUT, child.wait_with_output()).await {
+
+    let stdout_pipe = child
+        .stdout
+        .take()
+        .ok_or_else(|| anyhow!("内部错误：spawn 后 stdout 句柄为空"))?;
+    let stderr_pipe = child
+        .stderr
+        .take()
+        .ok_or_else(|| anyhow!("内部错误：spawn 后 stderr 句柄为空"))?;
+
+    // stderr：仅累积，不回调。
+    let stderr_task: tokio::task::JoinHandle<Vec<u8>> = tokio::spawn(async move {
+        use tokio::io::AsyncReadExt;
+        let mut buf = Vec::new();
+        let mut reader = stderr_pipe;
+        let _ = reader.read_to_end(&mut buf).await;
+        buf
+    });
+
+    // stdout：按行读，每行交 on_line，同时累积成完整字符串（保留换行，便于 parse_codex_stdout
+    // 等期望多行 stdout 的下游解析器照常工作）。
+    let stdout_task: tokio::task::JoinHandle<String> = tokio::spawn(async move {
+        let mut acc = String::new();
+        let mut lines = BufReader::new(stdout_pipe).lines();
+        loop {
+            match lines.next_line().await {
+                Ok(Some(line)) => {
+                    if let Some(cb) = on_line.as_mut() {
+                        cb(&line);
+                    }
+                    acc.push_str(&line);
+                    acc.push('\n');
+                }
+                Ok(None) => break,
+                Err(e) => {
+                    log::warn!("[driver] stdout 行读取错误：{e}");
+                    break;
+                }
+            }
+        }
+        acc
+    });
+
+    let exit_status = match tokio::time::timeout(timeout, child.wait()).await {
         Ok(r) => r.with_context(|| format!("等待 {program} 子进程退出失败"))?,
-        // 超时：child future 在此被丢弃，kill_on_drop 触发子进程终止。
         Err(_) => {
-            log::warn!("[driver] {program} 单轮执行超时（{TURN_TIMEOUT:?}），已终止子进程",);
+            log::warn!("[driver] {program} 单轮执行超时（{timeout:?}），已终止子进程");
+            let _ = child.start_kill();
+            stdout_task.abort();
+            stderr_task.abort();
             return Err(anyhow!(
-                "{program} 单轮执行超时（{TURN_TIMEOUT:?}），已终止子进程",
+                "{program} 单轮执行超时（{timeout:?}），已终止子进程"
             ));
         }
     };
+
+    let stdout = stdout_task.await.unwrap_or_default();
+    let stderr_bytes = stderr_task.await.unwrap_or_default();
     let elapsed = started.elapsed();
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
+
+    if !exit_status.success() {
+        let stderr = String::from_utf8_lossy(&stderr_bytes);
         log::warn!(
             "[driver] {program} 退出码 {:?}（耗时 {elapsed:?}）：{}",
-            output.status.code(),
+            exit_status.code(),
             stderr.trim(),
         );
         return Err(anyhow!(
             "{program} 退出码 {:?}：{}",
-            output.status.code(),
+            exit_status.code(),
             stderr.trim()
         ));
     }
-    let stdout = String::from_utf8_lossy(&output.stdout).to_string();
     log::info!(
         "[driver] {program} 正常退出（耗时 {elapsed:?}, stdout {} 字节）",
         stdout.len(),

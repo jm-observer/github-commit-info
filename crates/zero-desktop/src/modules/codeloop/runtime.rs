@@ -23,6 +23,10 @@ use tokio::sync::{oneshot, Mutex};
 /// 与 mod.rs 共享的进度事件名（前端 listen 它刷新状态条 / 触发 ASK_USER 弹窗）。
 pub const EV_PROGRESS: &str = "codeloop_progress";
 
+/// 实时 stdout 流事件名（前端订阅它在详情页底部滚动显示 CLI 输出，
+/// 解决"启没启动看不到"的痛点；见 docs/codeloop-attempt-model-design.md §4.4 / §6.3）。
+pub const EV_STREAM: &str = "codeloop_stream";
+
 // ------------------------- 跨会话传递的逐步确认门 -------------------------
 
 /// 确认门的三种结果（与 mod.rs 旧 Gate 同义）。
@@ -59,6 +63,8 @@ pub struct AskUserRequest<'a> {
 pub trait LoopEvents: Send + Sync + 'static {
     /// 上报一次进度。`value` 已带或不带 `loop_id`，实现可自行补齐。
     fn progress(&self, loop_id: i64, value: Value);
+    /// 上报一行 CLI 实时 stdout。`source` 取 `"claude"` / `"codex"`。默认 no-op。
+    fn stream_line(&self, _loop_id: i64, _source: &str, _line: &str) {}
 }
 
 /// Tauri 适配器：保持原 `app.emit(EV_PROGRESS, ...)` 行为不变。
@@ -79,6 +85,12 @@ impl LoopEvents for TauriLoopEvents {
             obj.insert("loop_id".into(), json!(loop_id));
         }
         let _ = self.app.emit(EV_PROGRESS, ev);
+    }
+    fn stream_line(&self, loop_id: i64, source: &str, line: &str) {
+        let _ = self.app.emit(
+            EV_STREAM,
+            json!({ "loop_id": loop_id, "source": source, "line": line }),
+        );
     }
 }
 

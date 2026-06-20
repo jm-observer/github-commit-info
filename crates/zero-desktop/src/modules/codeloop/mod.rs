@@ -375,6 +375,10 @@ struct LoopCtx {
     /// `ReviewSeed` 入口的 inline seed 原文（与 DB 的 `seed_review_path` 互斥）。
     /// DB 只存 hash 不存原文，故 inline 走通需 LoopCtx 透传。
     seed_review_inline: Option<String>,
+    /// 续跑模型：true = 这是用户点了"继续"再次发起的任务。
+    /// 影响：implementation prompt 用 RESUME 模板；worktree_path 已落库时附 WORKTREE_REUSE_NOTICE
+    /// 而非 WORKTREE_INSTRUCTION（见 codeloop-attempt-model-design.md §4.6）。
+    is_continue: bool,
 }
 
 impl LoopCtx {
@@ -394,6 +398,14 @@ impl LoopCtx {
         }
     }
 
+    /// 续跑模型：写 last_phase（失败仅记日志，不影响循环）。
+    /// 调用点见 docs/codeloop-attempt-model-design.md §3.3。
+    fn set_phase(&self, phase: &str) {
+        if let Err(e) = self.db.set_last_phase(self.loop_id, phase) {
+            log::warn!("[codeloop] 写 last_phase={phase} 失败：{e:#}");
+        }
+    }
+
     /// 终态收尾：finalize 记录（幂等）+ 上报 done。
     async fn finish(&self, final_verdict: FinalVerdict, total_rounds: u32) {
         let (status, fv) = match final_verdict {
@@ -403,6 +415,7 @@ impl LoopCtx {
             FinalVerdict::AbortedParse => ("aborted", "aborted_parse"),
             FinalVerdict::AbortedByUser => ("aborted", "aborted_by_user"),
         };
+        self.set_phase("finalized");
         if let Err(e) = self
             .db
             .finalize(self.loop_id, status, Some(fv), total_rounds as i64, None)
@@ -429,6 +442,17 @@ async fn send_and_resolve(
     session: &SessionRef,
     prompt_text: &str,
 ) -> Result<Resolved> {
+    send_and_resolve_with(ctx, session, prompt_text, None).await
+}
+
+/// 同 [`send_and_resolve`]，但可指定单轮超时；同时自动把 CLI stdout 流式 emit 到前端。
+/// 用于 implementation 首步等需要长超时 + 实时心跳的场景（见 design doc §4.4 / §5）。
+async fn send_and_resolve_with(
+    ctx: &LoopCtx,
+    session: &SessionRef,
+    prompt_text: &str,
+    timeout_override: Option<std::time::Duration>,
+) -> Result<Resolved> {
     let mut current = prompt_text.to_string();
     loop {
         log::info!(
@@ -437,7 +461,17 @@ async fn send_and_resolve(
             session.session_id,
             current.chars().count(),
         );
-        let turn = driver::send(session, &current).await?;
+        let events_for_stream = ctx.events.clone();
+        let loop_id_for_stream = ctx.loop_id;
+        let source_for_stream = session.provider.as_str();
+        let on_line: driver::LineCallback = Box::new(move |line: &str| {
+            events_for_stream.stream_line(loop_id_for_stream, source_for_stream, line);
+        });
+        let mut opts = driver::SendOpts::default().with_on_line(on_line);
+        if let Some(t) = timeout_override {
+            opts = opts.with_timeout(t);
+        }
+        let turn = driver::send_with(session, &current, opts).await?;
         log::info!(
             "[codeloop] ← {} 回复 {} 字符",
             session.provider.as_str(),
@@ -494,7 +528,8 @@ fn try_relocate_worktree(
     let Some(wt) = parse::parse_worktree_path(reply) else {
         return;
     };
-    match relocate_to_worktree(&wt, &target.repo_rel) {
+    // 用 ctx.codex.cwd（原始未重定位的 codex cwd）作为同仓校验锚点；它一直是 loop 的原 repo 根。
+    match relocate_to_worktree(&wt, &target.repo_rel, &ctx.codex.cwd) {
         Ok((new_target, new_cwd)) => {
             *target = new_target;
             codex.cwd = new_cwd;
@@ -561,14 +596,31 @@ async fn drive(ctx: &LoopCtx, start_round: u32) -> Result<()> {
     // worktree 模式下，worktree 即在这一步由 Claude 建立并回报路径。
     if ctx.mode == ReviewMode::Implementation && !ctx.resume_from_worktree {
         log::info!("[codeloop] implementation 模式：先让 Claude 按文档实现功能代码…");
-        let mut implement_prompt = prompt::render_claude_implement_prompt(
-            prompt::DEFAULT_CLAUDE_IMPLEMENT_TEMPLATE,
-            &target,
-            !claude_standing_sent,
-        );
+        // 续跑模型：is_continue → 用 RESUME 模板（"上次中断，继续完成未做的部分"）；
+        // 首次 → 沿用 DEFAULT 模板（"按规格全部实现"）。
+        let impl_template = if ctx.is_continue {
+            prompt::DEFAULT_CLAUDE_IMPLEMENT_RESUME_TEMPLATE
+        } else {
+            prompt::DEFAULT_CLAUDE_IMPLEMENT_TEMPLATE
+        };
+        let mut implement_prompt =
+            prompt::render_claude_implement_prompt(impl_template, &target, !claude_standing_sent);
         if ctx.use_worktree && !worktree_established {
-            implement_prompt.push_str(prompt::WORKTREE_INSTRUCTION);
+            // worktree_path 已落库 → 用 REUSE_NOTICE，让 Claude 在原 worktree 内继续；
+            // 否则发 INSTRUCTION 让 Claude 自己 git worktree add 一棵新的。
+            let existing_wt = ctx
+                .db
+                .get_loop(ctx.loop_id)
+                .ok()
+                .flatten()
+                .and_then(|r| r.worktree_path);
+            if let Some(wt) = existing_wt {
+                implement_prompt.push_str(&prompt::render_worktree_reuse_notice(&wt));
+            } else {
+                implement_prompt.push_str(prompt::WORKTREE_INSTRUCTION);
+            }
         }
+        ctx.set_phase("implementing");
         ctx.log_msg(
             0,
             "system",
@@ -584,7 +636,16 @@ async fn drive(ctx: &LoopCtx, start_round: u32) -> Result<()> {
         );
         ctx.report(json!({ "round": 0, "phase": "implementing" }))
             .await;
-        let reply = match send_and_resolve(ctx, &ctx.claude, &implement_prompt).await? {
+        // implementation 首步用长超时（TURN_TIMEOUT_IMPL=3600s）；worktree+多文件+编译验证
+        // 常态 30–60min，默认 1200s 会被切断（loop 12 即此种死法）。
+        let reply = match send_and_resolve_with(
+            ctx,
+            &ctx.claude,
+            &implement_prompt,
+            Some(driver::TURN_TIMEOUT_IMPL),
+        )
+        .await?
+        {
             Resolved::Reply(r) => r,
             Resolved::Timeout => {
                 ctx.finish(FinalVerdict::AbortedTimeout, 0).await;
@@ -606,11 +667,13 @@ async fn drive(ctx: &LoopCtx, start_round: u32) -> Result<()> {
         ctx.log_msg(0, "claude_implement", None, &reply);
         last_claude_reply = reply;
         log::info!("[codeloop] Claude 首步实现完成，进入 Codex 复核循环");
+        ctx.set_phase("implemented");
         ctx.report(json!({ "round": 0, "phase": "implemented" }))
             .await;
     } else if ctx.mode == ReviewMode::Implementation {
         log::info!("[codeloop] 从已存在 worktree 继续：跳过 Claude 实现首步，直接进入 Codex 复核");
         worktree_established = true;
+        ctx.set_phase("implemented");
         ctx.report(json!({ "round": 0, "phase": "implemented" }))
             .await;
     }
@@ -639,6 +702,7 @@ async fn drive(ctx: &LoopCtx, start_round: u32) -> Result<()> {
         }
 
         // 1. Codex 复核（含 ASK_USER 挂起）。
+        ctx.set_phase("codex_review");
         log::info!(
             "[codeloop] === 第 {n}/{} 轮：发起 Codex 复核 ===",
             ctx.max_rounds
@@ -725,6 +789,7 @@ async fn drive(ctx: &LoopCtx, start_round: u32) -> Result<()> {
         }
 
         // 5. Claude 据意见修订（含 ASK_USER 挂起）。
+        ctx.set_phase("claude_revise");
         // Claude 仅在 NEEDS_WORK 时被发起，其首次发送恒为第 1 轮 → n==1 即首轮。
         // 若 Claude 端已外部预热（established_claude），首轮也跳过 STANDING_BLOCK。
         // impl 模式首步已给 Claude 发过常驻块；仅在尚未发过时（design 模式首次修订）补发。
@@ -928,12 +993,17 @@ async fn run_loop(ctx: LoopCtx) {
 
 /// 把 Claude 回报的 worktree 路径校验后转成新的 `(TargetSpec, Codex cwd)`。
 ///
-/// 校验三关（防 Claude 回报任意路径导致 workspace-write 的 Codex 越界读写）：
-/// 路径存在 + 是 git 工作树（`find_repo_root` 命中）+ 落在用户目录（home）之下。
-/// repo_rel 在同仓另一检出里一致，故新 target 复用之，仅把 repo_root/abs 迁到 worktree。
+/// 信任规则（防 Claude 回报任意路径导致 workspace-write 的 Codex 越界读写）：
+/// 1. 路径存在 + 是 git 工作树（`find_repo_root` 命中）；
+/// 2. **同仓派生**（`git rev-parse --git-common-dir` 与 `origin_repo_root` 一致）
+///    **或** 落在用户 home 下——满足其一即接受。
+///
+/// 旧版只允许 home 之下，会误拒 `D:\git\toolkit.worktrees\*` 这类同仓 sibling worktree
+/// （见 docs/codeloop-attempt-model-design.md §3.3.6）。
 fn relocate_to_worktree(
     worktree: &str,
     repo_rel: &str,
+    origin_repo_root: &Path,
 ) -> std::result::Result<(TargetSpec, PathBuf), String> {
     let wt = PathBuf::from(worktree);
     if !wt.exists() {
@@ -941,11 +1011,10 @@ fn relocate_to_worktree(
     }
     let root = validate::find_repo_root(&wt).ok_or("不是 git 工作树（未找到 .git）")?;
     let canon = std::fs::canonicalize(&root).map_err(|e| format!("canonicalize 失败：{e}"))?;
-    if let Some(home) = dirs::home_dir() {
-        let home_canon = std::fs::canonicalize(&home).unwrap_or(home);
-        if !canon.starts_with(&home_canon) {
-            return Err("worktree 越出用户目录".into());
-        }
+    let same_repo = is_same_git_repo(&canon, origin_repo_root);
+    let in_home_dir = in_home(&canon);
+    if !same_repo && !in_home_dir {
+        return Err("worktree 既不属于本仓也不在用户目录下".into());
     }
     let root_disp = validate::display_path(&root);
     let abs = root_disp.join(repo_rel);
@@ -956,6 +1025,47 @@ fn relocate_to_worktree(
         abs: abs.to_string_lossy().replace('\\', "/"),
     };
     Ok((target, root_disp))
+}
+
+/// `path` 是否落在用户 home 目录下（canonicalize 后比较）。
+fn in_home(path: &Path) -> bool {
+    let Some(home) = dirs::home_dir() else {
+        return false;
+    };
+    let home_canon = std::fs::canonicalize(&home).unwrap_or(home);
+    path.starts_with(&home_canon)
+}
+
+/// 两个路径是否同属一个 git 仓库（比较 `git --git-common-dir`）。
+fn is_same_git_repo(a: &Path, b: &Path) -> bool {
+    match (git_common_dir(a), git_common_dir(b)) {
+        (Some(x), Some(y)) => x == y,
+        _ => false,
+    }
+}
+
+/// `git -C <at> rev-parse --git-common-dir` → canonicalized PathBuf；任何错误返回 None。
+fn git_common_dir(at: &Path) -> Option<PathBuf> {
+    let output = std::process::Command::new("git")
+        .arg("-C")
+        .arg(at)
+        .args(["rev-parse", "--git-common-dir"])
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let raw = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    if raw.is_empty() {
+        return None;
+    }
+    let raw_path = PathBuf::from(&raw);
+    let absolute = if raw_path.is_absolute() {
+        raw_path
+    } else {
+        at.join(raw_path)
+    };
+    std::fs::canonicalize(&absolute).ok()
 }
 
 /// 把 DTO 解析成 SessionRef：cwd 缺省时从会话存储 snapshot 补全。
@@ -1031,7 +1141,7 @@ fn sync_implementation_from_claude(db: &db::Db, store: &Store, loop_id: i64) -> 
         return Ok(());
     };
 
-    match relocate_to_worktree(&wt, &row.target_repo_rel) {
+    match relocate_to_worktree(&wt, &row.target_repo_rel, Path::new(&row.repo_root)) {
         Ok(_) => {
             db.set_worktree(loop_id, &wt)?;
             db.append_message(
@@ -1215,7 +1325,7 @@ pub async fn codeloop_start(
         return Err("只有 implementation 模式支持从 worktree 继续复核".into());
     }
     if let Some(wt) = resume_worktree_path.as_deref() {
-        let (new_target, new_cwd) = relocate_to_worktree(wt, &target.repo_rel)
+        let (new_target, new_cwd) = relocate_to_worktree(wt, &target.repo_rel, &codex.cwd)
             .map_err(|e| format!("worktree 路径校验失败：{e}"))?;
         target = new_target;
         codex.cwd = new_cwd;
@@ -1334,6 +1444,7 @@ pub async fn codeloop_start(
         target_role,
         spec_doc: spec_doc_abs,
         seed_review_inline: input.seed_review_inline.clone(),
+        is_continue: false,
     };
 
     let handle = tokio::spawn(run_loop(ctx));
@@ -1782,6 +1893,196 @@ pub async fn codeloop_stop(state: State<'_, AppState>, loop_id: i64) -> Result<(
     Ok(())
 }
 
+/// 「继续」一条已停 / 失败 / 完成的 loop：不新建记录，原地翻转 status 回 running、
+/// attempts_count +1，并按 last_phase 决定是否跳过实现首步。
+///
+/// 见 docs/codeloop-attempt-model-design.md §4.2 / §4.6。
+#[tauri::command]
+pub async fn codeloop_continue(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    loop_id: i64,
+) -> Result<(), String> {
+    let cs = &state.codeloop;
+    let db = cs.db.clone();
+
+    // 防双发：当前已在跑就拒。
+    {
+        let guard = cs.inner.lock().await;
+        if guard.contains_key(&loop_id) {
+            return Err(format!("loop #{loop_id} 仍在跟踪中，请先停止再继续"));
+        }
+    }
+
+    let row = db
+        .get_loop(loop_id)
+        .map_err(|e| format!("读取 loop 失败：{e:#}"))?
+        .ok_or_else(|| format!("loop #{loop_id} 不存在"))?;
+
+    let mode = match row.mode.as_str() {
+        "design" => ReviewMode::Design,
+        "implementation" => ReviewMode::Implementation,
+        other => return Err(format!("loop #{loop_id} mode={other} 不支持续跑")),
+    };
+    let entry_kind = match row.entry_kind.as_deref().unwrap_or("") {
+        "doc_review" => EntryKind::DocReview,
+        "implement" => EntryKind::Implement,
+        "review_seed" => EntryKind::ReviewSeed,
+        _ => match mode {
+            ReviewMode::Design => EntryKind::DocReview,
+            ReviewMode::Implementation => EntryKind::Implement,
+        },
+    };
+    // ReviewSeed + inline seed：DB 只存 hash 不存原文，无法自动续跑（design doc §4.6 边界）。
+    if entry_kind == EntryKind::ReviewSeed
+        && row.seed_review_inline_hash.is_some()
+        && row.seed_review_path.as_deref().filter(|s| !s.is_empty()).is_none()
+    {
+        return Err(
+            "该 loop 使用 inline ReviewSeed，DB 未保存原文，无法自动继续；请新建一条".into(),
+        );
+    }
+    let target_role = match (entry_kind, mode) {
+        (EntryKind::DocReview, _) => TargetRole::RevisionDoc,
+        (EntryKind::Implement, _) => TargetRole::SpecDoc,
+        (EntryKind::ReviewSeed, ReviewMode::Design) => TargetRole::RevisionDoc,
+        (EntryKind::ReviewSeed, ReviewMode::Implementation) => TargetRole::RevisionCode,
+    };
+
+    let store = Store::from_env().map_err(|e| format!("定位会话存储失败：{e:#}"))?;
+    let claude_dto = SessionRefDto {
+        session_id: row.claude_session.clone(),
+        cwd: None,
+    };
+    let codex_dto = SessionRefDto {
+        session_id: row.codex_session.clone(),
+        cwd: None,
+    };
+    let claude = resolve_ref(&store, Provider::Claude, &claude_dto)
+        .map_err(|e| format!("解析 Claude session 失败：{e:#}"))?;
+    let mut codex = resolve_ref(&store, Provider::Codex, &codex_dto)
+        .map_err(|e| format!("解析 Codex session 失败：{e:#}"))?;
+
+    let mut target = TargetSpec {
+        label: row.target_label.clone(),
+        repo_root: row.repo_root.clone(),
+        repo_rel: row.target_repo_rel.clone(),
+        abs: row.target_abs.clone(),
+    };
+    codex.cwd = PathBuf::from(&row.repo_root);
+
+    // worktree_path 已落库 → 把 codex --cd / target 重定位到它（让 Codex 在 worktree 内复核）。
+    if let Some(wt) = row.worktree_path.as_deref().filter(|s| !s.is_empty()) {
+        match relocate_to_worktree(wt, &target.repo_rel, &codex.cwd) {
+            Ok((new_target, new_cwd)) => {
+                target = new_target;
+                codex.cwd = new_cwd;
+            }
+            Err(e) => {
+                log::warn!("[codeloop] 续跑时 worktree 校验失败（{e}），回退到 repo_root");
+            }
+        }
+    }
+
+    let spec_doc_abs: Option<PathBuf> = row
+        .design_doc_path
+        .as_deref()
+        .filter(|s| !s.is_empty())
+        .and_then(|p| resolve_design_doc(Path::new(&target.repo_root), p).ok());
+
+    // 决定是否跳过实现首步：last_phase 至少到了 implemented 且 worktree_path 已落库。
+    let last_phase = row.last_phase.clone().unwrap_or_default();
+    let resume_from_wt = matches!(
+        last_phase.as_str(),
+        "implemented" | "codex_review" | "claude_revise" | "finalized"
+    ) && row.worktree_path.is_some();
+
+    // reset_for_continue 内部校验当前 status ∈ {aborted, failed, done}。
+    let new_count = db
+        .reset_for_continue(loop_id)
+        .map_err(|e| format!("准备续跑失败：{e:#}"))?;
+    let _ = db.append_message(
+        loop_id,
+        0,
+        "system",
+        None,
+        &format!(
+            "重新继续（第 {new_count} 次尝试，上次停在 last_phase={}）。{}",
+            if last_phase.is_empty() {
+                "未知"
+            } else {
+                last_phase.as_str()
+            },
+            if resume_from_wt {
+                "已跳过实现首步，直接进入 Codex 复核。"
+            } else {
+                "将从实现首步继续。"
+            }
+        ),
+    );
+
+    let progress = Arc::new(Mutex::new(json!({ "phase": "resuming" })));
+    let pending: Arc<Mutex<Option<Pending>>> = Arc::new(Mutex::new(None));
+    let pending_confirm: Arc<Mutex<Option<PendingConfirm>>> = Arc::new(Mutex::new(None));
+    let step_confirm = Arc::new(AtomicBool::new(row.step_confirm));
+    let seq = Arc::new(AtomicI64::new(0));
+
+    let events: Arc<dyn LoopEvents> = Arc::new(TauriLoopEvents::new(app.clone()));
+    let confirm: Arc<dyn ConfirmPolicy> = Arc::new(UiConfirmPolicy {
+        pending: pending.clone(),
+        pending_confirm: pending_confirm.clone(),
+        step_confirm: step_confirm.clone(),
+        answer_timeout: ANSWER_TIMEOUT,
+    });
+
+    let claude_sid = claude.session_id.clone();
+    let codex_sid = codex.session_id.clone();
+
+    let ctx = LoopCtx {
+        events,
+        confirm,
+        store,
+        db: db.clone(),
+        loop_id,
+        claude,
+        codex,
+        target,
+        mode,
+        max_rounds: row.max_rounds.max(1) as u32,
+        // 老记录没存 wait_for_idle，续跑时关掉预热（会话已稳定，不需要再 warm）。
+        wait_for_claude_idle: false,
+        use_worktree: row.use_worktree,
+        resume_from_worktree: resume_from_wt,
+        // 续跑：会话历史里 STANDING_BLOCK 已发过，双端都跳过。
+        established_codex: true,
+        established_claude: true,
+        progress: progress.clone(),
+        seq,
+        entry_kind,
+        target_role,
+        spec_doc: spec_doc_abs,
+        // inline seed 无法跨进程复现；上面已 reject 该路径。
+        seed_review_inline: None,
+        is_continue: true,
+    };
+
+    let handle = tokio::spawn(run_loop(ctx));
+    cs.inner.lock().await.insert(
+        loop_id,
+        RunningLoop {
+            handle,
+            loop_id,
+            claude_session: claude_sid,
+            codex_session: codex_sid,
+            progress,
+            pending,
+            pending_confirm,
+            step_confirm,
+        },
+    );
+    Ok(())
+}
+
 /// 列出复核循环记录（按 id 倒序，最近优先）。
 #[tauri::command]
 pub async fn codeloop_list_loops(
@@ -2031,7 +2332,7 @@ pub async fn run_codeloop(deps: RunLoopDeps, input: RunLoopInput) -> Result<RunL
         ));
     }
     if let Some(wt) = resume_worktree_path.as_deref() {
-        let (new_target, new_cwd) = relocate_to_worktree(wt, &target.repo_rel)
+        let (new_target, new_cwd) = relocate_to_worktree(wt, &target.repo_rel, &codex.cwd)
             .map_err(|e| anyhow::anyhow!("worktree 路径校验失败：{e}"))?;
         target = new_target;
         codex.cwd = new_cwd;
@@ -2126,6 +2427,7 @@ pub async fn run_codeloop(deps: RunLoopDeps, input: RunLoopInput) -> Result<RunL
         target_role,
         spec_doc: spec_doc_abs,
         seed_review_inline: input.seed_review_inline.clone(),
+        is_continue: false,
     };
 
     // 直接 await，不 spawn —— smoke runner 串行编排，等本段终态再起下一段。

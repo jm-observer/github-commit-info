@@ -44,6 +44,11 @@ pub struct LoopRow {
     pub seed_review_path: Option<String>,
     /// `ReviewSeed` 入口：inline seed 的 sm3 / sha256 短哈希前缀（便于排错与去重）。
     pub seed_review_inline_hash: Option<String>,
+    /// 续跑模型：上次任务停在哪个阶段。值见 [`set_last_phase`]。NULL 表示老记录或刚创建未推进。
+    /// UI"继续"按钮按此字段决定该用哪种 prompt 续跑（docs/codeloop-attempt-model-design.md §3.3）。
+    pub last_phase: Option<String>,
+    /// 续跑模型：当前是第几次尝试（含首次，默认 1）。每次「继续」+1。仅展示用。
+    pub attempts_count: i64,
 }
 
 /// 一条逐轮消息。
@@ -158,6 +163,15 @@ impl Db {
             .ok();
         conn.execute(
             "ALTER TABLE loops ADD COLUMN seed_review_inline_hash TEXT",
+            [],
+        )
+        .ok();
+        // 续跑模型（codeloop-attempt-model-design.md §3.1）：last_phase 标记上次停在哪一步，
+        // attempts_count 累计尝试次数。两列均幂等 ALTER。
+        conn.execute("ALTER TABLE loops ADD COLUMN last_phase TEXT", [])
+            .ok();
+        conn.execute(
+            "ALTER TABLE loops ADD COLUMN attempts_count INTEGER NOT NULL DEFAULT 1",
             [],
         )
         .ok();
@@ -288,7 +302,7 @@ impl Db {
                     target_repo_rel, target_abs, target_label, mode, max_rounds, step_confirm,
                     use_worktree, status, final_verdict, total_rounds, worktree_path, error,
                     parent_loop_id, entry_kind, design_doc_path, seed_review_path,
-                    seed_review_inline_hash
+                    seed_review_inline_hash, last_phase, attempts_count
              FROM loops ORDER BY id DESC LIMIT ?1",
         )?;
         let rows = stmt
@@ -324,6 +338,8 @@ impl Db {
                     design_doc_path: row.get(20)?,
                     seed_review_path: row.get(21)?,
                     seed_review_inline_hash: row.get(22)?,
+                    last_phase: row.get(23)?,
+                    attempts_count: row.get(24)?,
                 })
             })?
             .collect::<rusqlite::Result<Vec<_>>>()?;
@@ -372,7 +388,7 @@ impl Db {
                     target_repo_rel, target_abs, target_label, mode, max_rounds, step_confirm,
                     use_worktree, status, final_verdict, total_rounds, worktree_path, error,
                     parent_loop_id, entry_kind, design_doc_path, seed_review_path,
-                    seed_review_inline_hash
+                    seed_review_inline_hash, last_phase, attempts_count
              FROM loops WHERE id=?1",
         )?;
         let mut rows = stmt.query_map([loop_id], |row| {
@@ -400,12 +416,50 @@ impl Db {
                 design_doc_path: row.get(20)?,
                 seed_review_path: row.get(21)?,
                 seed_review_inline_hash: row.get(22)?,
+                last_phase: row.get(23)?,
+                attempts_count: row.get(24)?,
             })
         })?;
         match rows.next() {
             Some(r) => Ok(Some(r?)),
             None => Ok(None),
         }
+    }
+
+    /// 更新 last_phase（续跑模型；见 design doc §3.3）。
+    pub fn set_last_phase(&self, loop_id: i64, phase: &str) -> Result<()> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "UPDATE loops SET last_phase=?1, updated_at=?2 WHERE id=?3",
+            params![phase, now(), loop_id],
+        )?;
+        Ok(())
+    }
+
+    /// 「继续」入口准备：把 loop 从终态翻回 running、attempts_count +1、清 final_verdict / error，
+    /// 返回新的 attempts_count。要求当前 status ∈ {aborted, failed, done}；其他状态拒绝。
+    pub fn reset_for_continue(&self, loop_id: i64) -> Result<i64> {
+        let mut conn = self.conn.lock().unwrap();
+        let tx = conn.transaction()?;
+        let (status, count): (String, i64) = tx.query_row(
+            "SELECT status, attempts_count FROM loops WHERE id=?1",
+            [loop_id],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )?;
+        if !matches!(status.as_str(), "aborted" | "failed" | "done") {
+            return Err(anyhow::anyhow!(
+                "loop #{loop_id} 当前 status='{status}'，不允许继续（仅 aborted/failed/done 可继续）"
+            ));
+        }
+        let new_count = count + 1;
+        tx.execute(
+            "UPDATE loops SET status='running', final_verdict=NULL, error=NULL,
+                              attempts_count=?1, updated_at=?2
+             WHERE id=?3",
+            params![new_count, now(), loop_id],
+        )?;
+        tx.commit()?;
+        Ok(new_count)
     }
 
     /// 该 loop 的 `loop_messages` 表里是否存在指定 kind 的消息（任意 round）。

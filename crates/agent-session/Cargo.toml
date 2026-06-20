@@ -9,7 +9,7 @@ serde = { workspace = true }
 serde_json = { workspace = true }
 anyhow = { workspace = true }
 log = { workspace = true }
-tokio = { workspace = true, features = ["fs", "process", "time"] }
+tokio = { workspace = true, features = ["fs", "process", "time", "io-util", "rt"] }
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["rt-multi-thread", "macros"] }

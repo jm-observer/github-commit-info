@@ -385,13 +385,34 @@ export default function CodeloopPage() {
     }
     await startWith(next)
   }
-  // 「开始实现」：LoopDetail 内联配好 StartInput（承接血缘已带 parent_loop_id）后直接启动。
+  // 「开始实现」：design→impl 是真正的两段工作，仍新建一条 loop。
   const handleStartImplementation = (input: StartInput, options?: StageStartOptions) =>
     startStageWith(input, options)
-  const handleContinueReview = (input: StartInput, options?: StageStartOptions) =>
-    startStageWith(input, options)
-  const handleContinue = (input: StartInput, options?: StageStartOptions) =>
-    startStageWith(input, options)
+  // 「继续」/「继续复核」：续跑模型下不再新建 loop，原地翻转 status 回 running。
+  // input.parent_loop_id 是要续跑的目标 loop id。
+  const continueInPlace = async (input: StartInput) => {
+    const targetId = input.parent_loop_id
+    if (!targetId) {
+      setStartErr('内部错误：续跑缺 loop_id')
+      return
+    }
+    setStartErr(null)
+    try {
+      await CodeloopAPI.continueLoop(targetId)
+      setRunningLoops(prev => ({
+        ...prev,
+        [targetId]: { progress: { phase: 'resuming' }, liveAuto: !input.step_confirm },
+      }))
+      setSelectedLoopId(targetId)
+      refreshLoops()
+    } catch (e) {
+      setStartErr(String(e))
+    }
+  }
+  const handleContinueReview = (input: StartInput, _options?: StageStartOptions) =>
+    continueInPlace(input)
+  const handleContinue = (input: StartInput, _options?: StageStartOptions) =>
+    continueInPlace(input)
 
   const handleStop = async (loopId: number) => {
     try {

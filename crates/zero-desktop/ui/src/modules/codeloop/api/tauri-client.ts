@@ -136,6 +136,10 @@ export interface LoopRow {
   seed_review_path?: string | null
   /** ReviewSeed inline seed 的 sm3 短哈希（持久化记录用，便于排错/去重）。 */
   seed_review_inline_hash?: string | null
+  /** 续跑模型：上次任务停在哪个阶段（implementing/implemented/codex_review/claude_revise/finalized）；NULL=老记录。 */
+  last_phase?: string | null
+  /** 续跑模型：当前是第几次尝试（含首次，默认 1）。每次"继续"+1。 */
+  attempts_count: number
 }
 
 /** 一条自检结果（与后端 CheckRow 对齐）。 */
@@ -183,6 +187,8 @@ export const CodeloopAPI = {
   setAutoConfirm: (loopId: number, enabled: boolean) =>
     invoke<void>('codeloop_set_auto_confirm', { loopId, enabled }),
   stop: (loopId: number) => invoke<void>('codeloop_stop', { loopId }),
+  /** 续跑：原地翻转已停 / 失败 / 完成的 loop 回 running，attempts_count +1。 */
+  continueLoop: (loopId: number) => invoke<void>('codeloop_continue', { loopId }),
   // 记录列表 / 详情 / 删除
   listLoops: (limit = 50) => invoke<LoopRow[]>('codeloop_list_loops', { limit }),
   loopMessages: (loopId: number) => invoke<LoopMessageRow[]>('codeloop_loop_messages', { loopId }),

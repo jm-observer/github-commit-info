@@ -120,6 +120,11 @@ export function LoopList(props: Props) {
                   <span>{l.mode === 'design' ? '设计' : '实现'}</span>
                   {l.final_verdict && <span>· {FINAL_LABELS[l.final_verdict] ?? l.final_verdict}</span>}
                   <span>· {l.total_rounds} 轮</span>
+                  {l.attempts_count > 1 && (
+                    <span className="rounded bg-blue-100 px-1 text-[10px] font-medium text-blue-700 dark:bg-blue-900/40 dark:text-blue-300">
+                      × {l.attempts_count}
+                    </span>
+                  )}
                   {l.step_confirm ? <span>· 逐步确认</span> : <span>· 自动</span>}
                   {l.use_worktree && (
                     <span className="flex items-center gap-0.5 text-violet-500">

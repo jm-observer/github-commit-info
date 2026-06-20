@@ -100,6 +100,28 @@ pub const WORKTREE_INSTRUCTION: &str = "\
 在其中用子 agent 完成本轮修订与必要验证，完成后在回复中**单独一行**回报该工作树的绝对路径，\
 格式严格为：`WORKTREE: <绝对路径>`（该行只含这一个标记，不要夹带其它文字）。后续复核将在该工作树内进行。";
 
+/// **复用既有 worktree 提示段**：当 `loops.worktree_path` 已落库（续跑场景）时，由上层追加
+/// 到 Claude prompt 末尾。占位符 `{WORKTREE_PATH}` 由 [`render_worktree_reuse_notice`] 填充。
+///
+/// 见 docs/codeloop-attempt-model-design.md §3.2 / §4.6。
+pub const WORKTREE_REUSE_NOTICE: &str = "\
+\n\n【沿用既有工作树】之前已为本任务建立 worktree：`{WORKTREE_PATH}`。\
+请直接在此目录下工作，**不要再 `git worktree add` 新建**，也不要切换到其它目录。";
+
+/// 把 `{WORKTREE_PATH}` 填入 [`WORKTREE_REUSE_NOTICE`]。
+pub fn render_worktree_reuse_notice(worktree_path: &str) -> String {
+    WORKTREE_REUSE_NOTICE.replace("{WORKTREE_PATH}", worktree_path)
+}
+
+/// **Claude implement 续跑模板**：用户点"继续"且 last_phase 仍在 implementing 阶段时用。
+/// 与 [`DEFAULT_CLAUDE_IMPLEMENT_TEMPLATE`] 的差别：明确说"上次中断"、不附 WORKTREE_INSTRUCTION
+/// （cwd 由 ZD 用 loop.worktree_path spawn 时已稳定）。占位符 `{LABEL}`。
+///
+/// 见 docs/codeloop-attempt-model-design.md §4.6。
+pub const DEFAULT_CLAUDE_IMPLEMENT_RESUME_TEMPLATE: &str = "上次实现 {LABEL} 的过程中被中断，\
+请基于已有 worktree 继续完成未做的部分。如已做完，确认无遗漏后用一句话概述实现要点；\
+否则补完后再做同样的概述。期间若遇方案/范围歧义请用 ASK_USER 协议询问。";
+
 /// 复核模式，仅影响 prompt 措辞（复核口径）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]

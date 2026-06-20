@@ -52,6 +52,15 @@ const FINAL_LABELS: Record<string, string> = {
   interrupted: '中断（应用重启）',
 }
 
+const PHASE_LABELS: Record<string, string> = {
+  implementing: '实现中',
+  implemented: '实现完成',
+  codex_review: 'Codex 复核',
+  claude_revise: 'Claude 修订',
+  awaiting_user: '等用户回答',
+  finalized: '已收尾',
+}
+
 const ENTRY_META: Record<EntryKind, { icon: string; label: string; title: string }> = {
   doc_review: { icon: '📄', label: '文档复核', title: '从文档复核开始（DocReview）' },
   implement: { icon: '🛠', label: '从实现开始', title: '从实现开始（Implement）' },
@@ -294,6 +303,14 @@ export function LoopDetail({
           <span>{loop.mode === 'design' ? '设计复核' : '实现复核'}</span>
           {loop.final_verdict && <span>· {FINAL_LABELS[loop.final_verdict] ?? loop.final_verdict}</span>}
           <span>· {loop.total_rounds}/{loop.max_rounds} 轮</span>
+          {loop.attempts_count > 1 && (
+            <span className="rounded bg-blue-100 px-1 text-[11px] font-medium text-blue-700 dark:bg-blue-900/40 dark:text-blue-300">
+              × {loop.attempts_count}
+            </span>
+          )}
+          {loop.last_phase && !isLive && (
+            <span className="text-gray-400">· 上次停在 {PHASE_LABELS[loop.last_phase] ?? loop.last_phase}</span>
+          )}
           {isLive && <span className="text-blue-600 dark:text-blue-400">· {liveText(liveProgress)}</span>}
         </div>
 

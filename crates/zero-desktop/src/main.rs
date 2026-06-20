@@ -316,6 +316,7 @@ fn run_gui(workspace: PathBuf) -> Result<()> {
             modules::codeloop::codeloop_confirm,
             modules::codeloop::codeloop_set_auto_confirm,
             modules::codeloop::codeloop_stop,
+            modules::codeloop::codeloop_continue,
             modules::codeloop::codeloop_list_loops,
             modules::codeloop::codeloop_loop_messages,
             modules::codeloop::codeloop_delete_loop,
