@@ -5,6 +5,7 @@ pub mod llm_settings;
 pub mod lock_utils;
 pub mod paste_watch;
 pub mod settings;
+pub mod voice_commands;
 
 use anyhow::{Context, Result};
 use std::path::Path;

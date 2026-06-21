@@ -63,6 +63,10 @@ pub enum ServerEvent {
     Optimized {
         r#ref: u64,
         text: String,
+        /// 节 B：状态标记。`None`（字段省略）= 正常成功；`Some("fallback")` = LLM 调用失败 /
+        /// 超时，text 回退为 ASR 原文。客户端可据此提示"LLM 不可用，已返回原文"。
+        #[serde(skip_serializing_if = "Option::is_none")]
+        status: Option<String>,
     },
     Translated {
         r#ref: u64,

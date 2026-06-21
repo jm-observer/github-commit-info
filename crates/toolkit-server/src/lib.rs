@@ -87,8 +87,11 @@ pub async fn serve_with_web(
 ) -> Result<()> {
     // orchestrator(ASR 编排层）同进程挂载到 /api/asr：WS 在 /api/asr/stream，HTTP 在
     // /api/asr/api/*。其 app.db 落在 toolkit-server 的 workspace 下，与 toolkit.db 并列。
-    let orch_ctx =
-        orchestrator::init_ctx(&state.workspace).context("orchestrator init_ctx (ASR 编排层)")?;
+    // 嵌入模式：把 toolkit.db 池子注入 orchestrator，LLM 连接配置 / 提示词优先经公共层
+    // （`llm/mod.rs::builtins` 登记的 `asr_optimize_zh` / `asr_translate`）解析。详见
+    // docs/llm-and-voice-enhancement-plan.md 节 A。
+    let orch_ctx = orchestrator::init_ctx_with_toolkit_pool(&state.workspace, state.pool.clone())
+        .context("orchestrator init_ctx (ASR 编排层)")?;
     let app = build_router(state, web_dir).nest("/api/asr", orchestrator::router(orch_ctx));
     let listener = tokio::net::TcpListener::bind(bind)
         .await

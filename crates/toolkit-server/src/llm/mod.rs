@@ -21,6 +21,24 @@ pub const NAME_DOUYIN_REFINE: &str = "douyin_refine";
 pub const NAME_CHAT_SUMMARY: &str = "chat_summary";
 pub const NAME_CODELOOP_CODEX_REVIEW: &str = "codeloop_codex_review";
 pub const NAME_CODELOOP_CLAUDE_REVISION: &str = "codeloop_claude_revision";
+/// ASR 中文优化系统提示词（orchestrator 的 vLLM 润色调用）。orchestrator 经裸字符串
+/// `"asr_optimize_zh"` 读取（不依赖 toolkit-server crate）；两边名称必须一致。
+pub const NAME_ASR_OPTIMIZE_ZH: &str = "asr_optimize_zh";
+/// ASR 翻译系统提示词（orchestrator 的英文翻译调用）。
+pub const NAME_ASR_TRANSLATE: &str = "asr_translate";
+
+/// ASR 中文优化提示词内置默认（节 B 加固后）。orchestrator 的 `DEFAULT_OPTIMIZE_PROMPT`
+/// 是同份文本的运行时回退；改这里时同步改那边。`PROMPT_VERSION` 用 `v2` 反映节 B 改动。
+pub const ASR_OPTIMIZE_ZH_PROMPT: &str = "你是中文口语转写规整器。任务:仅修正口语病(去除\"那/就是/啊/什么的\"等口头语、合并自我重复如\"最左侧是最左侧是\"、补齐缺失标点、改正同音错字),输出通顺的书面中文。严格保留原句所有信息点和原有顺序;禁止归纳、概括、合并要点、改写为列表或重排语序;长句保持长句,不要为了简洁而压缩。\
+\n规则:\
+\n- 英文单词、代码标识符(驼峰/蛇形/含数字)保持原样,不要意译或音译,例如 Tauri 不要写成\"塔里\"。\
+\n- 数字、日期、金额、版本号统一阿拉伯数字与标准写法,例如\"二零二六年六月\"→\"2026 年 6 月\"、\"v 一点零\"→\"v1.0\"。\
+\n- 逐句对齐原文,不要合并/压缩/总结,不要删减信息。\
+\n严格要求:只输出整理后的文本本身;不要解释、不要选项、不要markdown、不要追问、不要任何前后缀;若已通顺则原样返回。";
+
+/// ASR 翻译提示词内置默认。
+pub const ASR_TRANSLATE_PROMPT: &str =
+    "Translate the user's sentence into natural English. Output ONLY the translation itself — no explanations, no options, no quotes, no markdown.";
 
 /// 对话总结内置 prompt。`{CONVERSATION}` 占位符在调用时替换为粘贴的会话文本。
 pub const CHAT_SUMMARY_PROMPT: &str =
@@ -71,6 +89,21 @@ pub fn builtins() -> Vec<BuiltinPrompt> {
             version: codeloop_core::prompt::TEMPLATE_VERSION,
             placeholders: codeloop_core::prompt::CLAUDE_PLACEHOLDERS,
             default_text: codeloop_core::prompt::DEFAULT_CLAUDE_TEMPLATE,
+        },
+        BuiltinPrompt {
+            name: NAME_ASR_OPTIMIZE_ZH,
+            description: "ASR 中文优化（口语病修正 + 英文/代码保留 + 数字规范化）",
+            // v2 = 节 B 在 v1 基础上增补英文保留 / 数字规范化 / 逐句对齐三条规则。
+            version: "v2",
+            placeholders: &[],
+            default_text: ASR_OPTIMIZE_ZH_PROMPT,
+        },
+        BuiltinPrompt {
+            name: NAME_ASR_TRANSLATE,
+            description: "ASR 中文→英文翻译",
+            version: "v1",
+            placeholders: &[],
+            default_text: ASR_TRANSLATE_PROMPT,
         },
     ]
 }

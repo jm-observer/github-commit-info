@@ -46,6 +46,10 @@ struct Cfg {
 pub struct AppCtx {
     cfg: Cfg,
     db: Arc<Db>,
+    /// 嵌入 toolkit-server 时持有的公共 LLM 层连接池（toolkit.db），用于读 `llm_config` /
+    /// `llm_prompts`。standalone bin 模式恒为 `None`，所有 LLM 配置回退到 orchestrator
+    /// 自有的 env / app.db / 编译期默认。详见节 A LLM 配置收拢。
+    toolkit_pool: Option<toolkit_core::SqlitePool>,
 }
 
 /// 运行时 Cfg。迁入 toolkit 后 orchestrator 是宿主 systemd 进程(非容器),故 asr /
@@ -66,8 +70,77 @@ static SEG_ID: AtomicU64 = AtomicU64::new(1);
 
 // Defaults for the LLM keys seeded into config (editable in the console
 // "配置" tab). Also the fallback if a key is somehow missing from the DB.
-const DEFAULT_OPTIMIZE_PROMPT: &str = "你是中文口语转写规整器。任务:仅修正口语病(去除\"那/就是/啊/什么的\"等口头语、合并自我重复如\"最左侧是最左侧是\"、补齐缺失标点、改正同音错字),输出通顺的书面中文。严格保留原句所有信息点和原有顺序;禁止归纳、概括、合并要点、改写为列表或重排语序;长句保持长句,不要为了简洁而压缩。严格要求:只输出整理后的文本本身;不要解释、不要选项、不要markdown、不要追问、不要任何前后缀;若已通顺则原样返回。";
+//
+// 节 B（ASR 中文优化加固）：在保留口语病修正的基础上，追加四条新规则：
+//   ① 英文 / 代码标识符保持原样（避免把 `Tauri` 写成"塔里"）。
+//   ② 数字 / 日期 / 金额 / 版本号统一阿拉伯数字与标准写法。
+//   ③ 逐句对齐，不删、不增、不合并、不压缩、不总结。
+//   ④ 已通顺则原样返回。
+const DEFAULT_OPTIMIZE_PROMPT: &str = "你是中文口语转写规整器。任务:仅修正口语病(去除\"那/就是/啊/什么的\"等口头语、合并自我重复如\"最左侧是最左侧是\"、补齐缺失标点、改正同音错字),输出通顺的书面中文。严格保留原句所有信息点和原有顺序;禁止归纳、概括、合并要点、改写为列表或重排语序;长句保持长句,不要为了简洁而压缩。\
+\n规则:\
+\n- 英文单词、代码标识符(驼峰/蛇形/含数字)保持原样,不要意译或音译,例如 Tauri 不要写成\"塔里\"。\
+\n- 数字、日期、金额、版本号统一阿拉伯数字与标准写法,例如\"二零二六年六月\"→\"2026 年 6 月\"、\"v 一点零\"→\"v1.0\"。\
+\n- 逐句对齐原文,不要合并/压缩/总结,不要删减信息。\
+\n严格要求:只输出整理后的文本本身;不要解释、不要选项、不要markdown、不要追问、不要任何前后缀;若已通顺则原样返回。";
 const DEFAULT_TRANSLATE_PROMPT: &str = "Translate the user's sentence into natural English. Output ONLY the translation itself — no explanations, no options, no quotes, no markdown.";
+
+/// 节 A：公共 LLM 层（toolkit.db `llm_prompts`）中的提示词名（与 toolkit-server `llm::builtins`
+/// 登记的 `NAME_ASR_OPTIMIZE_ZH` / `NAME_ASR_TRANSLATE` 必须保持一致，两边都用裸字符串避免
+/// 循环依赖）。
+const PROMPT_NAME_OPTIMIZE: &str = "asr_optimize_zh";
+const PROMPT_NAME_TRANSLATE: &str = "asr_translate";
+
+/// 解析 LLM 端点（base, model）。
+///
+/// 优先级：toolkit 公共层（嵌入模式才有）→ orchestrator 自身 app.db（旧路径，向后兼容）→
+/// env / 编译期默认（[`Cfg`]）。公共层一行内 base 或 model 任一空 → 视为未配置，跳到回退。
+fn resolve_llm_endpoint(
+    toolkit_pool: Option<&toolkit_core::SqlitePool>,
+    db: &Db,
+    c: &Cfg,
+) -> (String, String) {
+    if let Some(pool) = toolkit_pool {
+        if let Ok(Some(cfg)) = toolkit_core::llm_store::get_config(pool) {
+            let base = cfg.base_url.trim();
+            let model = cfg.model.trim();
+            if !base.is_empty() && !model.is_empty() {
+                return (base.to_string(), model.to_string());
+            }
+        }
+    }
+    let base = db
+        .config_get("vllm.base")
+        .unwrap_or_else(|| c.vllm_base.clone());
+    let model = db
+        .config_get("vllm.model")
+        .unwrap_or_else(|| c.vllm_model.clone());
+    (base, model)
+}
+
+/// 解析提示词文本。优先级：公共层 `llm_prompts.<name>` → app.db `<legacy_key>` →
+/// `default_text`（编译期内置）。空白文本视为未覆盖。
+fn resolve_prompt_text(
+    toolkit_pool: Option<&toolkit_core::SqlitePool>,
+    db: &Db,
+    name: &str,
+    legacy_key: &str,
+    default_text: &str,
+) -> String {
+    if let Some(pool) = toolkit_pool {
+        if let Ok(Some(p)) = toolkit_core::llm_store::get_prompt(pool, name) {
+            if !p.text.trim().is_empty() {
+                return p.text;
+            }
+        }
+    }
+    db.config_get(legacy_key)
+        .unwrap_or_else(|| default_text.to_string())
+}
+
+/// 取热词原文（公共层 / orchestrator app.db 同一键 `asr.hotwords`，仅 orchestrator 一处来源）。
+fn resolve_hotwords(db: &Db) -> String {
+    db.config_get("asr.hotwords").unwrap_or_default()
+}
 
 /// 抽取热词列表(忽略空行和注释)。每行可为 "词" 或 "词 权重",权重对 LLM 没意义,这里只取词面。
 fn parse_hotwords(raw: &str) -> Vec<String> {
@@ -183,9 +256,28 @@ pub async fn serve(bind: String, workspace: PathBuf) -> anyhow::Result<()> {
 }
 
 /// 打开 workspace 下的 app.db、播种运行时配置、挂保留清理后台任务,构造 [`AppCtx`]。
-/// **独立 serve 与嵌入 toolkit-server 共用**。同步函数,但内部 `tokio::spawn` 清理任务,
-/// 故须在 tokio 运行时内调用(两个调用方都在 async 上下文)。
+/// **独立 serve 入口**——不传 toolkit pool，所有 LLM 配置走 orchestrator 自身的 env / app.db /
+/// 编译期默认。嵌入 toolkit-server 模式应改用 [`init_ctx_with_toolkit_pool`]，把 toolkit.db
+/// 池子注入进来，LLM 连接/提示词优先走公共层（节 A）。
+///
+/// 同步函数,但内部 `tokio::spawn` 清理任务,故须在 tokio 运行时内调用(两个调用方都在 async 上下文)。
 pub fn init_ctx(workspace: &std::path::Path) -> anyhow::Result<AppCtx> {
+    init_ctx_inner(workspace, None)
+}
+
+/// 嵌入 toolkit-server 模式入口：把宿主的 toolkit pool 注入 [`AppCtx`]，
+/// LLM 连接配置 / 提示词优先经公共层（`toolkit-core::llm_store`）解析（节 A）。
+pub fn init_ctx_with_toolkit_pool(
+    workspace: &std::path::Path,
+    toolkit_pool: toolkit_core::SqlitePool,
+) -> anyhow::Result<AppCtx> {
+    init_ctx_inner(workspace, Some(toolkit_pool))
+}
+
+fn init_ctx_inner(
+    workspace: &std::path::Path,
+    toolkit_pool: Option<toolkit_core::SqlitePool>,
+) -> anyhow::Result<AppCtx> {
     let c = cfg();
 
     std::fs::create_dir_all(workspace).ok();
@@ -233,7 +325,11 @@ pub fn init_ctx(workspace: &std::path::Path) -> anyhow::Result<AppCtx> {
             }
         });
     }
-    Ok(AppCtx { cfg: c, db })
+    Ok(AppCtx {
+        cfg: c,
+        db,
+        toolkit_pool,
+    })
 }
 
 /// 构建 orchestrator 的 axum 路由（自带 state，产出 `Router<()>` 便于宿主 `.nest()` 挂载）。
@@ -292,6 +388,7 @@ async fn ws_upgrade(
 async fn handle_client(mut sock: WebSocket, ctx: AppCtx, upgrade_remote: Option<TraceContext>) {
     let c = ctx.cfg.clone();
     let db = ctx.db.clone();
+    let toolkit_pool = ctx.toolkit_pool.clone();
     let session_id = format!("s{}", SEG_ID.load(Ordering::Relaxed));
     db.session_start(&session_id);
     let started = Instant::now();
@@ -422,6 +519,7 @@ async fn handle_client(mut sock: WebSocket, ctx: AppCtx, upgrade_remote: Option<
             db: db.clone(),
             pcm_buf: pcm_buf.clone(),
             stream_ctx: stream_ctx.clone(),
+            toolkit_pool: toolkit_pool.clone(),
         },
     ));
 
@@ -500,6 +598,8 @@ struct AsrReaderCtx {
     db: Arc<Db>,
     pcm_buf: Arc<std::sync::Mutex<PcmBuf>>,
     stream_ctx: TraceContext,
+    /// 公共 LLM 层连接池（嵌入模式下来自 toolkit-server）。None 时回退到 env / app.db。
+    toolkit_pool: Option<toolkit_core::SqlitePool>,
 }
 
 async fn asr_reader(mut asr_rx: AsrRx, ctx: AsrReaderCtx) -> u64 {
@@ -511,6 +611,7 @@ async fn asr_reader(mut asr_rx: AsrRx, ctx: AsrReaderCtx) -> u64 {
         db,
         pcm_buf,
         stream_ctx,
+        toolkit_pool,
     } = ctx;
     let mut seg_count: u64 = 0;
     // 会话墙上时钟锚点:音频 t=0 ≈ asr_reader 起点的真实时刻。每段 wall = anchor + 偏移,
@@ -689,22 +790,25 @@ async fn asr_reader(mut asr_rx: AsrRx, ctx: AsrReaderCtx) -> u64 {
                 let defer_opt_to_secondary = merge_on && hello.want_secondary;
                 let do_opt_here = hello.want_optimize && !defer_opt_to_secondary;
                 if do_opt_here || hello.want_translate {
-                    let model = db
-                        .config_get("vllm.model")
-                        .unwrap_or_else(|| c.vllm_model.clone());
-                    let base = db
-                        .config_get("vllm.base")
-                        .unwrap_or_else(|| c.vllm_base.clone());
+                    let (base, model) = resolve_llm_endpoint(toolkit_pool.as_ref(), &db, &c);
                     let opt_sys = do_opt_here.then(|| {
-                        let base = db
-                            .config_get("llm.optimize_prompt")
-                            .unwrap_or_else(|| DEFAULT_OPTIMIZE_PROMPT.into());
-                        let hw = db.config_get("asr.hotwords").unwrap_or_default();
-                        optimize_prompt_with_hotwords(base, &hw)
+                        let tmpl = resolve_prompt_text(
+                            toolkit_pool.as_ref(),
+                            &db,
+                            PROMPT_NAME_OPTIMIZE,
+                            "llm.optimize_prompt",
+                            DEFAULT_OPTIMIZE_PROMPT,
+                        );
+                        optimize_prompt_with_hotwords(tmpl, &resolve_hotwords(&db))
                     });
                     let tr_sys = hello.want_translate.then(|| {
-                        db.config_get("llm.translate_prompt")
-                            .unwrap_or_else(|| DEFAULT_TRANSLATE_PROMPT.into())
+                        resolve_prompt_text(
+                            toolkit_pool.as_ref(),
+                            &db,
+                            PROMPT_NAME_TRANSLATE,
+                            "llm.translate_prompt",
+                            DEFAULT_TRANSLATE_PROMPT,
+                        )
                     });
                     // 合并模式以整条链原始文本为输入,不注入历史上下文(链本身即
                     // 上下文,且不喂回润色结果,从根上断开滚雪球);关闭时沿用
@@ -726,17 +830,18 @@ async fn asr_reader(mut asr_rx: AsrRx, ctx: AsrReaderCtx) -> u64 {
                         let opt_user = build_optimize_user_msg(&ctx_texts, &prim, None);
                         let opt_fut = async {
                             match &opt_sys {
-                                // 润色失败/超时:回发原文兜底,让该段从"优化中"落定,
-                                // 不让客户端永久转圈(trace 里 llm() 已记 Err)。
+                                // 节 B：润色失败/超时回发原文 + status:"fallback"，让该段
+                                // 从"优化中"落定并明确告知客户端是降级（trace 里 llm() 已记 Err）。
                                 Some(s) => Some(
-                                    llm(&base, &model, s, &opt_user, Some(&llm_ctx))
-                                        .await
-                                        .unwrap_or_else(|e| {
+                                    match llm(&base, &model, s, &opt_user, Some(&llm_ctx)).await {
+                                        Ok(t) => (t, false),
+                                        Err(e) => {
                                             tracing::warn!(
                                                 "[orch] optimize failed for seg {id}, fallback to raw: {e}"
                                             );
-                                            prim.clone()
-                                        }),
+                                            (prim.clone(), true)
+                                        }
+                                    },
                                 ),
                                 None => None,
                             }
@@ -750,7 +855,7 @@ async fn asr_reader(mut asr_rx: AsrRx, ctx: AsrReaderCtx) -> u64 {
                         let (opt, en) = tokio::join!(opt_fut, tr_fut);
                         // 合并模式下放行 latest-wins:只有"输入不短于已发出"才落库/回发,
                         // 防并发的较短旧结果覆盖较长新结果。非合并模式每 id 唯一,直接放行。
-                        if let Some(opt) = opt {
+                        if let Some((opt_text, fallback)) = opt {
                             let pass = !merge_on || {
                                 let mut g = opt_emitted2.lock().unwrap();
                                 if prim_len >= g.get(&id).copied().unwrap_or(0) {
@@ -761,8 +866,13 @@ async fn asr_reader(mut asr_rx: AsrRx, ctx: AsrReaderCtx) -> u64 {
                                 }
                             };
                             if pass {
-                                db2.segment_set_optimized(id as i64, &opt);
-                                send(&tx2, ServerEvent::Optimized { r#ref: id, text: opt }.json()).await;
+                                db2.segment_set_optimized(id as i64, &opt_text);
+                                let status = if fallback { Some("fallback".into()) } else { None };
+                                send(
+                                    &tx2,
+                                    ServerEvent::Optimized { r#ref: id, text: opt_text, status }.json(),
+                                )
+                                .await;
                             }
                         }
                         if let Some(en) = en {
@@ -837,11 +947,14 @@ async fn asr_reader(mut asr_rx: AsrRx, ctx: AsrReaderCtx) -> u64 {
                             let prim_len = prim.chars().count();
                             if prim_len > 0 {
                                 let sys = {
-                                    let base = db
-                                        .config_get("llm.optimize_prompt")
-                                        .unwrap_or_else(|| DEFAULT_OPTIMIZE_PROMPT.into());
-                                    let hw = db.config_get("asr.hotwords").unwrap_or_default();
-                                    optimize_prompt_with_hotwords(base, &hw)
+                                    let tmpl = resolve_prompt_text(
+                                        toolkit_pool.as_ref(),
+                                        &db,
+                                        PROMPT_NAME_OPTIMIZE,
+                                        "llm.optimize_prompt",
+                                        DEFAULT_OPTIMIZE_PROMPT,
+                                    );
+                                    optimize_prompt_with_hotwords(tmpl, &resolve_hotwords(&db))
                                 };
                                 let pname = db
                                     .config_get("asr.model")
@@ -852,27 +965,28 @@ async fn asr_reader(mut asr_rx: AsrRx, ctx: AsrReaderCtx) -> u64 {
                                     &prim,
                                     Some((&pname, &sname, &full)),
                                 );
-                                let model = db
-                                    .config_get("vllm.model")
-                                    .unwrap_or_else(|| c.vllm_model.clone());
-                                let base_url = db
-                                    .config_get("vllm.base")
-                                    .unwrap_or_else(|| c.vllm_base.clone());
+                                let (base_url, model) =
+                                    resolve_llm_endpoint(toolkit_pool.as_ref(), &db, &c);
                                 let db4 = db.clone();
                                 let tx4 = cli_tx.clone();
                                 let llm_ctx = stream_ctx.clone();
                                 let opt_emitted4 = opt_emitted.clone();
                                 llm_tasks.push(tokio::spawn(async move {
-                                    // 合并模式润色推迟到此处:失败/超时回发原文兜底,
-                                    // 否则该链客户端永久"优化中"(trace 里 llm() 已记 Err)。
-                                    let opt = llm(&base_url, &model, &sys, &user_msg, Some(&llm_ctx))
-                                        .await
-                                        .unwrap_or_else(|e| {
+                                    // 合并模式润色推迟到此处:失败/超时回发原文 + fallback 标记,
+                                    // 让该链客户端落定并明确告知降级（trace 里 llm() 已记 Err）。
+                                    let (opt, fallback) = match llm(
+                                        &base_url, &model, &sys, &user_msg, Some(&llm_ctx),
+                                    )
+                                    .await
+                                    {
+                                        Ok(t) => (t, false),
+                                        Err(e) => {
                                             tracing::warn!(
                                                 "[orch] merge optimize failed for chain {seg_id}, fallback to raw: {e}"
                                             );
-                                            prim.clone()
-                                        });
+                                            (prim.clone(), true)
+                                        }
+                                    };
                                     let pass = {
                                         let mut g = opt_emitted4.lock().unwrap();
                                         if prim_len >= g.get(&seg_id).copied().unwrap_or(0) {
@@ -884,10 +998,19 @@ async fn asr_reader(mut asr_rx: AsrRx, ctx: AsrReaderCtx) -> u64 {
                                     };
                                     if pass {
                                         db4.segment_set_optimized(seg_id as i64, &opt);
+                                        let status = if fallback {
+                                            Some("fallback".into())
+                                        } else {
+                                            None
+                                        };
                                         send(
                                             &tx4,
-                                            ServerEvent::Optimized { r#ref: seg_id, text: opt }
-                                                .json(),
+                                            ServerEvent::Optimized {
+                                                r#ref: seg_id,
+                                                text: opt,
+                                                status,
+                                            }
+                                            .json(),
                                         )
                                         .await;
                                     }
@@ -917,11 +1040,14 @@ async fn asr_reader(mut asr_rx: AsrRx, ctx: AsrReaderCtx) -> u64 {
                         if seg.text != text {
                             let ctx_texts = db.segments_context_before(&session_id, t0, 20.0);
                             let sys = {
-                                let base = db
-                                    .config_get("llm.optimize_prompt")
-                                    .unwrap_or_else(|| DEFAULT_OPTIMIZE_PROMPT.into());
-                                let hw = db.config_get("asr.hotwords").unwrap_or_default();
-                                optimize_prompt_with_hotwords(base, &hw)
+                                let tmpl = resolve_prompt_text(
+                                    toolkit_pool.as_ref(),
+                                    &db,
+                                    PROMPT_NAME_OPTIMIZE,
+                                    "llm.optimize_prompt",
+                                    DEFAULT_OPTIMIZE_PROMPT,
+                                );
+                                optimize_prompt_with_hotwords(tmpl, &resolve_hotwords(&db))
                             };
                             let pname = db
                                 .config_get("asr.model")
@@ -932,16 +1058,13 @@ async fn asr_reader(mut asr_rx: AsrRx, ctx: AsrReaderCtx) -> u64 {
                                 &seg.text,
                                 Some((&pname, &sname, &text)),
                             );
-                            let model = db
-                                .config_get("vllm.model")
-                                .unwrap_or_else(|| c.vllm_model.clone());
-                            let base_url = db
-                                .config_get("vllm.base")
-                                .unwrap_or_else(|| c.vllm_base.clone());
+                            let (base_url, model) =
+                                resolve_llm_endpoint(toolkit_pool.as_ref(), &db, &c);
                             let db3 = db.clone();
                             let tx3 = cli_tx.clone();
                             let llm_ctx = stream_ctx.clone();
                             llm_tasks.push(tokio::spawn(async move {
+                                // re-polish 仅在成功时覆盖；失败不发新事件，沿用上一版优化稿。
                                 if let Ok(opt) =
                                     llm(&base_url, &model, &sys, &user_msg, Some(&llm_ctx)).await
                                 {
@@ -951,6 +1074,7 @@ async fn asr_reader(mut asr_rx: AsrRx, ctx: AsrReaderCtx) -> u64 {
                                         ServerEvent::Optimized {
                                             r#ref: seg_id,
                                             text: opt,
+                                            status: None,
                                         }
                                         .json(),
                                     )
@@ -1199,26 +1323,24 @@ async fn api_segment_rerun(
         return Json(json!({"ok": false, "error": "segment not found"}));
     };
     let text = row.text.clone();
-    let model = ctx
-        .db
-        .config_get("vllm.model")
-        .unwrap_or_else(|| ctx.cfg.vllm_model.clone());
-    let base = ctx
-        .db
-        .config_get("vllm.base")
-        .unwrap_or_else(|| ctx.cfg.vllm_base.clone());
+    let (base, model) = resolve_llm_endpoint(ctx.toolkit_pool.as_ref(), &ctx.db, &ctx.cfg);
     let opt_sys = {
-        let base = ctx
-            .db
-            .config_get("llm.optimize_prompt")
-            .unwrap_or_else(|| DEFAULT_OPTIMIZE_PROMPT.into());
-        let hw = ctx.db.config_get("asr.hotwords").unwrap_or_default();
-        optimize_prompt_with_hotwords(base, &hw)
+        let tmpl = resolve_prompt_text(
+            ctx.toolkit_pool.as_ref(),
+            &ctx.db,
+            PROMPT_NAME_OPTIMIZE,
+            "llm.optimize_prompt",
+            DEFAULT_OPTIMIZE_PROMPT,
+        );
+        optimize_prompt_with_hotwords(tmpl, &resolve_hotwords(&ctx.db))
     };
-    let tr_sys = ctx
-        .db
-        .config_get("llm.translate_prompt")
-        .unwrap_or_else(|| DEFAULT_TRANSLATE_PROMPT.into());
+    let tr_sys = resolve_prompt_text(
+        ctx.toolkit_pool.as_ref(),
+        &ctx.db,
+        PROMPT_NAME_TRANSLATE,
+        "llm.translate_prompt",
+        DEFAULT_TRANSLATE_PROMPT,
+    );
     // 管理台触发的 rerun 没有客户端 trace 上下文;不挂 trace 即可(None=不记 span)。
     let opt_fut = llm(&base, &model, &opt_sys, &text, None);
     let tr_fut = llm(&base, &model, &tr_sys, &text, None);

@@ -24,6 +24,12 @@ document.querySelectorAll("nav#tabs button").forEach((b) => {
     if (b.dataset.tab === "tasks") refreshTasks();
     if (b.dataset.tab === "douyin") refreshCreators();
     if (b.dataset.tab === "workbench") wbRefreshCreators();
+    if (b.dataset.tab === "asr") {
+      // 懒加载 ASR 控制台 iframe：首次切到「语音」tab 时才注入 src，
+      // 避免每次开主面板都建立 WS。
+      const f = $("asr-frame");
+      if (f && !f.src) f.src = "/api/asr/";
+    }
   };
 });
 

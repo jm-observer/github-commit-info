@@ -27,6 +27,9 @@ tracing-subscriber = "0.3"
 # deadpool-sqlite 对齐,迁出后该约束消失。
 rusqlite = { workspace = true, features = ["bundled"] }
 custom-utils = { workspace = true, features = ["updater", "trace"] }
+# 嵌入 toolkit-server 模式下读取公共 LLM 层的连接配置 / 提示词目录（节 A：LLM 配置收拢）。
+# 独立 bin 模式不传 pool，函数仍可工作（回退 env / app.db / 编译期默认）。
+toolkit-core = { path = "../toolkit-core" }
 
 [[bin]]
 name = "orchestrator"

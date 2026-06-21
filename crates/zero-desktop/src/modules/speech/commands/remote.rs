@@ -678,6 +678,53 @@ async fn run_one_connection(
                         let play_beep = read_lock(&llm_settings_r).notify_sound;
                         bounce_tray_twice(&app_r, play_beep);
                     }
+                    // 本地语音命令分发：
+                    //   Whole（整段就是命令，如用户停顿后说"发送"）→ 执行动作并跳过剪贴板/粘贴。
+                    //   Tail（命令挂在正文末尾，如"你好，发送"）→ 把 `text` 改成分隔符前的
+                    //     正文走原链路；命令仅在 auto_paste 模式下追加（剪贴板模式下提前
+                    //     回车会误提交空内容）。
+                    // 仅在 OptimizedZh 模式下生效（其它模式优化稿不进剪贴板，无需拦截）。
+                    let voice_cmd_on = {
+                        let s = read_lock(&llm_settings_r);
+                        s.voice_commands_enabled
+                            && matches!(s.auto_copy_mode, AutoCopyMode::OptimizedZh)
+                    };
+                    let mut pending_tail_cmd: Option<
+                        crate::modules::speech::voice_commands::VoiceCommand,
+                    > = None;
+                    let mut text = text;
+                    if voice_cmd_on {
+                        match crate::modules::speech::voice_commands::match_command(&text) {
+                            Some(crate::modules::speech::voice_commands::CommandMatch::Whole(
+                                cmd,
+                            )) => {
+                                let acted =
+                                    crate::modules::speech::voice_commands::dispatch(cmd, &text);
+                                if acted {
+                                    // 命中且真的派发了按键 → 重置剪贴板累加（避免下一段把
+                                    // 已被视为"命令"的这段当成续接拼回去），continue 跳过
+                                    // 本段后续的剪贴板写入 / 自动粘贴。
+                                    copy_acc = None;
+                                    continue;
+                                }
+                                // 未派发（前台是本进程等）→ 落回原文走默认链路。
+                            }
+                            Some(crate::modules::speech::voice_commands::CommandMatch::Tail {
+                                prefix,
+                                command,
+                            }) => {
+                                info!(
+                                    target: "speech",
+                                    "[voice_cmd] tail matched cmd={command:?} prefix_chars={} raw={:?}",
+                                    prefix.chars().count(),
+                                    text
+                                );
+                                text = prefix;
+                                pending_tail_cmd = Some(command);
+                            }
+                            None => {}
+                        }
+                    }
                     let (copy, window_ms) = {
                         let s = read_lock(&llm_settings_r);
                         (
@@ -727,6 +774,15 @@ async fn run_one_connection(
                             false,
                             rewrite_retype,
                         );
+                    }
+                    // 尾部命令：正文已通过 auto_paste 打进焦点框（do_paste 为真才会发生），
+                    // 此时再补一次回车。剪贴板模式（do_paste=false）下不补 —— 用户尚未粘贴，
+                    // 提前回车 = 提交空内容。
+                    if let Some(cmd) = pending_tail_cmd {
+                        if do_paste {
+                            let _ = crate::modules::speech::voice_commands::dispatch(cmd, "<tail>");
+                            copy_acc = None;
+                        }
                     }
                 }
                 Some("translated") => {

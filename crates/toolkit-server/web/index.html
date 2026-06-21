@@ -44,6 +44,7 @@
       <button data-tab="douyin">抖音（调试）</button>
       <button data-tab="tasks">任务</button>
       <button data-tab="kb">知识库</button>
+      <button data-tab="asr">语音</button>
     </nav>
 
     <main>
@@ -236,6 +237,12 @@
           <button id="kb-btn">publish</button>
           <pre id="kb-out">—</pre>
         </div>
+      </section>
+
+      <!-- ===== 语音（orchestrator 控制台 iframe） ===== -->
+      <section id="tab-asr">
+        <iframe id="asr-frame" title="语音控制台"
+                style="width:100%; height:calc(100vh - 160px); border:0; background:var(--bg);"></iframe>
       </section>
     </main>
 

@@ -23,6 +23,10 @@ fn default_notify_sound() -> bool {
     true
 }
 
+fn default_voice_commands_enabled() -> bool {
+    true
+}
+
 #[derive(Serialize, Deserialize, Clone, PartialEq)]
 pub struct LlmSettings {
     #[serde(default)]
@@ -46,6 +50,10 @@ pub struct LlmSettings {
     /// 程序启动（语音页就绪）时是否自动开始识别录音。
     #[serde(default)]
     pub auto_start: bool,
+    /// 本地语音命令开关：优化稿命中固定短语（如"发送"）时执行对应动作而非进剪贴板。
+    /// 默认开启；UI 可后续暴露开关。详见 [`crate::modules::speech::voice_commands`]。
+    #[serde(default = "default_voice_commands_enabled")]
+    pub voice_commands_enabled: bool,
 }
 
 impl Default for LlmSettings {
@@ -58,6 +66,7 @@ impl Default for LlmSettings {
             auto_paste: false,
             auto_paste_rewrite_retype: false,
             auto_start: false,
+            voice_commands_enabled: true,
         }
     }
 }

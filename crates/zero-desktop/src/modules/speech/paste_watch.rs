@@ -59,6 +59,21 @@ pub fn type_text_with_backspaces_to_foreground(backspaces: usize, text: &str) ->
     }
 }
 
+/// 向当前前台窗口的焦点控件发一次回车键（语音命令"发送" → Enter）。
+///
+/// 与 [`type_text_to_foreground`] 共用「前台属于本进程时不动」的安全闸——避免用户正在
+/// Zero Desktop 自己的输入里时被误触发。返回是否真的发出了按键。
+pub fn press_enter_to_foreground() -> bool {
+    #[cfg(windows)]
+    {
+        win::press_enter()
+    }
+    #[cfg(not(windows))]
+    {
+        false
+    }
+}
+
 #[cfg(windows)]
 mod win {
     use super::PASTE_SIGNAL;
@@ -66,7 +81,9 @@ mod win {
     use std::sync::atomic::Ordering;
     use tracing::{error, info};
     use windows_sys::Win32::Foundation::{LPARAM, LRESULT, WPARAM};
-    use windows_sys::Win32::UI::Input::KeyboardAndMouse::{GetAsyncKeyState, VK_BACK, VK_CONTROL};
+    use windows_sys::Win32::UI::Input::KeyboardAndMouse::{
+        GetAsyncKeyState, VK_BACK, VK_CONTROL, VK_RETURN,
+    };
     use windows_sys::Win32::UI::WindowsAndMessaging::{
         CallNextHookEx, GetMessageW, SetWindowsHookExW, HC_ACTION, KBDLLHOOKSTRUCT, MSG,
         WH_KEYBOARD_LL, WM_KEYDOWN, WM_SYSKEYDOWN,
@@ -138,6 +155,28 @@ mod win {
                     dwExtraInfo: 0,
                 },
             },
+        }
+    }
+
+    /// 向焦点窗口发一次回车键。共用 [`type_text_with_backspaces`] 的本进程护栏。
+    pub fn press_enter() -> bool {
+        unsafe {
+            let fg = GetForegroundWindow();
+            if fg.is_null() {
+                return false;
+            }
+            let mut pid: u32 = 0;
+            GetWindowThreadProcessId(fg, &mut pid);
+            if pid == GetCurrentProcessId() {
+                return false;
+            }
+            let inputs = [vk_input(VK_RETURN, false), vk_input(VK_RETURN, true)];
+            let sent = SendInput(
+                inputs.len() as u32,
+                inputs.as_ptr(),
+                std::mem::size_of::<INPUT>() as i32,
+            );
+            sent as usize == inputs.len()
         }
     }
 

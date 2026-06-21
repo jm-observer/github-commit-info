@@ -74,8 +74,8 @@ async fn forward(
     in_headers: &HeaderMap,
     body: Bytes,
 ) -> Result<Response, reqwest::Error> {
-    let rmethod = reqwest::Method::from_bytes(method.as_str().as_bytes())
-        .unwrap_or(reqwest::Method::GET);
+    let rmethod =
+        reqwest::Method::from_bytes(method.as_str().as_bytes()).unwrap_or(reqwest::Method::GET);
     let mut req = client().request(rmethod, url).body(body.to_vec());
 
     // 透传请求头：剥掉 hop-by-hop 头 + host（reqwest 自己填）。
