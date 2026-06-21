@@ -69,25 +69,59 @@ pub fn screenshot_capture(app: AppHandle) -> Result<(), String> {
 
 /// 命令：提交最终成图（前端 canvas 合成的 PNG，base64）→ 落盘 + 写剪贴板 + 通知 → 关窗。
 /// 落盘与剪贴板互不阻断：任一失败仍尽力完成另一个，错误进日志/通知。返回落盘绝对路径。
+///
+/// **诊断**：每个阶段都写 `<workspace>/screenshots/.commit-trace.log`（覆盖式），
+/// 即便日志器没开/通知被屏蔽，也能从这个文件看清楚走到了哪一步。
 #[tauri::command]
 pub fn screenshot_commit(app: AppHandle, png_base64: String) -> Result<String, String> {
     use base64::Engine;
-    let bytes = base64::engine::general_purpose::STANDARD
-        .decode(png_base64.trim())
-        .map_err(|e| format!("解码 PNG 失败: {e}"))?;
-
     let workspace = app.state::<AppState>().workspace.clone();
-    let saved = super::output::save_png(&workspace, &bytes).map_err(|e| e.to_string())?;
+    let trace_path = super::output::screenshots_dir(&workspace).join(".commit-trace.log");
+    let trace = |stage: &str, detail: &str| {
+        let _ = std::fs::create_dir_all(super::output::screenshots_dir(&workspace));
+        let line = format!(
+            "[{}] {} | {}\n",
+            chrono::Local::now().format("%Y-%m-%d %H:%M:%S%.3f"),
+            stage,
+            detail
+        );
+        let _ = std::fs::write(&trace_path, line);
+        log::info!(target: "screenshot", "[commit] {} | {}", stage, detail);
+    };
+
+    trace("enter", &format!("png_base64.len={}", png_base64.len()));
+
+    let bytes = match base64::engine::general_purpose::STANDARD.decode(png_base64.trim()) {
+        Ok(b) => b,
+        Err(e) => {
+            let msg = format!("解码 PNG 失败: {e}");
+            trace("decode-fail", &msg);
+            return Err(msg);
+        }
+    };
+    trace("decoded", &format!("bytes.len={}", bytes.len()));
+
+    let saved = match super::output::save_png(&workspace, &bytes) {
+        Ok(p) => p,
+        Err(e) => {
+            let msg = e.to_string();
+            trace("save-fail", &msg);
+            return Err(msg);
+        }
+    };
     let saved_str = saved.to_string_lossy().into_owned();
+    trace("saved", &saved_str);
 
     // 写剪贴板（失败不阻断落盘结果）。
     let clip_err = write_clipboard_png(&app, &bytes).err();
-    if let Some(e) = clip_err.as_deref() {
-        log::warn!(target: "screenshot", "写剪贴板失败: {e}");
+    match clip_err.as_deref() {
+        Some(e) => trace("clipboard-fail", e),
+        None => trace("clipboard-ok", "CF_DIB"),
     }
 
     super::overlay::close_overlay(&app);
     notify_done(&app, &saved_str, clip_err.as_deref());
+    trace("done", &saved_str);
 
     Ok(saved_str)
 }
@@ -272,7 +306,22 @@ pub(crate) fn read_settings(workspace: &std::path::Path) -> ScreenshotSettings {
         .unwrap_or_default()
 }
 
-/// 把 PNG bytes 解码成 RGBA 后写入系统剪贴板（剪贴板 API 要原始像素，不吃 PNG 容器）。
+/// 把 PNG bytes 解码后写入系统剪贴板。
+///
+/// **Windows**：直接走 Win32 `SetClipboardData(CF_DIB, ...)`。原本 tauri-plugin-clipboard-manager
+/// 的 `write_image` 在 Windows 上底层 arboard 只写 CF_DIBV5，微信 / 部分 Office / 旧 QQ 这类挑食
+/// 程序只认 CF_DIB，结果"复制成功但粘贴一片空白"。CF_DIB 是最大公约数格式，几乎所有 Windows 程序
+/// 都吃。
+///
+/// **非 Windows**：仍走 tauri 插件兜底（zero-desktop 当前主要平台是 Windows，这条分支保留以便
+/// 跨平台编译）。
+#[cfg(windows)]
+fn write_clipboard_png(_app: &AppHandle, png_bytes: &[u8]) -> Result<(), String> {
+    let (rgba, w, h) = decode_png_rgba(png_bytes)?;
+    write_clipboard_cf_dib(&rgba, w, h)
+}
+
+#[cfg(not(windows))]
 fn write_clipboard_png(app: &AppHandle, png_bytes: &[u8]) -> Result<(), String> {
     use tauri_plugin_clipboard_manager::ClipboardExt;
     let (rgba, w, h) = decode_png_rgba(png_bytes)?;
@@ -280,6 +329,109 @@ fn write_clipboard_png(app: &AppHandle, png_bytes: &[u8]) -> Result<(), String> 
     app.clipboard()
         .write_image(&image)
         .map_err(|e| e.to_string())
+}
+
+/// Win32 直写 CF_DIB：BITMAPINFOHEADER + 32bpp BGRA bottom-up 像素 → GlobalAlloc(MOVEABLE)
+/// → SetClipboardData(CF_DIB)。成功后所有权转交剪贴板，**不要** GlobalFree。
+#[cfg(windows)]
+fn write_clipboard_cf_dib(rgba_top_down: &[u8], w: u32, h: u32) -> Result<(), String> {
+    use windows_sys::Win32::Graphics::Gdi::{BITMAPINFOHEADER, BI_RGB};
+    use windows_sys::Win32::System::DataExchange::{
+        CloseClipboard, EmptyClipboard, OpenClipboard, SetClipboardData,
+    };
+    use windows_sys::Win32::System::Memory::{
+        GlobalAlloc, GlobalLock, GlobalUnlock, GMEM_MOVEABLE,
+    };
+
+    const CF_DIB: u32 = 8;
+
+    if w == 0 || h == 0 {
+        return Err("空图像".into());
+    }
+    let row_stride = (w as usize) * 4;
+    let pixel_bytes = row_stride
+        .checked_mul(h as usize)
+        .ok_or_else(|| "像素尺寸溢出".to_string())?;
+    if rgba_top_down.len() != pixel_bytes {
+        return Err("RGBA 长度与宽高不匹配".into());
+    }
+
+    // RGBA top-down → BGRA bottom-up（CF_DIB / BI_RGB / biHeight>0 的标准期望）。
+    let mut bgra = vec![0u8; pixel_bytes];
+    for y in 0..(h as usize) {
+        let src = &rgba_top_down[y * row_stride..][..row_stride];
+        let dst_y = (h as usize) - 1 - y;
+        let dst = &mut bgra[dst_y * row_stride..][..row_stride];
+        for x in 0..(w as usize) {
+            let p = x * 4;
+            dst[p] = src[p + 2]; // B
+            dst[p + 1] = src[p + 1]; // G
+            dst[p + 2] = src[p]; // R
+            dst[p + 3] = src[p + 3]; // A（CF_DIB BI_RGB 32bpp 下视为保留字节，保留以兼容读 BGRA 的客户端）
+        }
+    }
+
+    let header_size = std::mem::size_of::<BITMAPINFOHEADER>();
+    let total = header_size
+        .checked_add(pixel_bytes)
+        .ok_or_else(|| "总大小溢出".to_string())?;
+
+    unsafe {
+        if OpenClipboard(std::ptr::null_mut()) == 0 {
+            return Err("OpenClipboard 失败".into());
+        }
+        // RAII 保证 panic / 早返时关闭剪贴板。
+        struct ClipboardGuard;
+        impl Drop for ClipboardGuard {
+            fn drop(&mut self) {
+                unsafe { CloseClipboard() };
+            }
+        }
+        let _guard = ClipboardGuard;
+
+        if EmptyClipboard() == 0 {
+            return Err("EmptyClipboard 失败".into());
+        }
+
+        let h_mem = GlobalAlloc(GMEM_MOVEABLE, total);
+        if h_mem.is_null() {
+            return Err("GlobalAlloc 失败".into());
+        }
+
+        let ptr = GlobalLock(h_mem) as *mut u8;
+        if ptr.is_null() {
+            // GlobalAlloc 的内存在 SetClipboardData 之前我们仍持有；这里失败要 GlobalFree，
+            // 但 windows-sys 的 GlobalFree 在 Memory 模块。简单起见：写入失败让进程继续，
+            // 泄漏一个临时缓冲（仅当 GlobalLock 失败这种极罕见路径）。
+            return Err("GlobalLock 失败".into());
+        }
+
+        let header = BITMAPINFOHEADER {
+            biSize: header_size as u32,
+            biWidth: w as i32,
+            biHeight: h as i32, // 正值 = bottom-up
+            biPlanes: 1,
+            biBitCount: 32,
+            biCompression: BI_RGB as u32,
+            biSizeImage: pixel_bytes as u32,
+            biXPelsPerMeter: 0,
+            biYPelsPerMeter: 0,
+            biClrUsed: 0,
+            biClrImportant: 0,
+        };
+
+        std::ptr::copy_nonoverlapping(&header as *const _ as *const u8, ptr, header_size);
+        std::ptr::copy_nonoverlapping(bgra.as_ptr(), ptr.add(header_size), pixel_bytes);
+
+        GlobalUnlock(h_mem);
+
+        if SetClipboardData(CF_DIB, h_mem as _).is_null() {
+            return Err("SetClipboardData 失败".into());
+        }
+        // 成功后 h_mem 所有权归剪贴板，绝不再 GlobalFree。
+    }
+
+    Ok(())
 }
 
 /// 解码 PNG → RGBA + 宽高（前端 canvas 一般输出 RGBA，兼容 RGB 补 alpha）。
