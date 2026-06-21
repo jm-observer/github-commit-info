@@ -69,7 +69,9 @@ export default function OverlayApp() {
     composePng(img, s, shapes, window.innerWidth, window.innerHeight)
       .then((b64) => invoke("screenshot_commit", { pngBase64: b64 }))
       .catch((e) => {
+        // overlay 的 devtools 一般看不到 → 也用 alert 直接弹给用户，便于诊断"按完成无反应"。
         console.error("[overlay] commit failed", e);
+        try { alert(`截图提交失败：${String(e)}`); } catch {}
         cancel();
       });
   }, [shapes, cancel]);
@@ -180,6 +182,7 @@ export default function OverlayApp() {
       <img
         ref={imgRef}
         src={frame.src}
+        crossOrigin="anonymous"
         draggable={false}
         alt="frozen"
         style={{
