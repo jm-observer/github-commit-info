@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useState } from 'react'
+import { useCallback, useState } from 'react'
 import {
   Activity,
   RefreshCw,
@@ -14,26 +14,19 @@ import {
 } from 'lucide-react'
 import {
   NetPolicyAPI,
-  type Status,
-  type VerifyReport,
   type VerifyCase,
-  type ConnectionsSnapshot,
   type ProcessCandidate,
 } from '../api/tauri-client'
+import { useNetPolicyProbe } from '../ProbeContext'
 
 /**
- * 本机现状查询区（只读 · 进页自动查 · 不改系统）。
+ * 本机现状查询区（只读 · 不改系统）。
  *
- * 进页挂载即调一组**纯只读**命令（不触发任何 apply / 不改系统）：
- *  - net_policy_verify   → 当前出口 IP / DNS 是否被劫持(fake-ip) / mihomo 控制器可达
- *  - net_policy_get_status → 防火墙状态 / TUN 起栈 / WG 已配
- *  - net_policy_connections → 活跃连接按出口聚合
- *  - net_policy_list_process_candidates → 按钮触发（枚举略重，不自动跑）
+ * 数据全部来自 `NetPolicyProbeProvider`（在 App 根挂载，启动即跑 verify + status + conns）。
+ * 本组件不再自己跑 verify ——切到此页时数据已就位，不再有 ~1s 等待。
+ * 「刷新现状」按钮 → 调 provider.runVerify()（单飞合并，跨页面共享）。
  *
- * 这些查询**不需要先应用网络策略**——出口 IP / DNS / 防火墙状态 / 进程都是查本机现状。
- * 本区不持有任何写命令，仅展示 + 「刷新现状」 + 「最后更新时间」。
- *
- * status 的快轮询仍在父组件（3s）；本区在挂载与「刷新现状」时拉一次重探测（verify）。
+ * 进程候选枚举（略重）仍是本组件按钮触发，不自动跑，也不进 provider（独立 ProcessCandidate UI 状态）。
  */
 
 type CaseTone = 'ok' | 'bad' | 'unknown'
@@ -80,49 +73,22 @@ function StatCard({
 }
 
 export function CurrentStateSection({
-  status,
-  conns,
   busy,
-  onVerify,
-  onExitIp,
 }: {
-  status: Status | null
-  conns: ConnectionsSnapshot
   /** 父级 busy（写动作进行中），让本区按钮也禁用避免并发 PS。 */
   busy: boolean
-  /** 把最新 verify 报告回传父级（VerifyMatrix 共用）。 */
-  onVerify?: (rep: VerifyReport) => void
-  /** 探到出口 IP 时回传父级（ProtectionBanner 共用）。 */
-  onExitIp?: (ip: string, at: string) => void
 }) {
-  const [verify, setVerify] = useState<VerifyReport | null>(null)
+  const { status, conns, verify, verifyUpdatedAt, probing, runVerify } = useNetPolicyProbe()
   const [candidates, setCandidates] = useState<ProcessCandidate[] | null>(null)
-  const [probing, setProbing] = useState(false)
   const [scanning, setScanning] = useState(false)
-  const [updatedAt, setUpdatedAt] = useState<string | null>(null)
   const [err, setErr] = useState<string | null>(null)
 
-  // 只读重探测：verify（出口 IP / DNS / 控制器）。挂载自动跑一次。
+  // 「刷新现状」→ provider.runVerify（单飞合并，自带 exit-ip 回填到 ProtectionBanner）。
   const probe = useCallback(async () => {
-    setProbing(true)
     setErr(null)
-    try {
-      const rep = await NetPolicyAPI.verify()
-      setVerify(rep)
-      onVerify?.(rep)
-      setUpdatedAt(new Date().toLocaleTimeString())
-      const ip = rep.cases.find((c) => c.id === 'exit-ip')
-      if (ip && ip.status === 'passed') onExitIp?.(ip.observed, new Date().toLocaleTimeString())
-    } catch (e) {
-      setErr(String(e))
-    } finally {
-      setProbing(false)
-    }
-  }, [onVerify, onExitIp])
-
-  useEffect(() => {
-    void probe()
-  }, [probe])
+    const rep = await runVerify()
+    if (rep == null) setErr('探测失败（见控制台）')
+  }, [runVerify])
 
   // 进程候选枚举（略重）：按钮触发，不自动跑。
   const scanProcesses = useCallback(async () => {
@@ -151,9 +117,9 @@ export function CurrentStateSection({
       <div className="flex flex-wrap items-center gap-x-3 gap-y-1 border-b border-gray-200 px-4 py-2 dark:border-gray-800">
         <Search size={15} className="text-gray-500" />
         <h2 className="text-sm font-semibold">本机现状（只读 · 不改系统）</h2>
-        <span className="text-[11px] text-gray-400">进页自动查；可随时刷新查看当前真实状态</span>
+        <span className="text-[11px] text-gray-400">App 启动即在后台预探测；切到此页直接展示</span>
         <span className="ml-auto flex items-center gap-1.5 text-xs text-gray-500 dark:text-gray-400">
-          {updatedAt ? `最后更新 ${updatedAt}` : '查询中…'}
+          {verifyUpdatedAt ? `最后更新 ${verifyUpdatedAt}` : '查询中…'}
         </span>
         <button
           className="inline-flex items-center gap-1.5 rounded-md border border-gray-300 px-3 py-1.5 text-sm transition-colors hover:bg-gray-100 disabled:opacity-50 dark:border-gray-700 dark:hover:bg-gray-800"

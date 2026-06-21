@@ -13,10 +13,12 @@ import SettingsPage from "./modules/settings/SettingsPage";
 import MusicPage from "./modules/music/MusicPage";
 import ScreenshotPage from "./modules/screenshot/ScreenshotPage";
 import { MusicPlayerProvider } from "./modules/music/PlayerContext";
+import { NetPolicyProbeProvider } from "./modules/net-policy/ProbeContext";
 
 export default function App() {
   return (
     <MusicPlayerProvider>
+      <NetPolicyProbeProvider>
       <BrowserRouter>
         <Routes>
           <Route path="/" element={<ShellLayout />}>
@@ -37,6 +39,7 @@ export default function App() {
           </Route>
         </Routes>
       </BrowserRouter>
+      </NetPolicyProbeProvider>
     </MusicPlayerProvider>
   );
 }

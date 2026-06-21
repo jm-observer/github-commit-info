@@ -8,30 +8,19 @@ import {
   type Rule,
   type RuleKind,
   type Route,
-  type VerifyReport,
-  type ConnectionsSnapshot,
 } from './api/tauri-client'
 import { ProtectionBanner } from './components/ProtectionBanner'
 import { FlowTopology } from './components/FlowTopology'
 import { ApplyStepper } from './components/ApplyStepper'
 import { VerifyMatrix } from './components/VerifyMatrix'
 import { CurrentStateSection } from './components/CurrentStateSection'
+import { useNetPolicyProbe } from './ProbeContext'
 
 const KIND_LABELS: Record<RuleKind, string> = {
   'process-path': '程序路径',
   'process-name': '程序名',
   'domain-suffix': '域名后缀',
   'ip-cidr': 'IP/CIDR',
-}
-
-const EMPTY_CONNS: ConnectionsSnapshot = {
-  available: false,
-  total: 0,
-  wg_count: 0,
-  direct_count: 0,
-  other_count: 0,
-  by_process: {},
-  connections: [],
 }
 
 // 首屏占位状态：让全景图在真实探测（~1s 的 PS 调用）回来前就能立刻渲染出「全灰/未起」骨架，
@@ -72,65 +61,39 @@ function btn(variant: 'primary' | 'danger' | 'ghost' = 'ghost') {
 // ── 主页面（编排） ────────────────────────────────────────────────────────────
 
 export default function NetPolicyPage() {
-  const [status, setStatus] = useState<Status | null>(null)
-  const [conns, setConns] = useState<ConnectionsSnapshot>(EMPTY_CONNS)
+  // status / conns / verify / exitIp 由全局 NetPolicyProbeProvider 持有（App 启动即跑、跨页面持续轮询）。
+  // 本页只管 settings / rules / busy / msg / 新规则草稿。
+  const {
+    status,
+    conns,
+    verify,
+    exitIp,
+    exitIpAt,
+    refreshFast,
+    runVerify: runVerifyProbe,
+  } = useNetPolicyProbe()
   const [settings, setSettings] = useState<Settings | null>(null)
   const [rules, setRules] = useState<RuleSet>({ rules: [], groups: [] })
-  const [verify, setVerify] = useState<VerifyReport | null>(null)
-  const [exitIp, setExitIp] = useState<string | null>(null)
-  const [exitIpAt, setExitIpAt] = useState<string | null>(null)
   const [busy, setBusy] = useState(false)
   const [msg, setMsg] = useState<{ kind: 'ok' | 'err'; text: string } | null>(null)
 
   const [newRule, setNewRule] = useState<Rule>({ kind: 'process-name', value: '', route: 'direct' })
   const wgFileRef = useRef<HTMLInputElement>(null)
-  const statusInFlightRef = useRef<Promise<void> | null>(null)
 
   const flash = (kind: 'ok' | 'err', text: string) => {
     setMsg({ kind, text })
     setTimeout(() => setMsg(null), 5000)
   }
 
-  const loadStatus = useCallback(() => {
-    if (statusInFlightRef.current) return statusInFlightRef.current
-
-    const req = NetPolicyAPI.getStatus()
-      .then(setStatus)
-      .catch(() => {})
-      .finally(() => {
-        statusInFlightRef.current = null
-      })
-    statusInFlightRef.current = req
-    return req
-  }, [])
-
-  // 快轮询数据（便宜的本地查询）：status + connections。出口 IP / DNS 等重探测不在此。
-  const pollFast = useCallback(async () => {
-    try {
-      const [, c] = await Promise.all([loadStatus(), NetPolicyAPI.getConnections()])
-      setConns(c)
-    } catch {
-      // 轮询失败不弹 toast（避免刷屏）；保留上次值。
-    }
-  }, [loadStatus])
-
-  // 完整加载（含 settings / rules，动作后用）。
-  // **各请求独立 setState、不再 Promise.all 整体等待**：便宜的 settings/rules（读文件）先到先显，
-  // 慢的 status（~1s 的 PS 探测）/conns 后到补齐。否则首屏全景图被最慢的 status 拖住，无法秒出。
+  // 「刷新」按钮：除 provider 的快探测外，把本页持有的 settings/rules 也重读一次（动作后兜底刷新）。
+  // settings/rules 是读文件，便宜；status/conns 走 provider 的合并请求，不会重复打 PS。
   const refresh = useCallback(() => {
-    void loadStatus()
-    void NetPolicyAPI.getConnections().then(setConns).catch(() => {})
+    refreshFast()
     void NetPolicyAPI.getSettings().then(setSettings).catch(() => {})
     void NetPolicyAPI.listRules().then(setRules).catch(() => {})
-  }, [loadStatus])
+  }, [refreshFast])
 
   useEffect(() => { void refresh() }, [refresh])
-
-  // 3s 快轮询：仅 status + connections，组件卸载时清理。
-  useEffect(() => {
-    const id = window.setInterval(() => { void pollFast() }, 3000)
-    return () => window.clearInterval(id)
-  }, [pollFast])
 
   const importWgConf = useCallback(async (file: File) => {
     try {
@@ -170,23 +133,12 @@ export default function NetPolicyPage() {
     run('删除规则', async () => setRules(await NetPolicyAPI.deleteRule(index)))
 
   // 验证（含 exit-ip / dns-hijack）：手动触发，重探测不进 3s 快轮询。
-  // 现状区挂载/「刷新现状」会自动跑 verify 并经 onVerify/onExitIp 回填这里；
-  // VerifyMatrix 的「一键自检」也复用此函数。
+  // provider 已在 App 启动时跑过一次 verify；本按钮和 VerifyMatrix 的「一键自检」复用 provider
+  // 的 runVerify（自带单飞 + 自动回填出口 IP）。
   const runVerify = () =>
     run('验证', async () => {
-      const rep = await NetPolicyAPI.verify()
-      handleVerify(rep)
+      await runVerifyProbe()
     })
-
-  // 现状区/自检共用的 verify 结果回填。
-  const handleVerify = (rep: VerifyReport) => {
-    setVerify(rep)
-    const ip = rep.cases.find(c => c.id === 'exit-ip')
-    if (ip && ip.status === 'passed') {
-      setExitIp(ip.observed)
-      setExitIpAt(new Date().toLocaleTimeString())
-    }
-  }
 
   return (
     <div className="mx-auto max-w-4xl space-y-5">
@@ -223,14 +175,9 @@ export default function NetPolicyPage() {
         {/* 保护状态横幅（汇总当前真实保护态） */}
         {status && <ProtectionBanner status={status} exitIp={exitIp} exitIpAt={exitIpAt} />}
 
-        {/* 本机现状只读查询区：出口 IP / DNS / 控制器 / 防火墙 / TUN / WG / 活跃连接 / 进程候选 */}
-        <CurrentStateSection
-          status={status}
-          conns={conns}
-          busy={busy}
-          onVerify={handleVerify}
-          onExitIp={(ip, at) => { setExitIp(ip); setExitIpAt(at) }}
-        />
+        {/* 本机现状只读查询区：出口 IP / DNS / 控制器 / 防火墙 / TUN / WG / 活跃连接 / 进程候选
+            数据全部来自 NetPolicyProbeProvider（App 启动即跑），切到此页时直接展示，不再触发 verify。 */}
+        <CurrentStateSection busy={busy} />
 
         {/* 数据通路全景图：节点标注「现状可查 / 应用后才有」。占位状态立即渲染骨架。 */}
         <FlowTopology status={status ?? LOADING_STATUS} conns={conns} settings={settings} />
