@@ -11,6 +11,8 @@ const TTS_TIMEOUT: Duration = Duration::from_secs(180);
 const VOICES_TIMEOUT: Duration = Duration::from_secs(30);
 /// 替换上传（小 WAV）。
 const REPLACE_TIMEOUT: Duration = Duration::from_secs(60);
+/// 跟读判分：上传短 clip + FunASR 转写（单机串行可能排队），给足 90s。
+const SHADOW_TIMEOUT: Duration = Duration::from_secs(90);
 /// 预览 WAV 落盘文件名（每次生成覆盖；前端用查询串做缓存击穿）。
 const PREVIEW_FILE: &str = "_tts_preview.wav";
 
@@ -163,6 +165,117 @@ pub async fn english_tts_preview(
         .map_err(|e| format!("落盘预览失败: {e}"))?;
 
     Ok(out_path.to_string_lossy().into_owned())
+}
+
+/// 跟读判分：把用户录音（`audio` 字节 + `mime`）+ 单元元信息 POST 到 toolkit-server
+/// `/api/web/shadow/score`（元信息走 query、音频走 raw body），回传判分 JSON
+/// （`{transcript, score, passed, words, stat, asr_model}`）。设计见 docs/english-shadow-design.md。
+#[tauri::command]
+#[allow(clippy::too_many_arguments)]
+pub async fn english_shadow_score(
+    state: State<'_, AppState>,
+    audio: Vec<u8>,
+    mime: String,
+    customer_id: i64,
+    kind: String,
+    sentence_id: i64,
+    word_index: Option<i64>,
+    ref_text: String,
+    threshold: Option<f64>,
+) -> Result<serde_json::Value, String> {
+    if audio.is_empty() {
+        return Err("录音为空".to_string());
+    }
+    if ref_text.trim().is_empty() {
+        return Err("参考文本为空".to_string());
+    }
+    let resolved = state.net.resolve(&state.workspace).await;
+    let endpoint = resolved
+        .shadow_score_endpoint()
+        .ok_or_else(|| "G10 base 未配置，请到设置页填写局域网/外网地址".to_string())?;
+
+    // query 参数（reqwest 负责 URL 编码 ref_text 等）。可选项按 Some 才追加。
+    let mut query: Vec<(&str, String)> = vec![
+        ("customer_id", customer_id.to_string()),
+        ("kind", kind),
+        ("sentence_id", sentence_id.to_string()),
+        ("ref_text", ref_text),
+        ("mime", mime.clone()),
+    ];
+    if let Some(wi) = word_index {
+        query.push(("word_index", wi.to_string()));
+    }
+    if let Some(th) = threshold {
+        query.push(("threshold", th.to_string()));
+    }
+
+    let client = reqwest::Client::builder()
+        .timeout(SHADOW_TIMEOUT)
+        .build()
+        .map_err(|e| e.to_string())?;
+    let mut req = client
+        .post(&endpoint)
+        .query(&query)
+        .header(reqwest::header::CONTENT_TYPE, mime)
+        .body(audio);
+    if let Some(tok) = resolved.g10_token.as_deref().filter(|s| !s.is_empty()) {
+        req = req.bearer_auth(tok);
+    }
+    let resp = req.send().await.map_err(|e| format!("判分请求失败: {e}"))?;
+    let status = resp.status();
+    let text = resp
+        .text()
+        .await
+        .map_err(|e| format!("读判分响应失败: {e}"))?;
+    if !status.is_success() {
+        return Err(map_status_err("跟读判分失败", status, &text));
+    }
+    serde_json::from_str(&text).map_err(|e| format!("解析判分 JSON 失败: {e}"))
+}
+
+/// 批量回读跟读统计：GET toolkit-server `/api/web/shadow/stats`，回传
+/// `{stats: [{kind, sentence_id, word_index?, success_count, fail_count, ...}]}`。
+#[tauri::command]
+pub async fn english_shadow_stats(
+    state: State<'_, AppState>,
+    customer_id: i64,
+    sentence_ids: Vec<i64>,
+) -> Result<serde_json::Value, String> {
+    if sentence_ids.is_empty() {
+        return Ok(serde_json::json!({ "stats": [] }));
+    }
+    let resolved = state.net.resolve(&state.workspace).await;
+    let endpoint = resolved
+        .shadow_stats_endpoint()
+        .ok_or_else(|| "G10 base 未配置，请到设置页填写局域网/外网地址".to_string())?;
+
+    let ids = sentence_ids
+        .iter()
+        .map(|i| i.to_string())
+        .collect::<Vec<_>>()
+        .join(",");
+
+    let client = reqwest::Client::builder()
+        .timeout(VOICES_TIMEOUT)
+        .build()
+        .map_err(|e| e.to_string())?;
+    let mut req = client.get(&endpoint).query(&[
+        ("customer_id", customer_id.to_string()),
+        ("sentence_ids", ids),
+    ]);
+    if let Some(tok) = resolved.g10_token.as_deref().filter(|s| !s.is_empty()) {
+        req = req.bearer_auth(tok);
+    }
+    let resp = req.send().await.map_err(|e| format!("查询统计失败: {e}"))?;
+    let status = resp.status();
+    let text = resp
+        .text()
+        .await
+        .map_err(|e| format!("读统计响应失败: {e}"))?;
+    if !status.is_success() {
+        return Err(map_status_err("查询统计失败", status, &text));
+    }
+    serde_json::from_str(&text).map_err(|e| format!("解析统计 JSON 失败: {e}"))
 }
 
 /// 确认替换：读取预览 WAV 文件（`preview_path`，须为上一步 english_tts_preview 落盘的预览文件），

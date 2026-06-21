@@ -12,6 +12,7 @@ douyin = { path = "../douyin" }
 # nest 到 /api/asr 下,ASR 与工具 API 共用 toolkit-server 单端口单入口。
 orchestrator = { path = "../orchestrator" }
 audio-clean-client = { path = "../audio-clean-client" }
+asr-client = { path = "../asr-client" }
 agent-session = { workspace = true }
 codeloop-core = { workspace = true }
 anyhow = { workspace = true }

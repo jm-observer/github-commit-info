@@ -120,4 +120,37 @@ CREATE TABLE IF NOT EXISTS llm_prompts (
     builtin_hash TEXT,
     updated_at   TEXT NOT NULL
 );
+
+-- English 跟读判分明细：每次跟读尝试一行（可回看 / 调阈值后重算）。kind=sentence|word；
+-- word 模式 word_index 为句内词序号，sentence 模式为 NULL。纯加表、IF NOT EXISTS 幂等，
+-- 同 codeloop_io / llm_*，不 bump SCHEMA_VERSION。见 docs/english-shadow-design.md §7。
+CREATE TABLE IF NOT EXISTS shadow_attempt (
+    id          TEXT PRIMARY KEY,
+    customer_id INTEGER NOT NULL,
+    kind        TEXT    NOT NULL,
+    sentence_id INTEGER NOT NULL,
+    word_index  INTEGER,
+    ref_text    TEXT    NOT NULL,
+    transcript  TEXT,
+    score       REAL    NOT NULL,
+    passed      INTEGER NOT NULL,
+    created_at  TEXT    NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_shadow_attempt_unit
+    ON shadow_attempt(customer_id, sentence_id, word_index);
+
+-- English 跟读单元累计统计（读取快；由 attempt 累加维护，可随时按 attempt 重建）。
+-- word_index 用 -1 占位代表「整句」单元，以进入复合主键。
+CREATE TABLE IF NOT EXISTS shadow_stat (
+    customer_id   INTEGER NOT NULL,
+    kind          TEXT    NOT NULL,
+    sentence_id   INTEGER NOT NULL,
+    word_index    INTEGER NOT NULL DEFAULT -1,
+    success_count INTEGER NOT NULL DEFAULT 0,
+    fail_count    INTEGER NOT NULL DEFAULT 0,
+    last_score    REAL,
+    last_passed   INTEGER,
+    last_at       TEXT,
+    PRIMARY KEY (customer_id, sentence_id, word_index, kind)
+);
 "#;

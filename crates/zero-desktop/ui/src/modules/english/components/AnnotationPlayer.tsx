@@ -5,6 +5,7 @@
 import { useState, useEffect, useRef } from 'react'
 import { Loader2, AlertCircle, RefreshCw, Music } from 'lucide-react'
 import AudioPlayer from './AudioPlayer'
+import ShadowPanel from '../shadow/ShadowPanel'
 import { AudioPlayerService } from '../services/AudioPlayerService'
 import ApiService from '../services/ApiService'
 import FileCacheManager from '../services/FileCacheManager'
@@ -265,7 +266,11 @@ export default function AnnotationPlayer({ autoStart = true, dataSource = 'annot
 
       {/* 播放器 UI（只在 AudioPlayerService 已初始化后渲染） */}
       {initialized && (
-        <AudioPlayer showAnnotation={true} showReport={true} showOptions={true} />
+        <>
+          <AudioPlayer showAnnotation={true} showReport={true} showOptions={true} />
+          {/* 跟读判分（静默叠加在播放循环上；默认关，开关在面板内） */}
+          <ShadowPanel />
+        </>
       )}
     </div>
   )

@@ -33,8 +33,12 @@ export class AudioPlayerService {
   private eventListeners: Record<AudioPlayerEventType, Array<(data: any) => void>> = {
     onPlayStateChange: [], onStatusTextChange: [], onSentenceChange: [],
     onPlayComplete: [], onPlayNext: [], onPlayPrevious: [], onToggleAnnotation: [],
-    onToggleReportError: [], onPlayCountChange: [], onTextToggle: []
+    onToggleReportError: [], onPlayCountChange: [], onTextToggle: [], onAwaitShadow: []
   }
+
+  // 跟读闸门：开启后，一句参考音频自动播完不再自动进下一句，而是 emit onAwaitShadow，
+  // 把推进权交给 ShadowController（判分通过 → nextSentence / 失败 → replayCurrent）。
+  private shadowGate = false
 
   private isInitialized = false
   private eventErrorLogState: Record<string, { lastLogAt: number; suppressedCount: number }> = {}
@@ -203,7 +207,28 @@ export class AudioPlayerService {
         if (this.isPlaying) void this.playCurrentAudio()
       }, this.audioSwitchDelay)
     } else {
-      this._nextSentence()
+      // 本句参考音频全部播完。开了跟读闸门则在此停住、等用户跟读；否则照常进下一句。
+      if (this.shadowGate) {
+        this._enterShadowWait()
+      } else {
+        this._nextSentence()
+      }
+    }
+  }
+
+  /** 进入跟读等待态：暂停、停掉播放标志，emit onAwaitShadow 把推进权交给 ShadowController。 */
+  private _enterShadowWait(): void {
+    try { this.audioAdapter.pause() } catch { /* ignore */ }
+    this._clearTimers()
+    this.isPlaying = false
+    this._triggerEvent('onPlayStateChange', { isPlaying: false })
+    this._updateStatusText('请跟读…')
+    const sentence = this._getCurrentSentence()
+    if (sentence) {
+      this._triggerEvent('onAwaitShadow', {
+        sentence,
+        sentenceIndex: this.currentSentenceIndex
+      })
     }
   }
 
@@ -339,6 +364,20 @@ export class AudioPlayerService {
 
   previousSentence(): void { this._previousSentence() }
   nextSentence(): void { this._nextSentence() }
+
+  /** 开/关跟读闸门。开启时一句参考音频自动播完会停在 onAwaitShadow 等跟读，不自动进下一句。 */
+  setShadowGate(enabled: boolean): void { this.shadowGate = enabled }
+
+  /** 跟读判分不通过时重读：重播当前句参考音频一遍，播完再次进入跟读等待。 */
+  replayCurrent(): void {
+    this._clearTimers()
+    this.currentAudioIndex = 0
+    // 置 playCount = max-1：播一遍后 _onAudioEnded 即走 _nextAudio → 末段 → 再次进闸门。
+    this.playCount = Math.max(0, this.maxPlayCount - 1)
+    this.isPlaying = true
+    this._triggerEvent('onPlayStateChange', { isPlaying: true })
+    void this.playCurrentAudio()
+  }
 
   toggleAnnotation(): void {
     const s = this._getCurrentSentence()

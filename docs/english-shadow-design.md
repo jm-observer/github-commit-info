@@ -101,14 +101,19 @@ ShadowController
 - **「标注重点」**:复用 english 后端已有的 `sentence.annotate` / `is_annotated`
   机制(`AudioPlayerService.toggleAnnotation` 已存在),**不**重复造,也不进 toolkit.db。
 
-### HTTP 端点(toolkit-server,新增 `english` 路由组)
+### HTTP 端点(toolkit-server,新增 `shadow` 路由组,nest 在 `/api/web/shadow`)
 
 注:跟读判分是**交互式低延迟**,按 TTS/clean 代理那种**同步端点**做,**不**做成 TaskKind(长任务+轮询不适用)。
+端点只服务桌面端自身、clip 短,故**不走 multipart**:元信息进 query、音频字节直接做请求 body
+(仿 `/api/web/audio/clean` 的 raw body 风格,免引入 multer/base64 依赖)。
 
 | 方法 | 路径 | 说明 |
 |---|---|---|
-| `POST` | `/api/web/english/shadow/score` | multipart:`audio` 文件 + 表单字段 `customer_id` / `kind`(sentence\|word) / `sentence_id` / `word_index?` / `ref_text` / `threshold?`。→ FunASR 转写 → 对齐打分 → 落 `shadow_attempt` + 累加 `shadow_stat` → 返回判分结果 |
-| `GET` | `/api/web/english/shadow/stats` | query:`customer_id` + `sentence_ids`(逗号分隔)。批量返回这些句子(及其词)的成功/失败次数、上次分数/结果,供进入播放时一次性回填 |
+| `POST` | `/api/web/shadow/score` | query:`customer_id` / `kind`(sentence\|word) / `sentence_id` / `word_index?` / `ref_text` / `threshold?` / `mime?`;body = 原始音频字节。→ FunASR 转写(`vad=false` 整段) → 对齐打分 → 落 `shadow_attempt` + 累加 `shadow_stat` → 返回判分结果(含 `asr_model` / `stat`)。DB 失败仅告警、判分照常返回 |
+| `GET` | `/api/web/shadow/stats` | query:`customer_id` + `sentence_ids`(逗号分隔)。批量返回这些句子(及其词)的成功/失败次数、上次分数/结果,供进入播放时一次性回填 |
+
+桌面端经 Tauri 命令 `english_shadow_score` / `english_shadow_stats` 代理(net 解析 + Bearer),
+端点由 `ResolvedEndpoint::shadow_score_endpoint()` / `shadow_stats_endpoint()` 派生。
 
 判分响应体:
 
@@ -229,7 +234,8 @@ CREATE TABLE IF NOT EXISTS shadow_stat (
 
 最小链路验证(动手第一步,优先做掉 §9 的两个未知):
 1. 录一条真实英文朗读(WebM 或 WAV)→ 直接 `curl` FunASR `/transcribe` 确认**英文识别正常**且**格式可解码**。
-2. `curl` `POST /api/web/english/shadow/score`(带一条音频 + ref_text)→ 看 `score`/`words` 合理。
+2. `curl --data-binary @clip.webm "…/api/web/shadow/score?customer_id=1&kind=sentence&sentence_id=1&ref_text=hello%20world"`
+   → 看 `score`/`words` 合理。
 3. 查 `toolkit.db` 的 `shadow_attempt` / `shadow_stat` 落库正确;再调 `/shadow/stats` 能回读。
 4. 前端:开跟读 → 读对一句自动跳、读错留在原地标红 → 计数累加 → 刷新后计数仍在(DB 持久)。
 

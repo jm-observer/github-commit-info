@@ -196,6 +196,16 @@ impl ResolvedEndpoint {
         self.join("/api/web/audio/voices")
     }
 
+    /// 跟读判分端点 `{g10_base}/api/web/shadow/score`（FunASR 转写 + 词级对齐打分）。
+    pub fn shadow_score_endpoint(&self) -> Option<String> {
+        self.join("/api/web/shadow/score")
+    }
+
+    /// 跟读统计端点 `{g10_base}/api/web/shadow/stats`（批量回读成功/失败计数）。
+    pub fn shadow_stats_endpoint(&self) -> Option<String> {
+        self.join("/api/web/shadow/stats")
+    }
+
     /// 公共大模型层端点 `{g10_base}/api/web/llm{path}`（`path` 以 `/` 开头，如 `/config`）。
     pub fn llm_endpoint(&self, path: &str) -> Option<String> {
         self.join(&format!("/api/web/llm{path}"))

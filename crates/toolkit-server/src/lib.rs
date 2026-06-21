@@ -7,6 +7,7 @@ pub mod config;
 pub mod douyin_mod;
 pub mod llm;
 pub mod routes;
+pub mod shadow;
 pub mod state;
 mod static_assets;
 
@@ -116,6 +117,8 @@ pub fn build_router(state: AppState, web_dir: &std::path::Path) -> axum::Router 
         )
         .nest("/api/web/douyin", douyin_mod::routes::router())
         .nest("/api/web/llm", llm::routes::router())
+        // English 跟读判分（FunASR 转写 + 词级对齐 + 落 toolkit.db）。
+        .nest("/api/web/shadow", shadow::routes::router())
         .nest("/api/agent", routes::agent::router())
         .nest("/api/browser", routes::browser::router())
         // english 后端反代:LAN 模式桌面端走 http://<host>:8788/api/english/* 绕开自签证书。
