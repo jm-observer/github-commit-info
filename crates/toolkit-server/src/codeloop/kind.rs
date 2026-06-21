@@ -209,6 +209,9 @@ impl LoopCtx {
                 n == 1,
                 target_role,
                 None,
+                // toolkit-server 旁路（非桌面 codeloop 主路径）暂不开放 evaluate_alternatives——
+                // 默认 SCOPE 已含现状分析维度，按需再加入参。
+                false,
             );
             let review = match self.send_and_resolve(&self.codex, &codex_prompt).await? {
                 Resolved::Reply(r) => r,

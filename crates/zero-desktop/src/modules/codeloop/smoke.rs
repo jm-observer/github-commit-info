@@ -110,8 +110,7 @@ pub fn run(args: SmokeArgs) -> i32 {
 
         let timeout = args.timeout;
         let json = args.json;
-        match tokio::time::timeout(timeout, run_inner(args, db.clone(), current_loop.clone()))
-            .await
+        match tokio::time::timeout(timeout, run_inner(args, db.clone(), current_loop.clone())).await
         {
             Ok(code) => code,
             Err(_) => {
@@ -148,11 +147,7 @@ pub fn run(args: SmokeArgs) -> i32 {
     })
 }
 
-async fn run_inner(
-    args: SmokeArgs,
-    db: Arc<db::Db>,
-    current_loop: Arc<AtomicI64>,
-) -> i32 {
+async fn run_inner(args: SmokeArgs, db: Arc<db::Db>, current_loop: Arc<AtomicI64>) -> i32 {
     let out = Output::new(args.json);
 
     // ---- preflight ----
@@ -354,6 +349,7 @@ fn entry_kind_label(k: EntryKind) -> &'static str {
         EntryKind::DocReview => "doc_review",
         EntryKind::Implement => "implement",
         EntryKind::ReviewSeed => "review_seed",
+        EntryKind::Continuation => "continuation",
     }
 }
 
@@ -717,6 +713,8 @@ async fn run_stage(
         design_doc_path: s.design_doc_path.clone(),
         seed_review_path: s.seed_review_path.clone(),
         seed_review_inline: s.seed_review_inline.clone(),
+        // smoke 不参数化"方案最优性"维度——保留默认 false。
+        evaluate_alternatives: false,
     };
     run_codeloop(deps, input).await
 }

@@ -9,13 +9,19 @@ interface Props {
   onPick: (provider: Provider, id: string) => void
   onRefresh: () => void
   loading: boolean
-  /** 新建 Codex 会话（复用所选 Claude 会话的仓库目录）。 */
+  /** 立刻新建 Codex 会话（复用所选 Claude 会话的仓库目录）。仅在 newCodexMode=false 时显示。 */
   onNewCodex: () => void
   creatingCodex: boolean
   /** 已选 Claude 会话的项目名（下发给 Codex 选择器作亲和项目）。 */
   claudeProject?: string
   /** 已选 Codex 会话的项目名（下发给 Claude 选择器作亲和项目）。 */
   codexProject?: string
+  /** 新建 Codex 模式：勾选后禁用 Codex 下拉，显示设计文档输入，启动时再实际建会话。 */
+  newCodexMode: boolean
+  setNewCodexMode: (v: boolean) => void
+  /** 新建 Codex 模式下的设计文档路径（相对 Claude 会话 cwd 或绝对路径）。 */
+  newCodexDesignDoc: string
+  setNewCodexDesignDoc: (v: string) => void
 }
 
 /** 主展示文本：优先首条用户消息预览（最稳定可认），回退 AI 标题，再回退短 id。 */
@@ -130,6 +136,8 @@ function SideSelect({
   value,
   onPick,
   affinityProject,
+  disabled,
+  disabledHint,
 }: {
   label: string
   provider: Provider
@@ -138,6 +146,10 @@ function SideSelect({
   onPick: (provider: Provider, id: string) => void
   /** 对侧已选会话的项目名（同项目联动）；空表示对侧未选，退化为纯 L1。 */
   affinityProject?: string
+  /** 禁用：输入框不可编辑、下拉不弹出；用于"新建 Codex 模式"等延迟创建场景。 */
+  disabled?: boolean
+  /** 禁用时的占位文案（替代输入框内容）。 */
+  disabledHint?: string
 }) {
   const [open, setOpen] = useState(false)
   const [query, setQuery] = useState('')
@@ -189,8 +201,8 @@ function SideSelect({
     setQuery('')
   }
 
-  // 关闭态展示已选会话标签；打开态展示用户输入。
-  const display = open ? query : selected ? optionLabel(selected) : ''
+  // 关闭态展示已选会话标签；打开态展示用户输入。禁用时退化为占位提示。
+  const display = disabled ? disabledHint ?? '' : open ? query : selected ? optionLabel(selected) : ''
 
   return (
     // min-w-0 让 flex-1 真正约束子项宽度。
@@ -199,16 +211,20 @@ function SideSelect({
       <div className="relative">
         <input
           value={display}
-          placeholder="— 选择 / 输入筛选 —"
+          placeholder={disabled ? '' : '— 选择 / 输入筛选 —'}
+          disabled={disabled}
           onChange={e => {
+            if (disabled) return
             setQuery(e.target.value)
             if (!open) setOpen(true)
           }}
           onFocus={() => {
+            if (disabled) return
             setOpen(true)
             setQuery('')
           }}
           onKeyDown={e => {
+            if (disabled) return
             if (e.key === 'Escape') {
               setOpen(false)
               ;(e.target as HTMLInputElement).blur()
@@ -218,13 +234,15 @@ function SideSelect({
               ;(e.target as HTMLInputElement).blur()
             }
           }}
-          className="w-full overflow-hidden text-ellipsis whitespace-nowrap rounded-md border border-gray-300 bg-white px-2 py-1.5 pr-7 text-sm outline-none focus:border-blue-400 dark:border-gray-600 dark:bg-gray-800 dark:text-gray-100"
+          className={`w-full overflow-hidden text-ellipsis whitespace-nowrap rounded-md border border-gray-300 bg-white px-2 py-1.5 pr-7 text-sm outline-none focus:border-blue-400 dark:border-gray-600 dark:bg-gray-800 dark:text-gray-100 ${
+            disabled ? 'cursor-not-allowed bg-gray-50 italic text-gray-500 dark:bg-gray-900/40 dark:text-gray-400' : ''
+          }`}
         />
         <ChevronDown
           size={14}
           className="pointer-events-none absolute right-2 top-1/2 -translate-y-1/2 text-gray-400"
         />
-        {open && (
+        {open && !disabled && (
           <ul className="absolute left-0 top-full z-20 mt-1 max-h-64 w-max min-w-full max-w-[32rem] overflow-auto rounded-md border border-gray-200 bg-white py-1 shadow-lg dark:border-gray-600 dark:bg-gray-800">
             <li
               // mousedown 而非 click：抢在 input blur 之前触发，避免列表先被关闭。
@@ -304,43 +322,82 @@ export function SessionPairPicker({
   creatingCodex,
   claudeProject,
   codexProject,
+  newCodexMode,
+  setNewCodexMode,
+  newCodexDesignDoc,
+  setNewCodexDesignDoc,
 }: Props) {
   return (
-    <div className="flex items-end gap-3">
-      <SideSelect
-        label="Claude Code 会话"
-        provider="claude"
-        sessions={sessions}
-        value={claudeId}
-        onPick={onPick}
-        affinityProject={codexProject}
-      />
-      <SideSelect
-        label="Codex 会话"
-        provider="codex"
-        sessions={sessions}
-        value={codexId}
-        onPick={onPick}
-        affinityProject={claudeProject}
-      />
-      <button
-        onClick={onNewCodex}
-        disabled={creatingCodex || !claudeId}
-        title={claudeId ? '新建 Codex 会话（复用所选 Claude 会话的仓库目录，消耗 codex 额度）' : '请先选择 Claude 会话以确定仓库目录'}
-        className="flex items-center gap-1.5 rounded-md border border-gray-300 px-3 py-1.5 text-sm hover:bg-gray-100 disabled:opacity-50 dark:border-gray-600 dark:hover:bg-gray-800"
-      >
-        <Plus size={14} className={creatingCodex ? 'animate-spin' : ''} />
-        {creatingCodex ? '新建中…' : '新建 Codex'}
-      </button>
-      <button
-        onClick={onRefresh}
-        disabled={loading}
-        title="刷新会话清单"
-        className="flex items-center gap-1.5 rounded-md border border-gray-300 px-3 py-1.5 text-sm hover:bg-gray-100 disabled:opacity-50 dark:border-gray-600 dark:hover:bg-gray-800"
-      >
-        <RefreshCw size={14} className={loading ? 'animate-spin' : ''} />
-        刷新
-      </button>
+    <div className="flex flex-col gap-2">
+      <div className="flex items-end gap-3">
+        <SideSelect
+          label="Claude Code 会话"
+          provider="claude"
+          sessions={sessions}
+          value={claudeId}
+          onPick={onPick}
+          affinityProject={codexProject}
+        />
+        <SideSelect
+          label={newCodexMode ? 'Codex 会话（启动时新建）' : 'Codex 会话'}
+          provider="codex"
+          sessions={sessions}
+          value={codexId}
+          onPick={onPick}
+          affinityProject={claudeProject}
+          disabled={newCodexMode}
+          disabledHint={
+            newCodexMode
+              ? claudeId
+                ? '将在「启动复核循环」时按设计文档新建一个 Codex 会话'
+                : '请先选 Claude 会话；启动时会新建 Codex'
+              : undefined
+          }
+        />
+        {!newCodexMode && (
+          <button
+            onClick={onNewCodex}
+            disabled={creatingCodex || !claudeId}
+            title={claudeId ? '立刻新建一个空 Codex 会话（不附文档；消耗 codex 额度）' : '请先选择 Claude 会话以确定仓库目录'}
+            className="flex items-center gap-1.5 rounded-md border border-gray-300 px-3 py-1.5 text-sm hover:bg-gray-100 disabled:opacity-50 dark:border-gray-600 dark:hover:bg-gray-800"
+          >
+            <Plus size={14} className={creatingCodex ? 'animate-spin' : ''} />
+            {creatingCodex ? '新建中…' : '新建 Codex'}
+          </button>
+        )}
+        <button
+          onClick={onRefresh}
+          disabled={loading}
+          title="刷新会话清单"
+          className="flex items-center gap-1.5 rounded-md border border-gray-300 px-3 py-1.5 text-sm hover:bg-gray-100 disabled:opacity-50 dark:border-gray-600 dark:hover:bg-gray-800"
+        >
+          <RefreshCw size={14} className={loading ? 'animate-spin' : ''} />
+          刷新
+        </button>
+      </div>
+
+      <div className="flex items-center gap-3 text-xs">
+        <label
+          className="flex items-center gap-1.5 text-gray-700 dark:text-gray-200"
+          title="勾选后 Codex 下拉禁用，启动时按下方设计文档新建一个 Codex 会话（establishing 阶段就声明 VERDICT / ASK_USER 契约）。"
+        >
+          <input
+            type="checkbox"
+            checked={newCodexMode}
+            onChange={e => setNewCodexMode(e.target.checked)}
+          />
+          新建 Codex 会话（启动时建，把设计文档喂进去）
+        </label>
+        {newCodexMode && (
+          <input
+            type="text"
+            value={newCodexDesignDoc}
+            onChange={e => setNewCodexDesignDoc(e.target.value)}
+            placeholder="设计文档路径（仓内相对或绝对；启动时随 establishing prompt 一起喂给新 Codex 会话）"
+            className="flex-1 rounded-md border border-gray-300 bg-white px-2 py-1 text-xs outline-none focus:border-blue-400 dark:border-gray-600 dark:bg-gray-800 dark:text-gray-100"
+          />
+        )}
+      </div>
     </div>
   )
 }

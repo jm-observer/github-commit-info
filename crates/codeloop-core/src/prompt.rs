@@ -11,7 +11,7 @@ use serde::{Deserialize, Serialize};
 use std::path::Path;
 
 /// 模板语义版本。改内置模板文案时同步 bump。
-pub const TEMPLATE_VERSION: &str = "v3";
+pub const TEMPLATE_VERSION: &str = "v5";
 
 /// Codex 复核模板支持的占位符（供控制台提示）。
 ///
@@ -21,9 +21,19 @@ pub const CODEX_PLACEHOLDERS: &[&str] = &["{LABEL}", "{SCOPE}", "{ROUND_HINT}"];
 /// Claude 修订模板支持的占位符。说明同 [`CODEX_PLACEHOLDERS`]。
 pub const CLAUDE_PLACEHOLDERS: &[&str] = &["{LABEL}", "{REVIEW}"];
 
-/// 复核口径（design）。
-const DESIGN_SCOPE: &str = "只关注事实/逻辑/前后一致性/可行性错误，不纠结措辞。";
-/// 复核口径（implementation）。
+/// 复核口径（design，默认）。覆盖事实/逻辑/可行性 + **文档对现状的分析是否与代码实际相符**。
+const DESIGN_SCOPE: &str = "关注：(1) 事实/逻辑/前后一致性/可行性错误；\
+(2) 文档对现状（既有代码/数据/约束）的分析是否与实际相符——必要时查阅代码确认；\
+(3) 不纠结措辞。";
+/// 复核口径（design，含方案最优性评估）。可选开启——较慢、易发散，仅在"方案尚未定稿"
+/// 时使用；对"已定稿要落地"的文档反而是噪音。见 codeloop-attempt-model-design.md
+/// 「SCOPE 维度」章节。
+const DESIGN_SCOPE_WITH_ALTERNATIVES: &str = "关注：(1) 事实/逻辑/前后一致性/可行性错误；\
+(2) 文档对现状（既有代码/数据/约束）的分析是否与实际相符——必要时查阅代码确认；\
+(3) 评估所选方案相对其它可行方案是否合理——如果存在更稳/更简/更聚焦的替代请明确指出，\
+否则不要为指出而指出；\
+(4) 不纠结措辞。";
+/// 复核口径（implementation）。"实现是否符合设计"恒不评估方案最优性——若想换方案应回到 design 阶段。
 const IMPL_SCOPE: &str = "只关注实现是否符合设计、有无逻辑/边界/正确性错误，不纠结风格。";
 
 /// **Locator 段（`SpecDoc` 角色）**：今天 `mode=Implementation` / Codex 复核文档时使用的措辞。
@@ -113,6 +123,21 @@ pub fn render_worktree_reuse_notice(worktree_path: &str) -> String {
     WORKTREE_REUSE_NOTICE.replace("{WORKTREE_PATH}", worktree_path)
 }
 
+/// **Codex 复核续跑模板（Continuation 入口）**：选既有 session pair 续跑场景。
+/// 不带 `{LABEL}` / locator — 会话历史已包含上下文。占位符仅 `{ROUND_HINT}`。
+///
+/// 见 docs/codeloop-attempt-model-design.md（Continuation 入口章节）。
+pub const DEFAULT_CODEX_CONTINUATION_TEMPLATE: &str =
+    "请基于本会话已建立的上下文继续审阅当前状态。\
+逐条列出新发现的问题（无问题写「无」）。最后另起一行只输出结论：\
+无明显错误输出 `VERDICT: PASS`，否则 `VERDICT: NEEDS_WORK`。{ROUND_HINT}";
+
+/// **Claude 修订续跑模板（Continuation 入口）**：选既有 session pair 续跑场景。
+/// 不带 `{LABEL}` / locator — 会话历史已包含上下文。占位符仅 `{REVIEW}`。
+pub const DEFAULT_CLAUDE_CONTINUATION_TEMPLATE: &str =
+    "Codex 本轮复核意见如下：\n---\n{REVIEW}\n---\n\
+请据此修订，仅改确有问题处，并在回复末尾用一句话概述本轮改动。";
+
 /// **Claude implement 续跑模板**：用户点"继续"且 last_phase 仍在 implementing 阶段时用。
 /// 与 [`DEFAULT_CLAUDE_IMPLEMENT_TEMPLATE`] 的差别：明确说"上次中断"、不附 WORKTREE_INSTRUCTION
 /// （cwd 由 ZD 用 loop.worktree_path spawn 时已稳定）。占位符 `{LABEL}`。
@@ -135,12 +160,15 @@ pub enum ReviewMode {
 /// - `DocReview`：Codex 复核文档 → Claude 修订（沿用今天默认）。
 /// - `Implement`：Claude 先按 `target_path` 实现代码 → Codex 复核 → Claude 修订。
 /// - `ReviewSeed`：把用户提供的现成 review 文本当 round-1 喂给 Claude → 跳过 Codex 首轮。
+/// - `Continuation`：选既有 session pair 直接续跑——会话历史里已经讨论过对象，
+///   不需要 `target_path` / 不再注入 locator / 不再喂 LABEL，只发"继续审核 / 继续修订"。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum EntryKind {
     DocReview,
     Implement,
     ReviewSeed,
+    Continuation,
 }
 
 /// `target_path` 的角色（与 `ReviewMode` 正交：`ReviewMode` 决定"循环主体类型"；
@@ -196,7 +224,11 @@ fn spec_doc_rel(target: &TargetSpec, spec_doc: &Path) -> String {
 /// 三种 role 之后**统一**追加 [`ASK_USER_BLOCK`]，由调用方在 first_turn 时拼回模板。
 ///
 /// 见 docs/codeloop-multi-entry-design.md §3 / §6.3。
-pub fn locator_block(target: &TargetSpec, target_role: TargetRole, spec_doc: Option<&Path>) -> String {
+pub fn locator_block(
+    target: &TargetSpec,
+    target_role: TargetRole,
+    spec_doc: Option<&Path>,
+) -> String {
     let tmpl = match target_role {
         TargetRole::SpecDoc => LOCATOR_BLOCK_SPEC_DOC.to_string(),
         TargetRole::RevisionDoc => LOCATOR_BLOCK_REVISION_DOC.to_string(),
@@ -215,6 +247,9 @@ pub fn locator_block(target: &TargetSpec, target_role: TargetRole, spec_doc: Opt
 /// 的首轮（仅首轮附 locator + ASK_USER 协议段，后续轮依赖会话历史不再重发）。
 ///
 /// `target_role` / `spec_doc` 决定 Locator 段措辞（见 [`locator_block`]）。
+///
+/// `evaluate_alternatives`：仅在 `mode=Design` 下生效，true → 切到
+/// [`DESIGN_SCOPE_WITH_ALTERNATIVES`]（多一条"方案最优性"维度）。Implementation 恒忽略此参数。
 pub fn render_codex_prompt(
     template: &str,
     target: &TargetSpec,
@@ -223,9 +258,16 @@ pub fn render_codex_prompt(
     first_turn: bool,
     target_role: TargetRole,
     spec_doc: Option<&Path>,
+    evaluate_alternatives: bool,
 ) -> String {
     let scope = match mode {
-        ReviewMode::Design => DESIGN_SCOPE,
+        ReviewMode::Design => {
+            if evaluate_alternatives {
+                DESIGN_SCOPE_WITH_ALTERNATIVES
+            } else {
+                DESIGN_SCOPE
+            }
+        }
         ReviewMode::Implementation => IMPL_SCOPE,
     };
     let round_hint = if round > 1 {
@@ -275,6 +317,68 @@ pub fn render_claude_implement_prompt(
     fill_locator(&s, target)
 }
 
+/// **新建 Codex 会话 + 喂设计文档**的 establishing 模板：
+/// 把文档原文嵌入首轮 prompt，**同时**声明 VERDICT / ASK_USER 输出契约——这样后续
+/// codeloop 用 Continuation 入口续跑时，第一轮就可以按 `established_codex=true` 跳过
+/// 协议建立块，避免重复刷屏。占位符 `{DOC_CONTENT}` 由 [`render_new_codex_with_doc`] 填充。
+///
+/// 见 docs/codeloop-attempt-model-design.md（新建 Codex 流程章节，由桌面端 SessionPairPicker
+/// 的「新建 Codex 会话」勾选触发）。
+pub const NEW_CODEX_WITH_DOC_TEMPLATE: &str = "你好。这是一个用于跨会话复核的新会话。\
+\n我们要复核 / 讨论的设计文档原文如下：\
+\n---\
+\n{DOC_CONTENT}\
+\n---\
+\n\n请熟悉以上文档内容。**审阅重点**：\
+\n(1) 事实/逻辑/前后一致性/可行性错误；\
+\n(2) 文档对现状（既有代码/数据/约束）的分析是否与实际相符——必要时查阅代码确认；\
+\n(3) 不纠结措辞。\
+\n\n后续我会以「请继续审核」之类指令发起每一轮复核，请按以下输出契约工作：\
+\n1. 逐条列出发现的问题（无问题写「无」）。\
+\n2. 最后另起一行只输出结论：无明显错误 → `VERDICT: PASS`，否则 `VERDICT: NEEDS_WORK`。\
+\n3. 若遇到需要我方做选择的岔路（例如方案 A 还是 B），不要自行假设。\
+请只输出一行、以 `ASK_USER: ` 开头、后接合法 JSON，例如：\
+`ASK_USER: {\"question\": \"实现登录用哪种方案？\", \"options\": [\"方案A：JWT 无状态\", \"方案B：服务端 session\"]}`，\
+然后停止等我答复。该行不要包含 JSON 之外的任何文字。\
+\n\n现在请先回复『已就绪』，等待后续复核任务。";
+
+/// 把文档原文填入 [`NEW_CODEX_WITH_DOC_TEMPLATE`]。
+pub fn render_new_codex_with_doc(doc_content: &str) -> String {
+    NEW_CODEX_WITH_DOC_TEMPLATE.replace("{DOC_CONTENT}", doc_content)
+}
+
+/// 渲染 Continuation 入口的 Codex 复核 prompt：不带 LABEL / 不带 locator。
+///
+/// `first_turn=true` 时追加 [`ASK_USER_BLOCK`]——既有 session 历史里通常没声明过
+/// VERDICT / ASK_USER 输出契约，首轮需建立；后续轮依赖会话历史不再重发。
+/// 与 [`render_codex_prompt`] 的 first_turn 区别：那里还会附 locator，这里只发协议。
+pub fn render_codex_continuation_prompt(template: &str, round: u32, first_turn: bool) -> String {
+    let round_hint = if round > 1 {
+        format!("（这是第 {round} 轮，对方已按你上轮意见修订，请重新复核。）")
+    } else {
+        String::new()
+    };
+    let mut s = template.replace("{ROUND_HINT}", &round_hint);
+    if first_turn {
+        s.push_str(ASK_USER_BLOCK);
+    }
+    s
+}
+
+/// 渲染 Continuation 入口的 Claude 修订 prompt：不带 LABEL / 不带 locator。
+/// `first_turn` 语义同 [`render_codex_continuation_prompt`]。
+pub fn render_claude_continuation_prompt(
+    template: &str,
+    codex_review: &str,
+    first_turn: bool,
+) -> String {
+    let mut s = template.replace("{REVIEW}", codex_review);
+    if first_turn {
+        s.push_str(ASK_USER_BLOCK);
+    }
+    s
+}
+
 /// 把外部 review seed 文本包成"显然非 Codex 输出"的样式，作为 Claude 修订 prompt 的 `{REVIEW}`
 /// 入参，避免 Claude 把它误认为真实 Codex 判定 + 抵御 prompt injection。
 ///
@@ -317,6 +421,7 @@ mod tests {
             true,
             TargetRole::RevisionDoc,
             None,
+            false,
         );
         assert!(p.contains("设计文档 docs/foo.md"));
         assert!(p.contains("VERDICT: PASS"));
@@ -343,6 +448,7 @@ mod tests {
             false,
             TargetRole::SpecDoc,
             None,
+            false,
         );
         assert!(p.contains("第 3 轮"));
         assert!(p.contains("符合设计"));
@@ -405,10 +511,14 @@ mod tests {
             true,
             TargetRole::RevisionCode,
             Some(&spec_doc),
+            false,
         );
         assert!(p.contains("待修订代码根"), "首轮应出现 RevisionCode 措辞");
         assert!(p.contains("规格依据"), "spec_doc=Some 时应追加规格依据行");
-        assert!(p.contains("docs/spec.md"), "应给出相对 repo_root 的 spec_doc 路径");
+        assert!(
+            p.contains("docs/spec.md"),
+            "应给出相对 repo_root 的 spec_doc 路径"
+        );
         assert!(!p.contains("无外部规格依据"));
         assert!(p.contains("ASK_USER: "), "三种 role 共用 ASK_USER 协议段");
     }
@@ -423,6 +533,7 @@ mod tests {
             true,
             TargetRole::RevisionCode,
             None,
+            false,
         );
         assert!(p.contains("待修订代码根"));
         assert!(
@@ -456,7 +567,10 @@ mod tests {
         );
         assert!(p.contains("设计文档"), "LABEL 占位符应被替换");
         // SpecDoc 角色 → Locator 用 LOCATOR_BLOCK_SPEC_DOC 措辞（与旧 STANDING_BLOCK 一致）。
-        assert!(p.contains("复核/修订对象明确为"), "首轮应附 SpecDoc Locator");
+        assert!(
+            p.contains("复核/修订对象明确为"),
+            "首轮应附 SpecDoc Locator"
+        );
         assert!(p.contains("ASK_USER: "), "首轮应附 ASK_USER 协议段");
     }
 
@@ -480,7 +594,137 @@ mod tests {
     }
 
     #[test]
-    fn template_version_bumped_to_v3() {
-        assert_eq!(TEMPLATE_VERSION, "v3");
+    fn template_version_bumped_to_v5() {
+        assert_eq!(TEMPLATE_VERSION, "v5");
+    }
+
+    #[test]
+    fn design_scope_default_includes_current_state_analysis() {
+        // 默认 SCOPE 必含「现状分析」维度（v5 新增）。
+        let p = render_codex_prompt(
+            DEFAULT_CODEX_TEMPLATE,
+            &spec("docs/foo.md"),
+            ReviewMode::Design,
+            1,
+            true,
+            TargetRole::RevisionDoc,
+            None,
+            false,
+        );
+        assert!(p.contains("现状"), "DESIGN_SCOPE 默认应含现状分析维度");
+        assert!(!p.contains("评估所选方案"), "默认不打开方案最优性维度");
+    }
+
+    #[test]
+    fn design_scope_with_alternatives_adds_optimality_dimension() {
+        let p = render_codex_prompt(
+            DEFAULT_CODEX_TEMPLATE,
+            &spec("docs/foo.md"),
+            ReviewMode::Design,
+            1,
+            true,
+            TargetRole::RevisionDoc,
+            None,
+            true,
+        );
+        assert!(p.contains("评估所选方案"));
+        assert!(p.contains("现状"), "alternatives 维度不应替换掉现状分析");
+    }
+
+    #[test]
+    fn impl_scope_ignores_evaluate_alternatives_flag() {
+        // Implementation 阶段不评估方案最优性——flag 透传也只走 IMPL_SCOPE。
+        let p = render_codex_prompt(
+            DEFAULT_CODEX_TEMPLATE,
+            &spec("src/foo.rs"),
+            ReviewMode::Implementation,
+            1,
+            true,
+            TargetRole::SpecDoc,
+            None,
+            true, // 即便传 true
+        );
+        assert!(p.contains("符合设计"));
+        assert!(!p.contains("评估所选方案"));
+    }
+
+    #[test]
+    fn new_codex_with_doc_includes_review_focus() {
+        // establishing prompt 也要带审阅重点（现状分析）。
+        let p = render_new_codex_with_doc("# 草案\n这是文档全文。");
+        assert!(p.contains("审阅重点"));
+        assert!(p.contains("现状"));
+    }
+
+    #[test]
+    fn render_new_codex_with_doc_embeds_content_and_protocol() {
+        let p = render_new_codex_with_doc("# 设计草案\n\n这是文档全文。");
+        assert!(p.contains("这是文档全文"));
+        assert!(p.contains("VERDICT: PASS"));
+        assert!(p.contains("ASK_USER: "));
+        // 占位符必须全部替换。
+        assert!(!p.contains("{DOC_CONTENT}"));
+    }
+
+    // --- Continuation 入口模板（无 LABEL / 无 locator） ---
+
+    #[test]
+    fn codex_continuation_first_turn_appends_ask_user_no_locator() {
+        let p = render_codex_continuation_prompt(DEFAULT_CODEX_CONTINUATION_TEMPLATE, 1, true);
+        assert!(p.contains("VERDICT: PASS"));
+        assert!(!p.contains("这是第"));
+        // 首轮：仅协议段（ASK_USER），无 locator。
+        assert!(p.contains("ASK_USER: "), "首轮应附 ASK_USER 协议");
+        assert!(
+            !p.contains("工作树根"),
+            "Continuation 任何时候都不附 locator"
+        );
+        // 占位符全部替换。
+        assert!(!p.contains("{LABEL}"));
+        assert!(!p.contains("{ROUND_HINT}"));
+    }
+
+    #[test]
+    fn codex_continuation_later_turn_omits_protocol_block() {
+        // 既有 session 已在首轮建立过协议 → 后续轮不再重发 ASK_USER。
+        let p = render_codex_continuation_prompt(DEFAULT_CODEX_CONTINUATION_TEMPLATE, 4, false);
+        assert!(p.contains("第 4 轮"));
+        assert!(!p.contains("ASK_USER: "));
+        assert!(!p.contains("工作树根"));
+    }
+
+    #[test]
+    fn codex_continuation_established_first_round_omits_protocol() {
+        // 预热（established_codex）→ 即便 round 1 也按 first_turn=false 调，跳过协议段。
+        let p = render_codex_continuation_prompt(DEFAULT_CODEX_CONTINUATION_TEMPLATE, 1, false);
+        assert!(!p.contains("ASK_USER: "));
+        assert!(!p.contains("这是第"));
+    }
+
+    #[test]
+    fn claude_continuation_first_turn_appends_ask_user() {
+        let p = render_claude_continuation_prompt(
+            DEFAULT_CLAUDE_CONTINUATION_TEMPLATE,
+            "问题 1：边界缺失",
+            true,
+        );
+        assert!(p.contains("问题 1：边界缺失"));
+        assert!(p.contains("仅改确有问题处"));
+        assert!(p.contains("ASK_USER: "), "首轮应附 ASK_USER 协议");
+        assert!(!p.contains("工作树根"));
+        assert!(!p.contains("{LABEL}"));
+        assert!(!p.contains("{REVIEW}"));
+    }
+
+    #[test]
+    fn claude_continuation_later_turn_omits_protocol_block() {
+        let p = render_claude_continuation_prompt(
+            DEFAULT_CLAUDE_CONTINUATION_TEMPLATE,
+            "问题 1：边界缺失",
+            false,
+        );
+        assert!(p.contains("问题 1：边界缺失"));
+        assert!(p.contains("仅改确有问题处"));
+        assert!(!p.contains("ASK_USER: "));
     }
 }

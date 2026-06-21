@@ -32,6 +32,7 @@ const FINAL_LABELS: Record<string, string> = {
 
 /** 入口徽标（旧数据 entry_kind=null 时按 mode 推断；见多入口设计 §5 兼容映射）。 */
 const ENTRY_META: Record<EntryKind, { icon: string; label: string; title: string }> = {
+  continuation: { icon: '▶', label: '续跑', title: '继续既有讨论（Continuation）' },
   doc_review: { icon: '📄', label: '文档复核', title: '从文档复核开始（DocReview）' },
   implement: { icon: '🛠', label: '实现', title: '从实现开始（Implement）' },
   review_seed: { icon: '📝', label: '外部 seed', title: '从既有复核意见开始（ReviewSeed）' },

@@ -39,6 +39,12 @@ export default function CodeloopPage() {
   const [claudeId, setClaudeId] = useState('')
   const [codexId, setCodexId] = useState('')
   const [creatingCodex, setCreatingCodex] = useState(false)
+  // 新建 Codex 模式：勾选后启动时按设计文档新建一个 Codex 会话（establishing 阶段就喂文档 +
+  // 声明 VERDICT/ASK_USER 契约），随后强制走 Continuation 入口（estCodex=true 跳过协议块）。
+  const [newCodexMode, setNewCodexMode] = useState(false)
+  const [newCodexDesignDoc, setNewCodexDesignDoc] = useState('')
+  // 评估方案最优性：仅 Design 系入口（doc_review / review_seed-design）显示；默认关。
+  const [evaluateAlternatives, setEvaluateAlternatives] = useState(false)
 
   // 双栏消息：cursor 用 ref（不触发渲染），messages 用 state。
   const cursors = useRef<Record<Provider, number>>({ codex: 0, claude: 0 })
@@ -46,9 +52,9 @@ export default function CodeloopPage() {
 
   // 新建表单
   const [targetPath, setTargetPath] = useState('')
-  // 入口种类（多入口设计 §3）：默认 doc_review。ReviewSeed 时有二级 mode 子选；
-  // DocReview/Implement 时 mode 由入口决定（design / implementation）。
-  const [entryKind, setEntryKind] = useState<EntryKind>('doc_review')
+  // 入口种类（多入口设计 §3）：默认 continuation——选既有 session 续跑，不需要任何 target/seed。
+  // ReviewSeed 时有二级 mode 子选；DocReview/Implement 时 mode 由入口决定（design/implementation）。
+  const [entryKind, setEntryKind] = useState<EntryKind>('continuation')
   // 仅 ReviewSeed 时由用户选；DocReview→design / Implement→implementation 由 entry 卡片自动写。
   const [seedMode, setSeedMode] = useState<ReviewMode>('design')
   // ReviewSeed 的 seed 输入：tab 切换文件路径 / 内联文本（两选一，相互清空）。
@@ -81,13 +87,15 @@ export default function CodeloopPage() {
     // 切到 review_seed 时不强行重置 seedMode（保留用户上次选择）。
   }
 
-  // 由入口 + ReviewSeed 子选 推出最终 mode。
+  // 由入口 + ReviewSeed 子选 推出最终 mode。Continuation 不渲染 SCOPE，随便给个 design 即可。
   const effectiveMode: ReviewMode =
-    entryKind === 'doc_review'
+    entryKind === 'continuation'
       ? 'design'
-      : entryKind === 'implement'
-        ? 'implementation'
-        : seedMode
+      : entryKind === 'doc_review'
+        ? 'design'
+        : entryKind === 'implement'
+          ? 'implementation'
+          : seedMode
 
   const [startErr, setStartErr] = useState<string | null>(null)
   // 各循环已应答 / 已拍板的 seq（避免弹窗重复触发；seq 在循环内单调）。
@@ -118,12 +126,13 @@ export default function CodeloopPage() {
   const [showPreview, setShowPreview] = useState(false)
 
   // 由表单组装 StartInput（启动 / 自检共用）。多入口字段按 entry_kind 条件性附带：
-  // 仅 ReviewSeed 才透传 seed_review_*；仅 ReviewSeed(impl) 才透传 design_doc_path。
+  // - Continuation：不带 target_path / seed / design_doc（既有 session 携带上下文）。
+  // - ReviewSeed：透传 seed_review_*；ReviewSeed(impl) 才透传 design_doc_path。
+  // - DocReview / Implement：必带 target_path。
   const buildInput = (): StartInput => {
     const base: StartInput = {
       claude: { session_id: claudeId },
       codex: { session_id: codexId },
-      target_path: targetPath.trim(),
       mode: effectiveMode,
       max_rounds: maxRounds,
       wait_for_claude_idle: waitIdle,
@@ -131,6 +140,10 @@ export default function CodeloopPage() {
       use_worktree: useWorktree,
       established: { codex: estCodex, claude: estClaude },
       entry_kind: entryKind,
+      evaluate_alternatives: evaluateAlternatives,
+    }
+    if (entryKind !== 'continuation' && targetPath.trim()) {
+      base.target_path = targetPath.trim()
     }
     if (entryKind === 'review_seed') {
       if (seedTab === 'path' && seedReviewPath.trim()) {
@@ -148,7 +161,10 @@ export default function CodeloopPage() {
   // 启动后清空新建表单，让用户立即配下一个循环（含会话选择——同一会话不可并发占用）。
   const resetForm = () => {
     setTargetPath('')
-    setEntryKind('doc_review')
+    setNewCodexMode(false)
+    setNewCodexDesignDoc('')
+    setEvaluateAlternatives(false)
+    setEntryKind('continuation')
     setSeedMode('design')
     setSeedTab('path')
     setSeedReviewPath('')
@@ -348,8 +364,12 @@ export default function CodeloopPage() {
   const seedReady =
     entryKind !== 'review_seed' ||
     (seedTab === 'path' ? !!seedReviewPath.trim() : !!seedReviewInline.trim())
+  // Continuation 不需要 target_path；其它入口必填。
+  const targetReady = entryKind === 'continuation' || !!targetPath.trim()
+  // Codex 端就绪：newCodexMode 下要求填了 design doc；否则要求选了既有 codex 会话。
+  const codexReady = newCodexMode ? !!newCodexDesignDoc.trim() : !!codexId
   // 并发模型：可随时配置/启动新循环（同一会话除外，由后端校验），不设全局 running 闸。
-  const canStart = !!claudeId && !!codexId && !!targetPath.trim() && seedReady
+  const canStart = !!claudeId && codexReady && targetReady && seedReady
   const startWith = async (input: StartInput) => {
     setStartErr(null)
     try {
@@ -366,7 +386,40 @@ export default function CodeloopPage() {
       setStartErr(String(e))
     }
   }
-  const handleStart = () => startWith(buildInput())
+  // 启动入口：newCodexMode 时先后端建会话（喂设计文档 + 声明 VERDICT/ASK_USER 契约）
+  // 拿到新 session id，再用 Continuation 入口启动循环（codex 端已预热，跳过协议块）。
+  const handleStart = async () => {
+    if (newCodexMode) {
+      if (!claudeId || !newCodexDesignDoc.trim()) return
+      setStartErr(null)
+      setCreatingCodex(true)
+      let newId: string
+      try {
+        newId = await CodeloopAPI.newCodexSession(claudeId, newCodexDesignDoc.trim())
+      } catch (e) {
+        setStartErr(String(e))
+        setCreatingCodex(false)
+        return
+      }
+      refreshSessions()
+      setCreatingCodex(false)
+      // 用新 session id 强制走 Continuation；codex 端在 establishing 阶段已声明协议 → 预热=true。
+      const input: StartInput = {
+        claude: { session_id: claudeId },
+        codex: { session_id: newId },
+        mode: 'design',
+        max_rounds: maxRounds,
+        wait_for_claude_idle: waitIdle,
+        step_confirm: stepConfirm,
+        use_worktree: useWorktree,
+        established: { codex: true, claude: estClaude },
+        entry_kind: 'continuation',
+      }
+      await startWith(input)
+      return
+    }
+    await startWith(buildInput())
+  }
   // 阶段动作：可选择先新建 Codex Agent/session，再启动派生记录。
   const startStageWith = async (input: StartInput, options?: StageStartOptions) => {
     let next = input
@@ -527,6 +580,10 @@ export default function CodeloopPage() {
         creatingCodex={creatingCodex}
         claudeProject={claudeProject}
         codexProject={codexProject}
+        newCodexMode={newCodexMode}
+        setNewCodexMode={setNewCodexMode}
+        newCodexDesignDoc={newCodexDesignDoc}
+        setNewCodexDesignDoc={setNewCodexDesignDoc}
       />
       {projectMismatch && (
         <div className="text-xs text-amber-600 dark:text-amber-400">
@@ -539,27 +596,30 @@ export default function CodeloopPage() {
         </div>
       )}
 
-      {/* 入口选择卡 + ReviewSeed 动态字段（多入口设计 §7）。 */}
-      <EntryPicker
-        entryKind={entryKind}
-        onPick={handlePickEntry}
-        seedMode={seedMode}
-        setSeedMode={setSeedMode}
-        seedTab={seedTab}
-        setSeedTab={setSeedTab}
-        seedReviewPath={seedReviewPath}
-        setSeedReviewPath={setSeedReviewPath}
-        seedReviewInline={seedReviewInline}
-        setSeedReviewInline={setSeedReviewInline}
-        designDocPath={designDocPath}
-        setDesignDocPath={setDesignDocPath}
-        disabled={false}
-      />
+      {/* 入口选择卡 + ReviewSeed 动态字段（多入口设计 §7）。
+          newCodexMode 下隐藏——新建 Codex 流程隐式走 Continuation，入口无意义。 */}
+      {!newCodexMode && (
+        <EntryPicker
+          entryKind={entryKind}
+          onPick={handlePickEntry}
+          seedMode={seedMode}
+          setSeedMode={setSeedMode}
+          seedTab={seedTab}
+          setSeedTab={setSeedTab}
+          seedReviewPath={seedReviewPath}
+          setSeedReviewPath={setSeedReviewPath}
+          seedReviewInline={seedReviewInline}
+          setSeedReviewInline={setSeedReviewInline}
+          designDocPath={designDocPath}
+          setDesignDocPath={setDesignDocPath}
+          disabled={false}
+        />
+      )}
 
       <LoopStatusBar
         targetPath={targetPath}
         setTargetPath={setTargetPath}
-        entryKind={entryKind}
+        entryKind={newCodexMode ? 'continuation' : entryKind}
         mode={effectiveMode}
         maxRounds={maxRounds}
         setMaxRounds={setMaxRounds}
@@ -573,6 +633,8 @@ export default function CodeloopPage() {
         setEstCodex={setEstCodex}
         estClaude={estClaude}
         setEstClaude={setEstClaude}
+        evaluateAlternatives={evaluateAlternatives}
+        setEvaluateAlternatives={setEvaluateAlternatives}
         onPreview={() => setShowPreview(true)}
         canStart={canStart}
         onStart={handleStart}
@@ -710,7 +772,8 @@ interface EntryPickerProps {
 }
 
 const ENTRY_CARDS: { kind: EntryKind; icon: string; title: string; hint: string }[] = [
-  { kind: 'doc_review', icon: '📄', title: '从文档复核开始', hint: '现有默认：Codex 复核文档 ↔ Claude 修订。' },
+  { kind: 'continuation', icon: '▶', title: '继续既有讨论', hint: '默认：会话已携带上下文 → 直接「继续审核 ↔ 继续修订」循环。' },
+  { kind: 'doc_review', icon: '📄', title: '从文档复核开始', hint: '指定待复核文档：Codex 复核文档 ↔ Claude 修订。' },
   { kind: 'implement', icon: '🛠', title: '从实现开始', hint: '文档已定稿：Claude 按文档实现 → 复核环。' },
   { kind: 'review_seed', icon: '📝', title: '从既有复核意见开始', hint: '已有 review 产物：跳过 Codex 首轮直接修订。' },
 ]
@@ -736,7 +799,7 @@ function EntryPicker(props: EntryPickerProps) {
   return (
     <div className="flex flex-col gap-2 rounded-md border border-gray-200 bg-white p-3 dark:border-gray-800 dark:bg-gray-900">
       <div className="text-xs font-medium text-gray-600 dark:text-gray-300">起点（入口）</div>
-      <div className="grid grid-cols-1 gap-2 md:grid-cols-3">
+      <div className="grid grid-cols-1 gap-2 md:grid-cols-4">
         {ENTRY_CARDS.map(c => {
           const selected = c.kind === entryKind
           return (

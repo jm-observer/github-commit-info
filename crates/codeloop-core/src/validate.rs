@@ -33,6 +33,27 @@ pub struct Validated {
     pub target_abs: PathBuf,
 }
 
+/// 仅校验两端 session 的 cwd 落在同一个 git 工作树（用于 Continuation 入口，target_path 缺省）。
+/// 成功返回共同 repo root。
+pub fn validate_two_way(claude_cwd: &Path, codex_cwd: &Path) -> Result<PathBuf> {
+    let claude_root = find_repo_root(claude_cwd)
+        .ok_or_else(|| anyhow!("Claude cwd 向上未找到 .git：{}", claude_cwd.display()))?;
+    let codex_root = find_repo_root(codex_cwd)
+        .ok_or_else(|| anyhow!("Codex cwd 向上未找到 .git：{}", codex_cwd.display()))?;
+    let cr = canon(&claude_root);
+    let dr = canon(&codex_root);
+    if cr != dr {
+        bail!(
+            "两端不在同一工作树：Claude repo root={}，Codex repo root={}（claude cwd={}，codex cwd={}）",
+            claude_root.display(),
+            codex_root.display(),
+            claude_cwd.display(),
+            codex_cwd.display(),
+        );
+    }
+    Ok(cr)
+}
+
 /// 三方一致性校验。
 ///
 /// - `claude_cwd` / `codex_cwd`：两会话解析出的工作目录。

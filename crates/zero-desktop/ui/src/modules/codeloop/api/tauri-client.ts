@@ -67,18 +67,22 @@ export type ReviewMode = 'design' | 'implementation'
 
 /**
  * 入口种类（codeloop 多入口设计 §3）：
- * - doc_review：从文档复核开始（现有默认）。mode 必为 design。
+ * - continuation：选既有 session pair 续跑——既有会话已携带上下文，无需 target/seed/规格。
+ *   不渲染 LABEL/locator，只下发"继续审核 / 继续修订"。
+ * - doc_review：从文档复核开始。mode 必为 design。
  * - implement：从实现开始（文档已定稿，进入实现 + 复核环）。mode 必为 implementation。
  * - review_seed：从既有 review 产物开始，跳过 Codex 首轮。mode=design / implementation 二选一。
  */
-export type EntryKind = 'doc_review' | 'implement' | 'review_seed'
+export type EntryKind = 'continuation' | 'doc_review' | 'implement' | 'review_seed'
 
 export interface StartInput {
   claude: { session_id: string; cwd?: string }
   codex: { session_id: string; cwd?: string }
-  target_path: string
+  /** Continuation 入口可缺省；其它入口必填。 */
+  target_path?: string
   target_label?: string
-  mode: ReviewMode
+  /** Continuation 入口可缺省（mode 不参与 prompt）；其它入口必填。 */
+  mode?: ReviewMode
   max_rounds?: number
   wait_for_claude_idle?: boolean
   /** 逐步确认（手动）：每次跨会话传递前弹窗等用户拍板；默认 true。 */
@@ -99,6 +103,12 @@ export interface StartInput {
   seed_review_path?: string | null
   /** review_seed 的 seed 直接文本（与 seed_review_path 二选一）。 */
   seed_review_inline?: string | null
+  /**
+   * 评估方案最优性（仅 Design 系入口生效；Implementation 与 Continuation 忽略）。
+   * true → Codex 复核 SCOPE 多一条"方案 vs 替代方案合理性"维度。慢、易发散，
+   * 仅对"方案未定稿"的文档有用。默认 false。
+   */
+  evaluate_alternatives?: boolean
 }
 
 // ── 复核循环记录（持久化）──────────────────────────────────────────────────
@@ -167,8 +177,12 @@ export const CodeloopAPI = {
   listSessions: (limit = 30) => invoke<SessionSummary[]>('codeloop_list_sessions', { limit }),
   sessionMessages: (provider: Provider, sessionId: string, after: number) =>
     invoke<MessagesPage>('codeloop_session_messages', { provider, sessionId, after }),
-  newCodexSession: (claudeSessionId: string) =>
-    invoke<string>('codeloop_new_codex_session', { claudeSessionId }),
+  /** 新建 Codex 会话；可选 designDocPath：把文档原文 + VERDICT/ASK_USER 契约一起喂进首轮。 */
+  newCodexSession: (claudeSessionId: string, designDocPath?: string) =>
+    invoke<string>('codeloop_new_codex_session', {
+      claudeSessionId,
+      designDocPath: designDocPath ?? null,
+    }),
   /** 向单个会话发一轮（预览驱动台 / 首轮预热）；返回回复文本。真实调用 CLI。 */
   sendOne: (provider: Provider, sessionId: string, text: string) =>
     invoke<string>('codeloop_send_one', { provider, sessionId, text }),

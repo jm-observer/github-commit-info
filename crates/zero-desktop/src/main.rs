@@ -119,13 +119,9 @@ fn main() -> Result<()> {
     // `codeloop-smoke --json` 模式下 stdout 是 JSONL 契约，不能让 logger 串字符进来。
     // 此模式下完全跳过 logger 注册（log crate 变 no-op，driver / codeloop 的 log::info!
     // 都被吃掉）；其它命令保持原行为。
-    let suppress_logger = matches!(
-        cli.command,
-        Some(Command::CodeloopSmoke { json: true, .. })
-    );
+    let suppress_logger = matches!(cli.command, Some(Command::CodeloopSmoke { json: true, .. }));
     if !suppress_logger {
-        let _ =
-            custom_utils::logger::logger_feature(APP, "info,reqwest=warn", Info, false).build();
+        let _ = custom_utils::logger::logger_feature(APP, "info,reqwest=warn", Info, false).build();
     }
 
     init_trace();

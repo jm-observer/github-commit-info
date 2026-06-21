@@ -15,6 +15,9 @@ fn store() -> Store {
 
 const CODEX_DONE: &str = "11111111-aaaa-bbbb-cccc-000000000001";
 const CODEX_RUNNING: &str = "22222222-aaaa-bbbb-cccc-000000000002";
+/// fixture：在 session_index.jsonl 中保留，但 rollout 已搬到 archived_sessions/。
+/// 应被 list() 过滤掉，但仍可被 locate() 找到。
+const CODEX_ARCHIVED: &str = "44444444-aaaa-bbbb-cccc-000000000004";
 // 新源 fixture：含 response_item（developer/environment_context/多轮 user+assistant/
 // reasoning/function_call/output）+ event_msg 双写。不在 session_index.jsonl（不进 list）。
 const CODEX_RESUME: &str = "33333333-aaaa-bbbb-cccc-000000000003";
@@ -47,6 +50,35 @@ fn list_returns_both_providers_sorted() {
     let done = claude.iter().find(|r| r.id == CLAUDE_DONE).unwrap();
     assert_eq!(done.title, "Codeloop 双栏视图实现");
     assert_eq!(done.status, SessionStatus::Idle);
+}
+
+#[test]
+fn list_filters_out_codex_archived_sessions() {
+    // session_index 里有三条 codex 行，其中 ARCHIVED 的 rollout 在 archived_sessions/。
+    // list() 应只返回两条 active 的，不让归档会话出现在配对下拉里。
+    let rows = store().list(20).unwrap();
+    let codex_ids: Vec<&str> = rows
+        .iter()
+        .filter(|r| r.provider == Provider::Codex)
+        .map(|r| r.id.as_str())
+        .collect();
+    assert!(codex_ids.contains(&CODEX_DONE));
+    assert!(codex_ids.contains(&CODEX_RUNNING));
+    assert!(
+        !codex_ids.contains(&CODEX_ARCHIVED),
+        "已归档 session 不应出现在 list 输出里：实际 ids={codex_ids:?}"
+    );
+}
+
+#[test]
+fn locate_still_finds_archived_session() {
+    // locate() 仍跨 active + archived 两个根查找——归档会话「按 id 定位」仍可用，
+    // 仅在「列表」环节被过滤。保持现状以兼容 snapshot/messages 等其它入口。
+    let path = store()
+        .locate(Provider::Codex, CODEX_ARCHIVED)
+        .unwrap()
+        .expect("归档 session 仍能被 locate 定位到");
+    assert!(path.to_string_lossy().contains("archived_sessions"));
 }
 
 #[test]

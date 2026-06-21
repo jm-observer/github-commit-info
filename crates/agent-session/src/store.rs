@@ -161,32 +161,37 @@ impl Store {
         Ok(None)
     }
 
+    /// 仅在 active 目录里定位 rollout jsonl；已归档（搬到 archived_sessions/）的 → None。
+    /// 用于 codex_list 过滤——session_index.jsonl 不区分活/归档，需用文件系统位置判定。
+    fn codex_locate_active(&self, session_id: &str) -> Result<Option<PathBuf>> {
+        find_jsonl_containing(&self.codex_sessions_root(), session_id)
+    }
+
     fn codex_list(&self, limit: usize) -> Result<Vec<SessionSummary>> {
         let mut rows = read_jsonl(&self.codex_index())?;
         // 按 updated_at 倒序。
         rows.sort_by_key(|r| std::cmp::Reverse(str_field(r, "updated_at")));
+        // session_index.jsonl 保留已归档（`codex archive`）的条目；rollout jsonl 已被搬到
+        // ~/.codex/archived_sessions/。这些 session 不适合再驱动新一轮交互——下拉列表里
+        // 直接过滤掉，不消耗 limit 配额。
         let mut out = Vec::new();
-        for row in rows.into_iter().take(limit) {
+        for row in rows.into_iter() {
+            if out.len() >= limit {
+                break;
+            }
             let id = str_field(&row, "id");
-            // 读一次会话文件，同时得到状态 / 首条用户消息预览 / cwd。
-            let (status, preview, cwd) = match self.codex_locate(&id)? {
-                Some(path) => {
-                    let events = read_jsonl(&path)?;
-                    (
-                        codex_status(&events),
-                        codex_first_user(&events),
-                        codex_cwd(&events).to_string_lossy().into_owned(),
-                    )
-                }
-                None => (SessionStatus::Unknown, String::new(), String::new()),
+            // 只在 active 目录里查；查不到即视为已归档（或文件已删），跳过。
+            let Some(path) = self.codex_locate_active(&id)? else {
+                continue;
             };
+            let events = read_jsonl(&path)?;
             out.push(SessionSummary {
                 provider: Provider::Codex,
                 id,
                 title: str_field(&row, "thread_name"),
-                preview,
-                cwd,
-                status,
+                preview: codex_first_user(&events),
+                cwd: codex_cwd(&events).to_string_lossy().into_owned(),
+                status: codex_status(&events),
                 updated_at: str_field(&row, "updated_at"),
             });
         }

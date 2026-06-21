@@ -21,6 +21,9 @@ interface Props {
   setEstCodex: (v: boolean) => void
   estClaude: boolean
   setEstClaude: (v: boolean) => void
+  /** 评估方案最优性：仅 Design 系入口（非 Continuation、mode=design）显示。 */
+  evaluateAlternatives: boolean
+  setEvaluateAlternatives: (v: boolean) => void
   /** 打开预览 / 手动驱动台。 */
   onPreview: () => void
   canStart: boolean
@@ -38,13 +41,15 @@ interface Props {
 /** target_path 控件的 label 文案随入口 + mode 变化（§7 角色矩阵）。 */
 function targetPathLabel(entryKind: EntryKind, mode: ReviewMode): string {
   switch (entryKind) {
+    case 'continuation':
+      return ''
     case 'doc_review':
       return '待复核 / 修订文档（仓库内路径）'
     case 'implement':
       return '设计/规格文档（仓库内路径）'
     case 'review_seed':
       return mode === 'implementation'
-        ? '待修订代码根（仓库内路径）'
+        ? '待修订代码根（仓库内相对路径，文件或目录均可）'
         : '待修订文档（仓库内路径）'
   }
 }
@@ -59,16 +64,31 @@ export function LoopStatusBar(props: Props) {
   return (
     <div className="flex flex-col gap-2 rounded-md border border-gray-200 bg-gray-50 p-3 dark:border-gray-800 dark:bg-gray-900">
       <div className="flex flex-wrap items-end gap-3">
-        <div className="flex flex-1 flex-col gap-1" style={{ minWidth: 220 }}>
-          <label className="text-xs text-gray-500 dark:text-gray-400">{targetPathLabel(entryKind, mode)}</label>
-          <input
-            type="text"
-            value={props.targetPath}
-            onChange={e => props.setTargetPath(e.target.value)}
-            placeholder={entryKind === 'review_seed' && mode === 'implementation' ? 'src/' : 'docs/foo.md'}
-            className="rounded-md border border-gray-300 bg-white px-2 py-1.5 text-sm outline-none focus:border-blue-400 dark:border-gray-600 dark:bg-gray-800 dark:text-gray-100"
-          />
-        </div>
+        {entryKind === 'continuation' ? (
+          <div className="flex flex-1 flex-col gap-1 pb-2" style={{ minWidth: 220 }}>
+            <div className="text-xs text-gray-500 dark:text-gray-400">复核范围</div>
+            <div className="rounded-md border border-dashed border-gray-300 bg-gray-50 px-2 py-1.5 text-xs text-gray-600 dark:border-gray-700 dark:bg-gray-800/60 dark:text-gray-300">
+              既有会话已携带上下文 —— 无需指定 target，循环只发「继续审核 ↔ 继续修订」。
+            </div>
+          </div>
+        ) : (
+          <div className="flex flex-1 flex-col gap-1" style={{ minWidth: 220 }}>
+            <label className="text-xs text-gray-500 dark:text-gray-400">
+              {targetPathLabel(entryKind, mode)}
+            </label>
+            <input
+              type="text"
+              value={props.targetPath}
+              onChange={e => props.setTargetPath(e.target.value)}
+              placeholder={
+                entryKind === 'review_seed' && mode === 'implementation'
+                  ? 'crates/zero-desktop（文件或目录均可）'
+                  : 'docs/foo.md'
+              }
+              className="rounded-md border border-gray-300 bg-white px-2 py-1.5 text-sm outline-none focus:border-blue-400 dark:border-gray-600 dark:bg-gray-800 dark:text-gray-100"
+            />
+          </div>
+        )}
 
         <div className="flex flex-col gap-1">
           <label className="text-xs text-gray-500 dark:text-gray-400">最大轮次</label>
@@ -137,6 +157,22 @@ export function LoopStatusBar(props: Props) {
           />
           Claude 已预热
         </label>
+
+        {/* 仅 Design 系入口（非 Continuation、mode=design）显示——Implementation 阶段评估方案
+            最优性 = 返工；Continuation 直接走会话历史，无 SCOPE。 */}
+        {entryKind !== 'continuation' && mode === 'design' && (
+          <label
+            className="flex items-center gap-1.5 pb-2 text-xs text-gray-600 dark:text-gray-300"
+            title="多一条「评估所选方案 vs 替代方案合理性」维度。慢、易发散，仅对方案未定稿的文档有用；定稿落地阶段勿开。"
+          >
+            <input
+              type="checkbox"
+              checked={props.evaluateAlternatives}
+              onChange={e => props.setEvaluateAlternatives(e.target.checked)}
+            />
+            评估方案合理性
+          </label>
+        )}
 
         <button
           onClick={props.onPreview}

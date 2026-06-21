@@ -311,9 +311,8 @@ impl Db {
                 let mode: String = row.get(9)?;
                 // 读侧推断（§5 兼容表）：把 NULL 行的 entry_kind 用 mode 推断后写回到 DTO 上
                 // 供前端展示，不回填 DB。
-                let entry_kind = Some(
-                    infer_entry_kind(entry_kind_db.as_deref(), &mode).to_string(),
-                );
+                let entry_kind =
+                    Some(infer_entry_kind(entry_kind_db.as_deref(), &mode).to_string());
                 Ok(LoopRow {
                     id: row.get(0)?,
                     created_at: row.get(1)?,

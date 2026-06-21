@@ -62,6 +62,7 @@ const PHASE_LABELS: Record<string, string> = {
 }
 
 const ENTRY_META: Record<EntryKind, { icon: string; label: string; title: string }> = {
+  continuation: { icon: '▶', label: '续跑', title: '继续既有讨论（Continuation）' },
   doc_review: { icon: '📄', label: '文档复核', title: '从文档复核开始（DocReview）' },
   implement: { icon: '🛠', label: '从实现开始', title: '从实现开始（Implement）' },
   review_seed: { icon: '📝', label: '外部 seed', title: '从既有复核意见开始（ReviewSeed）' },
@@ -317,7 +318,11 @@ export function LoopDetail({
         {/* 配置内容（只读，对应上方新建表单的字段）。 */}
         <div className="mt-2 grid grid-cols-[auto_1fr] gap-x-3 gap-y-0.5 text-[11px] text-gray-500 dark:text-gray-400">
           <span className="text-gray-400">目标</span>
-          <span className="truncate text-gray-600 dark:text-gray-300" title={loop.target_abs}>{loop.target_abs}</span>
+          {loop.entry_kind === 'continuation' || !loop.target_repo_rel ? (
+            <span className="text-gray-500 dark:text-gray-400 italic">（继续既有讨论，无指定 target）</span>
+          ) : (
+            <span className="truncate text-gray-600 dark:text-gray-300" title={loop.target_abs}>{loop.target_abs}</span>
+          )}
           <span className="text-gray-400">仓库</span>
           <span className="truncate text-gray-600 dark:text-gray-300" title={loop.repo_root}>{loop.repo_root}</span>
           <span className="text-gray-400">Claude</span>
