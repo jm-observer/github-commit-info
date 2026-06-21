@@ -23,7 +23,12 @@ impl Default for VadSettings {
 }
 
 /// Built-in default orchestrator URL.
-pub(crate) const DEFAULT_REMOTE_URL: &str = "ws://192.168.0.68:8090/stream";
+/// orchestrator 已并入 toolkit-server :8788/api/asr 同进程,默认指向新地址。
+pub(crate) const DEFAULT_REMOTE_URL: &str = "ws://192.168.0.68:8788/api/asr/stream";
+
+/// 旧默认 URL（orchestrator 独立 :8090 时期）。`load_remote_settings_from_db` 会把 DB 里
+/// 残留的此值自动迁移到新 `DEFAULT_REMOTE_URL`,因为现网 :8090 已退役。
+const LEGACY_REMOTE_URL: &str = "ws://192.168.0.68:8090/stream";
 
 /// Combined settings DTO exchanged with the frontend.
 #[derive(Serialize, Deserialize, Clone)]
@@ -113,6 +118,8 @@ pub(crate) async fn apply_settings_to_state(
     let new_vad = VadSettings {
         asr_language: new_settings.asr_language,
     };
+    // voice_commands_enabled 暂未进 CombinedSettings DTO（UI 尚未暴露开关），保留当前值。
+    let voice_commands_enabled = read_lock(&state.llm_settings).voice_commands_enabled;
     let new_llm = LlmSettings {
         auto_copy_mode: new_settings.auto_copy_mode,
         merge_window_ms: new_settings.merge_window_ms.min(MAX_MERGE_WINDOW_MS),
@@ -121,6 +128,7 @@ pub(crate) async fn apply_settings_to_state(
         auto_paste: new_settings.auto_paste,
         auto_paste_rewrite_retype: new_settings.auto_paste_rewrite_retype,
         auto_start: new_settings.auto_start,
+        voice_commands_enabled,
     };
     let new_url = new_settings.remote_url.trim().to_string();
 
@@ -261,11 +269,17 @@ pub(crate) async fn load_llm_settings_from_db(db: &db::SpeechDatabase) -> LlmSet
     if let Ok(Some(v)) = db.get_setting("ui.auto_start".to_string()).await {
         s.auto_start = matches!(v.as_str(), "1" | "on" | "true");
     }
+    if let Ok(Some(v)) = db
+        .get_setting("llm.voice_commands_enabled".to_string())
+        .await
+    {
+        s.voice_commands_enabled = !matches!(v.as_str(), "0" | "off" | "false");
+    }
     s
 }
 
 pub(crate) async fn load_remote_settings_from_db(db: &db::SpeechDatabase) -> (String, Vec<String>) {
-    let url = match db.get_setting("remote.url".to_string()).await {
+    let mut url = match db.get_setting("remote.url".to_string()).await {
         Ok(Some(v))
             if !v.trim().is_empty() && (v.starts_with("ws://") || v.starts_with("wss://")) =>
         {
@@ -273,6 +287,18 @@ pub(crate) async fn load_remote_settings_from_db(db: &db::SpeechDatabase) -> (St
         }
         _ => DEFAULT_REMOTE_URL.to_string(),
     };
+    // 迁移:DB 里残留的旧 orchestrator :8090 URL 自动改写为新地址并回写。:8090 已退役,
+    // 不改写会让升级用户继续连死端口。
+    if url == LEGACY_REMOTE_URL {
+        info!(
+            "speech.remote_url: 迁移旧默认 {} -> {}",
+            LEGACY_REMOTE_URL, DEFAULT_REMOTE_URL
+        );
+        url = DEFAULT_REMOTE_URL.to_string();
+        let _ = db
+            .upsert_setting("remote.url".to_string(), url.clone())
+            .await;
+    }
     let presets = match db.get_setting("remote.url_presets".to_string()).await {
         Ok(Some(v)) => serde_json::from_str::<Vec<String>>(&v)
             .unwrap_or_default()
@@ -282,6 +308,7 @@ pub(crate) async fn load_remote_settings_from_db(db: &db::SpeechDatabase) -> (St
                 !t.is_empty()
                     && (t.starts_with("ws://") || t.starts_with("wss://"))
                     && t != DEFAULT_REMOTE_URL
+                    && t != LEGACY_REMOTE_URL
             })
             .collect(),
         _ => Vec::new(),
