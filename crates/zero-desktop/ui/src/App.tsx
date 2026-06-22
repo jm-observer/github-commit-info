@@ -2,6 +2,7 @@ import { BrowserRouter, Navigate, Route, Routes } from "react-router-dom";
 import ShellLayout from "./shared/ShellLayout";
 import EnglishAnnotated from "./modules/english/EnglishAnnotated";
 import EnglishAll from "./modules/english/EnglishAll";
+import EnglishPackages from "./modules/english/EnglishPackages";
 import SpeechPage from "./modules/speech/SpeechPage";
 import AudioCleanPage from "./modules/audio-clean/AudioCleanPage";
 import CookiePage from "./modules/cookie/CookiePage";
@@ -25,6 +26,7 @@ export default function App() {
             <Route index element={<Navigate to="/english/annotated" replace />} />
             <Route path="english/annotated" element={<EnglishAnnotated />} />
             <Route path="english/all" element={<EnglishAll />} />
+            <Route path="english/packages" element={<EnglishPackages />} />
             <Route path="speech" element={<SpeechPage />} />
             <Route path="audio-clean" element={<AudioCleanPage />} />
             <Route path="cookie" element={<CookiePage />} />

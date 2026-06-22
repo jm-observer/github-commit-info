@@ -18,6 +18,15 @@ export interface Sentence {
   [key: string]: any
 }
 
+/** 音频包（「按包来听」）。与后端 package.list 返回项对齐（迁自 mini-program Package）。 */
+export interface Package {
+  id: number
+  title: string
+  description?: string | null
+  sentence_count?: number
+  [key: string]: any
+}
+
 /** 单个参考词的判定结果（逐词标色用）。与后端 shadow::WordResult 对齐。 */
 export interface ShadowWordResult {
   ref: string

@@ -11,6 +11,8 @@ import ApiService from '../services/ApiService'
 import FileCacheManager from '../services/FileCacheManager'
 import EnvConfigService from '../services/EnvConfigService'
 import HtmlAudioAdapter from '../adapters/HtmlAudioAdapter'
+import { playerSession } from '../services/playerSession'
+import { shouldCacheAudio, backgroundCacheAudios } from '../services/audioCache'
 import type { Sentence } from '../types'
 import { Button } from '../../speech/components/ui/Button'
 import { readAutoStartPref } from '../autoStartPref'
@@ -44,7 +46,8 @@ export default function AnnotationPlayer({ autoStart = true, dataSource = 'annot
     // 同 dataSource 已经初始化过 → 切菜单回来,直接挂回单例 UI,不停播放、不重拉列表。
     if (
       componentInstanceState.initializedDataSource === dataSource &&
-      componentInstanceState.sentences.length > 0
+      componentInstanceState.sentences.length > 0 &&
+      playerSession.owner === dataSource  // 单例仍归本 dataSource(没被「听包」等入口接管)才复用
     ) {
       setSentences(componentInstanceState.sentences)
       setInitialized(true)
@@ -92,17 +95,24 @@ export default function AnnotationPlayer({ autoStart = true, dataSource = 'annot
       setError(null)
 
       const sentencesList = await loadSentences()
-      await cacheAudioFiles(sentencesList)
 
       setLoadingText('正在初始化播放器...')
       await new Promise(resolve => setTimeout(resolve, 100))
       await initAudioPlayer(sentencesList)
+
+      // 缓存不阻塞起播：LAN 直接流式不缓存，WAN 后台静默缓存整批。
+      const envConfig = await EnvConfigService.getInstance().getConfig()
+      if (shouldCacheAudio(envConfig.apiBaseUrl)) {
+        backgroundDownloadCancelRef.current = false
+        void backgroundCacheAudios(sentencesList, envConfig.apiBaseUrl, backgroundDownloadCancelRef)
+      }
 
       setLoading(false)
       setInitialized(true)
       // 标记初始化完成 + 缓存列表,下次同 dataSource mount 走 fast-path 直接复用。
       componentInstanceState.initializedDataSource = dataSource
       componentInstanceState.sentences = sentencesList
+      playerSession.owner = dataSource  // 声明单例当前归本 dataSource 所有
     } catch (err: any) {
       console.error('播放器初始化失败:', err)
       setLoading(false)
@@ -128,63 +138,6 @@ export default function AnnotationPlayer({ autoStart = true, dataSource = 'annot
       throw new Error(dataSource === 'annotated' ? '没有标注句子' : '没有句子')
     }
     return list
-  }
-
-  const cacheAudioFiles = async (sentencesList: Sentence[]) => {
-    if (!sentencesList.length) return
-
-    // EnvConfig 用于缓存 manager（apiBaseUrl 备用）
-    const envConfig = await EnvConfigService.getInstance().getConfig()
-    const cacheManager = FileCacheManager.getInstance()
-
-    const isAllMode = dataSource === 'all'
-    const primary = isAllMode ? sentencesList.slice(0, 50) : sentencesList
-    const remaining = isAllMode ? sentencesList.slice(50) : []
-
-    let cachedCount = 0
-    const totalCount = primary.reduce((acc, s) => acc + s.audios.length, 0)
-
-    for (const sentence of primary) {
-      for (const audio of sentence.audios) {
-        setLoadingText(`正在缓存音频... (${cachedCount + 1}/${totalCount})`)
-        try {
-          await cacheManager.downloadAndCache(audio.id, envConfig.apiBaseUrl)
-          cachedCount++
-        } catch (err) {
-          console.error(`缓存音频失败 (ID: ${audio.id}):`, err)
-        }
-      }
-    }
-
-    if (remaining.length > 0) {
-      backgroundDownloadCancelRef.current = false
-      cacheRemainingAudioFiles(remaining, cacheManager, envConfig.apiBaseUrl).catch(err => {
-        if (!backgroundDownloadCancelRef.current) console.error('后台下载出错:', err)
-      })
-    }
-  }
-
-  const cacheRemainingAudioFiles = async (
-    remainingSentences: Sentence[],
-    cacheManager: FileCacheManager,
-    apiBaseUrl: string
-  ) => {
-    if (backgroundDownloadCancelRef.current) return
-    let count = 0
-    for (const sentence of remainingSentences) {
-      if (backgroundDownloadCancelRef.current) return
-      for (const audio of sentence.audios) {
-        if (backgroundDownloadCancelRef.current) return
-        try {
-          await cacheManager.downloadAndCache(audio.id, apiBaseUrl)
-          count++
-          if (count % 10 === 0) console.log(`后台下载进度: ${count}`)
-        } catch (err) {
-          if (backgroundDownloadCancelRef.current) return
-          console.error(`后台缓存失败 (ID: ${audio.id}):`, err)
-        }
-      }
-    }
   }
 
   const initAudioPlayer = async (sentencesList: Sentence[]) => {

@@ -62,6 +62,18 @@ class ApiService {
     return this.request('sentences.all')
   }
 
+  /** 取音频包列表（「按包来听」）。对应 mini-program 的 package.list。 */
+  async getPackages() {
+    return this.request<import('../types').Package[]>('package.list')
+  }
+
+  /** 取指定包内的句子（带 customer_id 以回显标注/报错状态）。对应 package.sentences。 */
+  async getPackageSentences(packageId: number) {
+    const customerId = await EnvConfigService.getInstance().getCustomerId()
+    if (!customerId) throw new Error('customer_id 未配置，请在设置页配置 customer_id')
+    return this.request('package.sentences', { customer_id: customerId, package_id: packageId })
+  }
+
   async annotateSentence(sentenceId: number, annotationText: string) {
     const customerId = await EnvConfigService.getInstance().getCustomerId()
     if (!customerId) throw new Error('customer_id 未配置，请在设置页配置 customer_id')

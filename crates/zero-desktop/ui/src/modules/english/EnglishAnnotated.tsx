@@ -4,11 +4,13 @@
  */
 
 import EnglishBootstrap from './EnglishBootstrap'
+import EnglishTabs from './components/EnglishTabs'
 import AnnotationPlayer from './components/AnnotationPlayer'
 
 export default function EnglishAnnotated() {
   return (
     <EnglishBootstrap>
+      <EnglishTabs />
       <AnnotationPlayer autoStart={true} dataSource="annotated" />
     </EnglishBootstrap>
   )
