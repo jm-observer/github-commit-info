@@ -1,6 +1,7 @@
 //! toolkit-server：axum 服务，装配 toolkit-core / toolkit-tasks + 业务模块（Plan 2+）。
 
 pub mod audioforge;
+mod audiostore;
 pub mod codeloop;
 pub mod config;
 #[path = "douyin/mod.rs"]
@@ -116,7 +117,9 @@ pub fn build_router(state: AppState, web_dir: &std::path::Path) -> axum::Router 
         .nest("/api/web", routes::web::router())
         .nest(
             "/api/web/audio",
-            routes::audio::router().merge(audioforge::routes::router()),
+            routes::audio::router()
+                .merge(audioforge::routes::router())
+                .merge(audiostore::routes::router()),
         )
         .nest("/api/web/douyin", douyin_mod::routes::router())
         .nest("/api/web/llm", llm::routes::router())

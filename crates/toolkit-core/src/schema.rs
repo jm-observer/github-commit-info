@@ -153,4 +153,19 @@ CREATE TABLE IF NOT EXISTS shadow_stat (
     last_at       TEXT,
     PRIMARY KEY (customer_id, sentence_id, word_index, kind)
 );
+
+-- 音频统一仓库（audio-store）：内容寻址 blob 仓库，按 id 收拢音频字节，供 english 等消费方
+-- 持引用消复制。**只存音频字节本身的元信息、不持任何产品语义**（句子/课程/包等都在消费方）。
+-- id = sm3(bytes) 前 8 字节短哈希（`aud_` 前缀），同内容自然去重（内容寻址幂等）。字节落
+-- `<workspace>/audio-store/<id>.wav`，本表记元信息。纯加表、IF NOT EXISTS 幂等：同 codeloop_io /
+-- llm_* / shadow_*，migrate() 启动即建出，故不需要、也不应 bump SCHEMA_VERSION。
+-- 见 docs/audio-store-design.md。
+CREATE TABLE IF NOT EXISTS audio_blob (
+    id           TEXT PRIMARY KEY,
+    bytes        INTEGER NOT NULL,
+    duration     REAL,
+    content_type TEXT NOT NULL DEFAULT 'audio/wav',
+    source       TEXT NOT NULL,
+    created_at   TEXT NOT NULL
+);
 "#;

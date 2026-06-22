@@ -28,6 +28,7 @@ log = { workspace = true }
 custom-utils = { workspace = true, features = ["updater", "trace"] }
 rusqlite = { workspace = true }
 reqwest = { workspace = true }
+sm3 = { workspace = true }
 
 [dev-dependencies]
 reqwest = { workspace = true }
