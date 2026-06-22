@@ -27,8 +27,11 @@ document.querySelectorAll("nav#tabs button").forEach((b) => {
     if (b.dataset.tab === "asr") {
       // 懒加载 ASR 控制台 iframe：首次切到「语音」tab 时才注入 src，
       // 避免每次开主面板都建立 WS。
+      // 注意:必须用无尾斜杠的 "/api/asr" —— axum `nest("/api/asr", ..)` 把内层
+      // `/` 路由映射到 `/api/asr`(无斜杠)上,带斜杠的 `/api/asr/` 反而 404,
+      // iframe 会白屏。
       const f = $("asr-frame");
-      if (f && !f.src) f.src = "/api/asr/";
+      if (f && !f.src) f.src = "/api/asr";
     }
   };
 });

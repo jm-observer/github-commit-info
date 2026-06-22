@@ -1454,13 +1454,23 @@ textarea{width:100%;min-height:96px;line-height:1.5;font-family:ui-monospace,SFM
 <button data-t=sp>声纹</button><button data-t=cf>配置</button></nav>
 <main><div id=v></div></main>
 <script>
+// Nested mount support: standalone serve at "/", toolkit-server nests this
+// router under "/api/asr". location.pathname tells us which prefix to prepend
+// to all absolute paths inside this page (API fetch + href + audio src). On
+// standalone, __PREFIX is '' and behavior is unchanged.
+const __PREFIX=(function(){let p=location.pathname.replace(/\/$/,'');p=p.replace(/\/segment\/\d+$/,'');return p})();
+// Root URL for "back to console" / tab-bounce links. Standalone -> "/";
+// nested -> "/api/asr" WITHOUT trailing slash (axum's nest 404s "/api/asr/").
+const __ROOT=__PREFIX||'/';
+const __origFetch=window.fetch.bind(window);
+window.fetch=function(u,o){if(typeof u==='string'&&u.charAt(0)==='/')u=__PREFIX+u;return __origFetch(u,o)};
 const V=document.getElementById('v');let tab='ov';
 const NAV=document.querySelector('nav');
 document.querySelectorAll('nav button').forEach(b=>b.onclick=()=>{
  // When entering the standalone /segment/:id page, the nav buttons should
  // bounce back to "/" with the desired tab active; on the main console they
  // just switch tabs in-place.
- if(window.__singleMode){location.href='/#'+b.dataset.t;return}
+ if(window.__singleMode){location.href=__ROOT+'#'+b.dataset.t;return}
  document.querySelectorAll('nav button').forEach(x=>x.classList.remove('on'));
  b.classList.add('on');tab=b.dataset.t;render()});
 async function j(u,m,bd){const o={method:m||'GET'};if(bd){o.headers={'content-type':'application/json'};o.body=JSON.stringify(bd)}return (await fetch(u,o)).json()}
@@ -1567,12 +1577,12 @@ async function clearAllHistory(){
 function renderSeg(r,opts){
  opts=opts||{};
  const audioBtn=r.has_audio
-  ?`<button class="s ren" onclick="playSeg(${r.id})">▶ 试听</button> <a class="s ren" style="text-decoration:none;display:inline-block" href="/api/segments/${r.id}/audio">⬇ 下载</a>`
+  ?`<button class="s ren" onclick="playSeg(${r.id})">▶ 试听</button> <a class="s ren" style="text-decoration:none;display:inline-block" href="${__PREFIX}/api/segments/${r.id}/audio">⬇ 下载</a>`
   :'<span class=note>(音频已过期)</span>';
  const openLink=opts.hideOpen?''
-  :`<a class="s ren" style="text-decoration:none;display:inline-block" href="/segment/${r.id}" target="_blank" rel="noopener" title="在新标签页单独打开此条记录">↗ 单独打开</a>`;
+  :`<a class="s ren" style="text-decoration:none;display:inline-block" href="${__PREFIX}/segment/${r.id}" target="_blank" rel="noopener" title="在新标签页单独打开此条记录">↗ 单独打开</a>`;
  const idHtml=opts.hideOpen?`<span class=id>#${r.id}</span>`
-  :`<span class=id><a href="/segment/${r.id}" target="_blank" rel="noopener" title="在新标签页打开">#${r.id}</a></span>`;
+  :`<span class=id><a href="${__PREFIX}/segment/${r.id}" target="_blank" rel="noopener" title="在新标签页打开">#${r.id}</a></span>`;
  return `<div class=seg id=seg_${r.id}>
   <div class=seg-hd>
    ${idHtml}
@@ -1606,14 +1616,14 @@ async function delSeg(id,singleMode){
  if(!confirm('删除该条记录?(原文/优化/翻译及保留的音频都会删除,且不可恢复)'))return;
  const d=await j('/api/segments/'+id,'DELETE');
  if(d.ok){
-  if(singleMode){location.href='/#hi';return}
+  if(singleMode){location.href=__ROOT+'#hi';return}
   const el=document.getElementById('seg_'+id);if(el)el.remove();
  }else{alert('删除失败')}
 }
 function esc(s){return (s+'').replace(/[&<>]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;'}[c]))}
 function escA(s){return esc(s).replace(/"/g,'&quot;')}
 async function saveSeg(id){const t=document.getElementById('tx_'+id).value;const d=await j('/api/segments/'+id+'/text','POST',{text:t});alert(d.ok?'已保存':'保存失败:'+(d.error||'?'))}
-function playSeg(id){const a=document.getElementById('hap');a.style.display='block';a.src='/api/segments/'+id+'/audio';a.play()}
+function playSeg(id){const a=document.getElementById('hap');a.style.display='block';a.src=__PREFIX+'/api/segments/'+id+'/audio';a.play()}
 async function dl(id){if(confirm('删除该声纹?')){await j('/api/speakers/'+id,'DELETE');render()}}
 async function rn(id){const n=prompt('新名称');if(n){await j('/api/speakers/'+id+'/rename','POST',{name:n});render()}}
 async function en(id,e){await j('/api/speakers/'+id+'/enabled','POST',{enabled:e})}
@@ -1650,12 +1660,12 @@ async function renderSingleSegment(id){
  if(NAV)NAV.style.display='none';
  let r;
  try{const resp=await fetch('/api/segments/'+id);
-  if(!resp.ok){V.innerHTML='<div class="card single-wrap"><a class="s ren back" href="/">← 返回管理台</a><p class=note style="margin-top:14px">未找到 #'+id+' 的记录(可能已删除)。</p></div>';return}
+  if(!resp.ok){V.innerHTML='<div class="card single-wrap"><a class="s ren back" href="'+__ROOT+'">← 返回管理台</a><p class=note style="margin-top:14px">未找到 #'+id+' 的记录(可能已删除)。</p></div>';return}
   r=await resp.json();
- }catch(e){V.innerHTML='<div class="card single-wrap"><a class="s ren back" href="/">← 返回管理台</a><p class=note style="margin-top:14px">加载失败:'+esc(String(e))+'</p></div>';return}
- const audioSrc=r.has_audio?('/api/segments/'+r.id+'/audio'):'';
+ }catch(e){V.innerHTML='<div class="card single-wrap"><a class="s ren back" href="'+__ROOT+'">← 返回管理台</a><p class=note style="margin-top:14px">加载失败:'+esc(String(e))+'</p></div>';return}
+ const audioSrc=r.has_audio?(__PREFIX+'/api/segments/'+r.id+'/audio'):'';
  V.innerHTML='<div class="single-wrap">'+
-  '<a class="s ren back" href="/" style="text-decoration:none">← 返回管理台</a>'+
+  '<a class="s ren back" href="'+__ROOT+'" style="text-decoration:none">← 返回管理台</a>'+
   '<div class=card>'+
    (audioSrc?'<audio id=hap controls autoplay style="width:100%;margin-bottom:14px" src="'+audioSrc+'"></audio>'
             :'<p class=note style="margin-bottom:10px">(原始音频已过期或未保存,只剩文本)</p>')+
@@ -1663,7 +1673,8 @@ async function renderSingleSegment(id){
   '</div></div>';
 }
 function bootstrap(){
- const m=location.pathname.match(/^\/segment\/(\d+)\/?$/);
+ // Match /segment/:id whether on standalone "/" or nested under "/api/asr/".
+ const m=location.pathname.match(/\/segment\/(\d+)\/?$/);
  if(m){renderSingleSegment(parseInt(m[1],10));return}
  // hash-based jump (e.g. coming back from a /segment page with /#hi)
  const h=(location.hash||'').replace('#','');
