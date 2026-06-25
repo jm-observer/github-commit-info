@@ -216,6 +216,7 @@ pwsh ./deploy-g10.ps1 -SkipBuild # 仅复制已有产物
 - [docs/english-shadow-design.md](docs/english-shadow-design.md) — 英语跟读判分（v1：ASR 文本对齐）设计。
 - [docs/english-shadow-todo.md](docs/english-shadow-todo.md) — 跟读判分优化需求 TODO（全自动 / 实时录评 / 发音级评分）。
 - [docs/english-shadow-gop-design.md](docs/english-shadow-gop-design.md) — 跟读发音级评测（GOP 音素评分）设计。
+- [docs/english-shadow-realtime-design.md](docs/english-shadow-realtime-design.md) — 跟读实时发音评测（流式 GOP：流式声学 + 在线对齐 + WS，批量 GOP 作 finalizer）设计。
 - [docs/distributed-worker-design.md](docs/distributed-worker-design.md) — 分布式 worker 设计：多 IP 节点 + pull 调度 + 两段式自更新。
 - [docs/toolkit-rfc/2026-06-04-initial-skeleton/data-model.md](docs/toolkit-rfc/2026-06-04-initial-skeleton/data-model.md) — SQLite 数据模型。
 - [docs/toolkit-rfc/2026-06-10-toolkit-elevation/plan.md](docs/toolkit-rfc/2026-06-10-toolkit-elevation/plan.md) — 提级为统一工具中台的分阶段规划。
