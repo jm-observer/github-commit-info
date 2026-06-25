@@ -27,8 +27,8 @@ export interface Package {
   [key: string]: any
 }
 
-/** 发音三档（GOP 后端）。与后端 PhoneResult/WordResult 的 pron_status 对齐。 */
-export type ShadowPronStatus = 'ok' | 'warn' | 'bad'
+/** 发音四档（GOP 后端）。`uncertain`=引擎没把这个音对齐好,不判对错。与后端 pron_status 对齐。 */
+export type ShadowPronStatus = 'ok' | 'warn' | 'bad' | 'uncertain'
 
 /** 单个参考音素的发音评测结果（GOP 后端）。与后端 shadow::PhoneResult 对齐。 */
 export interface ShadowPhoneResult {
@@ -39,6 +39,11 @@ export interface ShadowPhoneResult {
   expected_ph?: string
   actual_ph?: string
   hint?: string
+  /** 对齐可靠性：false → 引擎没对齐好(uncertain),不算读错。 */
+  reliable?: boolean
+  /** 该音素对齐时间段(秒)。 */
+  t_start?: number
+  t_end?: number
 }
 
 /**

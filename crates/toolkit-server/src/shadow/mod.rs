@@ -53,8 +53,13 @@ pub fn select_backend() -> ScoreBackend {
     }
 }
 
-/// 默认「通过」阈值（内容命中率）。设计 §2 决策 1。
-pub const DEFAULT_THRESHOLD: f64 = 0.9;
+/// 默认「通过」阈值。v1=内容命中率;GOP=句级发音分。GOP 分天花板 ~0.9,旧 0.9 不合理 → 0.6。
+/// 见 docs/english-shadow-scoring-ui-design.md §2.4。前端 passThreshold 滑杆覆盖此默认。
+pub const DEFAULT_THRESHOLD: f64 = 0.6;
+
+/// GOP 通过判定允许的「严重错读音素」上限(uncertain 不计)。真人读一句几乎总有 1 个孤立难音素
+/// (尾塞音 / ʃ 等),要求「零 bad」基本无法通过 → 放宽到 ≤1。见 scoring-ui 设计 §2.4。
+pub const MAX_BAD_PHONES: u32 = 1;
 
 /// 跟读粒度。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -87,7 +92,7 @@ pub struct PhoneResult {
     pub ph: String,
     /// 该音素发音分 0~1（已标定）。
     pub score: f64,
-    /// 发音三档：`ok` 达标 / `warn` 偏弱 / `bad` 明显错读。
+    /// 发音四档：`ok` 达标 / `warn` 偏弱 / `bad` 明显错读 / `uncertain` 没对齐上(不判对错)。
     pub pron_status: String,
     /// 错读时的「期望音素」（结构化，前端/落库以此为准）。
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -98,6 +103,14 @@ pub struct PhoneResult {
     /// 人类可读诊断文案（由 expected/actual 拼出，仅展示用）。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub hint: Option<String>,
+    /// 对齐可靠性：`Some(false)` → 引擎没把这个音对齐好(uncertain)。见 scoring-ui 设计 §3。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reliable: Option<bool>,
+    /// 该音素对齐时间段(秒),供明细表/波形定位。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub t_start: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub t_end: Option<f64>,
 }
 
 /// 单个参考词的判定结果（供前端逐词标色）。

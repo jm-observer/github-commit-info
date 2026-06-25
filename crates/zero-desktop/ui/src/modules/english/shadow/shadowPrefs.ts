@@ -27,7 +27,7 @@ export const DEFAULT_SHADOW_PREFS: ShadowPrefs = {
   enabled: false,
   granularity: 'sentence',
   autoAdvanceOnPass: true,
-  passThreshold: 0.9,
+  passThreshold: 0.6,
   captureMode: 'auto',
   streaming: false
 }

@@ -9,10 +9,10 @@
  */
 
 import { useCallback, useEffect, useRef, useState } from 'react'
-import { Mic, Square, SkipForward, RotateCcw, Star, Loader2, CheckCircle2, XCircle } from 'lucide-react'
+import { Mic, Square, SkipForward, RotateCcw, Star, Loader2, CheckCircle2, XCircle, Volume2 } from 'lucide-react'
 import { AudioPlayerService } from '../services/AudioPlayerService'
 import ApiService from '../services/ApiService'
-import type { Sentence, ShadowScore, ShadowStat, ShadowWordResult } from '../types'
+import type { Sentence, ShadowScore, ShadowStat, ShadowWordResult, ShadowPhoneResult, ShadowPronStatus } from '../types'
 import { Button } from '../../speech/components/ui/Button'
 import {
   captureUtterance,
@@ -45,6 +45,7 @@ function wordColorClass(w: ShadowWordResult): string {
       case 'ok': return 'text-green-600 dark:text-green-400'
       case 'warn': return 'text-amber-600 underline decoration-dotted dark:text-amber-400'
       case 'bad': return 'text-red-500 underline decoration-wavy dark:text-red-400'
+      case 'uncertain': return 'text-gray-400 decoration-dotted dark:text-gray-500'
     }
   }
   return w.status === 'ok'
@@ -54,18 +55,20 @@ function wordColorClass(w: ShadowWordResult): string {
       : 'text-gray-400 line-through dark:text-gray-500'
 }
 
-/** 从判分结果收集需要提示的错读音素（warn/bad），附所属词，供针对性纠音展示。 */
-function collectPhoneHints(score: ShadowScore): { word: string, ph: string, hint: string }[] {
-  const out: { word: string, ph: string, hint: string }[] = []
-  for (const w of score.words) {
-    for (const p of w.phones ?? []) {
-      if (p.pron_status === 'ok') continue
-      const hint = p.hint
-        ?? (p.expected_ph && p.actual_ph ? `${p.expected_ph} 读成了 ${p.actual_ph}` : `${p.ph} 发音偏弱`)
-      out.push({ word: w.ref, ph: p.ph, hint })
-    }
+/** 发音四档 → 明细表的色/标(含中文标签)。 */
+function pronStyle(s?: ShadowPronStatus): { cls: string, label: string } {
+  switch (s) {
+    case 'ok': return { cls: 'text-green-600 dark:text-green-400', label: '达标' }
+    case 'warn': return { cls: 'text-amber-600 dark:text-amber-400', label: '偏弱' }
+    case 'bad': return { cls: 'text-red-500 dark:text-red-400', label: '错读' }
+    case 'uncertain': return { cls: 'text-gray-400 dark:text-gray-500', label: '存疑' }
+    default: return { cls: 'text-gray-500', label: '—' }
   }
-  return out
+}
+
+/** 音素的 IPA(若已知 ARPAbet→IPA 映射,可扩;暂直接显示 ARPAbet)。 */
+function phoneLabel(p: ShadowPhoneResult): string {
+  return p.ph
 }
 
 interface ActiveUnit {
@@ -92,6 +95,13 @@ export default function ShadowPanel() {
   const [info, setInfo] = useState<string | null>(null)
   // 流式 partial:逐词落定的临时分(committed,渲染为 tentative);final 到达即清空改用 score。
   const [partials, setPartials] = useState<Map<number, ShadowPartial>>(new Map())
+  // 明细表:当前展开的词(看其逐音素);评分细则说明折叠。
+  const [expandedWord, setExpandedWord] = useState<number | null>(null)
+  const [showRules, setShowRules] = useState(false)
+  // 上一次「自己读的」录音,供回放(批量=webm blob;流式=拼成的 16k wav blob)。
+  const [myAudioUrl, setMyAudioUrl] = useState<string | null>(null)
+  const myAudioUrlRef = useRef<string | null>(null)
+  const myAudioElRef = useRef<HTMLAudioElement | null>(null)
 
   // 异步流程里读到的「当前态」走 ref，避开事件回调闭包过期。
   const prefsRef = useRef(prefs)
@@ -100,11 +110,31 @@ export default function ShadowPanel() {
   const streamRef = useRef<StreamHandle | null>(null)
   prefsRef.current = prefs
 
+  // 分数变化(新结果 / 清空)→ 收起音素明细,避免指向过期的词。
+  useEffect(() => { setExpandedWord(null) }, [score])
+
   const persist = useCallback((next: ShadowPrefs) => {
     setPrefs(next)
     writeShadowPrefs(next)
     audioService.setShadowGate(next.enabled)
   }, [audioService])
+
+  // 记下「自己读的」录音(撤销旧 URL,建新 object URL),供回放。
+  const setMyRecording = useCallback((blob: Blob) => {
+    if (myAudioUrlRef.current) URL.revokeObjectURL(myAudioUrlRef.current)
+    const u = URL.createObjectURL(blob)
+    myAudioUrlRef.current = u
+    setMyAudioUrl(u)
+  }, [])
+
+  // 回放自己的录音。用独立一次性 Audio,不走参考音频的统一播放器(避免扰动闸门/歌单)。
+  const playMyRecording = useCallback(() => {
+    const u = myAudioUrlRef.current
+    if (!u) return
+    if (!myAudioElRef.current) myAudioElRef.current = new Audio()
+    const el = myAudioElRef.current
+    try { el.pause(); el.currentTime = 0; el.src = u; void el.play() } catch { /* ignore */ }
+  }, [])
 
   // 当前跟读单元的参考文本（整句 or 当前词）。
   const currentRefText = useCallback((u: ActiveUnit): string => {
@@ -171,7 +201,8 @@ export default function ShadowPanel() {
         },
         onError: (msg: string) => {
           if (!finalArrived) { setInfo(null); setError('流式评测：' + msg) }
-        }
+        },
+        onRecorded: (wav: Blob) => setMyRecording(wav)
       },
       dynamicMaxMs(refText)
     )
@@ -226,6 +257,8 @@ export default function ShadowPanel() {
       setInfo('未检测到朗读，点「开始」重试或跳过。')
       return
     }
+    // 留一份录音供「听我的录音」回放。
+    setMyRecording(new Blob([new Uint8Array(captured.bytes)], { type: captured.mime || 'audio/webm' }))
 
     setPhase('scoring')
     try {
@@ -294,6 +327,8 @@ export default function ShadowPanel() {
       audioService.removeEventListener('onSentenceChange', onSentenceChange)
       captureRef.current?.stop()
       streamRef.current?.stop()
+      try { myAudioElRef.current?.pause() } catch { /* ignore */ }
+      if (myAudioUrlRef.current) { URL.revokeObjectURL(myAudioUrlRef.current); myAudioUrlRef.current = null }
       // 离开跟读页 → 关掉闸门，否则共享的播放单例会停在「请跟读…」等待态，
       // 切回标注/全部页时无人推进 → 看起来"没法播放"。
       audioService.setShadowGate(false)
@@ -440,15 +475,19 @@ export default function ShadowPanel() {
             {score
               ? (
                 <span className="leading-relaxed">
-                  {score.words.map((w, i) => (
-                    <span
-                      key={i}
-                      className={wordColorClass(w)}
-                      title={w.pron_status && w.score != null ? `发音 ${Math.round(w.score * 100)}%` : undefined}
-                    >
-                      {w.ref}{' '}
-                    </span>
-                  ))}
+                  {score.words.map((w, i) => {
+                    const hasPhones = (w.phones?.length ?? 0) > 0
+                    return (
+                      <span
+                        key={i}
+                        onClick={hasPhones ? () => setExpandedWord(expandedWord === i ? null : i) : undefined}
+                        className={`${wordColorClass(w)} ${hasPhones ? 'cursor-pointer' : ''} ${expandedWord === i ? 'bg-blue-100 dark:bg-blue-900/40 rounded' : ''}`}
+                        title={w.pron_status && w.score != null ? `发音 ${Math.round(w.score * 100)}%${hasPhones ? ' · 点击看音素' : ''}` : undefined}
+                      >
+                        {w.ref}{' '}
+                      </span>
+                    )
+                  })}
                 </span>
               )
               : partials.size > 0
@@ -473,23 +512,76 @@ export default function ShadowPanel() {
                 : <span className="text-gray-700 dark:text-gray-200">{refText || '—'}</span>}
           </div>
 
-          {/* 错读音素提示（仅 GOP 后端有 phones 时显示；针对性纠音） */}
-          {score && (() => {
-            const hints = collectPhoneHints(score)
-            if (hints.length === 0) return null
+          {/* 展开的词 → 逐音素明细表(评分细则可视化:看哪个音读得不够好 + 哪些是引擎没对齐) */}
+          {score && expandedWord != null && (() => {
+            const w = score.words[expandedWord]
+            const phones = w?.phones ?? []
+            if (phones.length === 0) return null
             return (
-              <div className="flex flex-wrap gap-1.5 text-xs">
-                {hints.map((h, i) => (
-                  <span
-                    key={i}
-                    className="rounded bg-red-50 px-1.5 py-0.5 text-red-600 dark:bg-red-900/30 dark:text-red-300"
-                  >
-                    <b>{h.word}</b> · {h.hint}
-                  </span>
-                ))}
+              <div className="rounded-md border border-gray-200 bg-white text-xs dark:border-gray-700 dark:bg-gray-900">
+                <div className="flex items-center justify-between border-b border-gray-100 px-2 py-1 text-gray-500 dark:border-gray-700">
+                  <span>「<b>{w.ref}</b>」音素明细</span>
+                  <span className="cursor-pointer hover:text-gray-700 dark:hover:text-gray-300" onClick={() => setExpandedWord(null)}>收起 ✕</span>
+                </div>
+                <table className="w-full">
+                  <thead className="text-gray-400">
+                    <tr>
+                      <th className="px-2 py-1 text-left font-normal">音素</th>
+                      <th className="px-2 py-1 text-left font-normal">你的分</th>
+                      <th className="px-2 py-1 text-left font-normal">状态</th>
+                      <th className="px-2 py-1 text-left font-normal">说明</th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {phones.map((p: ShadowPhoneResult, i) => {
+                      const sty = pronStyle(p.pron_status)
+                      const note = p.pron_status === 'uncertain'
+                        ? '引擎没听准,不算你读错'
+                        : (p.expected_ph && p.actual_ph
+                          ? `读成了 ${p.actual_ph}`
+                          : (p.hint ?? (p.pron_status === 'ok' ? '' : '偏弱')))
+                      return (
+                        <tr key={i} className="border-t border-gray-50 dark:border-gray-800">
+                          <td className="px-2 py-1 font-mono">{phoneLabel(p)}</td>
+                          <td className="px-2 py-1">
+                            <span className="inline-flex items-center gap-1">
+                              <span className="inline-block h-1.5 w-10 rounded bg-gray-200 dark:bg-gray-700">
+                                <span className={`block h-1.5 rounded ${p.pron_status === 'uncertain' ? 'bg-gray-400' : p.pron_status === 'bad' ? 'bg-red-400' : p.pron_status === 'warn' ? 'bg-amber-400' : 'bg-green-400'}`} style={{ width: `${Math.round((p.score ?? 0) * 100)}%` }} />
+                              </span>
+                              {p.pron_status === 'uncertain' ? '—' : `${Math.round((p.score ?? 0) * 100)}`}
+                            </span>
+                          </td>
+                          <td className={`px-2 py-1 ${sty.cls}`}>{sty.label}</td>
+                          <td className="px-2 py-1 text-gray-500 dark:text-gray-400">{note}</td>
+                        </tr>
+                      )
+                    })}
+                  </tbody>
+                </table>
               </div>
             )
           })()}
+
+          {/* 图例 + 评分细则说明(让用户看懂分数 + 区分"读错"vs"引擎没对齐") */}
+          {score && (
+            <div className="text-[11px] text-gray-500 dark:text-gray-400">
+              <div className="flex flex-wrap items-center gap-x-3 gap-y-1">
+                <span className="text-green-600 dark:text-green-400">● 达标</span>
+                <span className="text-amber-600 dark:text-amber-400">● 偏弱</span>
+                <span className="text-red-500 dark:text-red-400">● 错读</span>
+                <span className="text-gray-400">● 存疑(引擎没对齐,不算错)</span>
+                <span className="cursor-pointer underline" onClick={() => setShowRules(v => !v)}>评分细则 {showRules ? '▲' : '▼'}</span>
+              </div>
+              {showRules && (
+                <div className="mt-1 rounded bg-gray-50 p-2 leading-relaxed dark:bg-gray-800">
+                  逐音素打「发音分」(0–100),自下而上聚合到词、句。<b>点词可展开音素明细</b>。
+                  <b>灰色「存疑」</b>= 引擎没把这个音对齐好/没听准(连读快词常见),<b>不算你读错</b>、不拉低分。
+                  通过 = 句分 ≥ {Math.round(prefs.passThreshold * 100)}% 且严重错读音素 ≤ 1。
+                  分数由模型给出仅供参考(标定持续优化中),可点「听我的」回放自行判断。
+                </div>
+              )}
+            </div>
+          )}
 
           {/* 状态 + 分数 */}
           <div className="flex min-h-6 items-center gap-2 text-sm">
@@ -528,6 +620,9 @@ export default function ShadowPanel() {
             </Button>
             <Button variant="outline" size="sm" onClick={replayThenShadow} disabled={phase === 'recording' || phase === 'scoring'} title="重听参考再读">
               重听
+            </Button>
+            <Button variant="outline" size="sm" onClick={playMyRecording} disabled={!myAudioUrl || phase === 'recording'} title="回放上一次自己读的录音">
+              <Volume2 size={14} /> 听我的
             </Button>
             <Button variant="outline" size="sm" onClick={() => advanceUnit(false)} disabled={phase === 'recording' || phase === 'scoring'} title="跳过当前">
               <SkipForward size={14} /> 跳过

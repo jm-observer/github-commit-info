@@ -64,6 +64,12 @@ struct AssessPhone {
     actual_ph: Option<String>,
     #[serde(default)]
     hint: Option<String>,
+    #[serde(default)]
+    reliable: Option<bool>,
+    #[serde(default)]
+    t_start: Option<f64>,
+    #[serde(default)]
+    t_end: Option<f64>,
 }
 
 /// 调 `:8098 /assess` 做发音评测，映射进 [`ScoreResult`]。
@@ -155,7 +161,8 @@ fn map_response(r: AssessResponse, ref_text: &str, threshold: f64) -> ScoreResul
         transcript: r.transcript.unwrap_or_default(),
         ref_text: ref_text.trim().to_string(),
         score: r.sentence_score,
-        passed: r.sentence_score >= threshold && bad_count == 0,
+        // 放宽:句分达标 且 严重错读音素 ≤ 上限(uncertain 已不计入 bad_count)。设计 §2.4。
+        passed: r.sentence_score >= threshold && bad_count <= super::MAX_BAD_PHONES,
         words,
         bad_phone_count: Some(bad_count),
         model: r.model,
@@ -170,6 +177,9 @@ fn map_phone(p: AssessPhone) -> PhoneResult {
         expected_ph: p.expected_ph,
         actual_ph: p.actual_ph,
         hint: p.hint,
+        reliable: p.reliable,
+        t_start: p.t_start,
+        t_end: p.t_end,
     }
 }
 
@@ -233,20 +243,26 @@ mod tests {
     }
 
     #[test]
-    fn passed_requires_no_bad_phone() {
-        // 句分够，但有 1 个 bad 音素 → 不通过（设计 §2 决策 6）。
-        let r = map_response(sample(), "I think so", 0.6);
+    fn passed_tolerates_one_bad_but_not_two() {
+        // 放宽规则(设计 §2.4):句分达标 + bad ≤ 1 → 通过;bad ≥ 2 → 不过。
+        let r = map_response(sample(), "I think so", 0.6); // bad_phone_count=1, score 0.71
         assert_eq!(r.bad_phone_count, Some(1));
-        assert!(!r.passed);
+        assert!(r.passed, "1 个 bad 应允许通过");
+
+        let mut two = sample();
+        two.bad_phone_count = Some(2);
+        let r2 = map_response(two, "x", 0.6);
+        assert!(!r2.passed, "2 个 bad 应不通过");
     }
 
     #[test]
-    fn passed_when_score_ok_and_clean() {
+    fn passed_needs_score_above_threshold() {
+        // 句分不够 → 不过(即便零 bad)。
         let mut resp = sample();
         resp.bad_phone_count = Some(0);
-        resp.sentence_score = 0.8;
+        resp.sentence_score = 0.5;
         let r = map_response(resp, "x", 0.6);
-        assert!(r.passed);
+        assert!(!r.passed);
     }
 
     #[test]
