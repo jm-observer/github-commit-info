@@ -12,6 +12,7 @@
 pub mod gop;
 pub mod routes;
 pub mod store;
+pub mod stream;
 
 use serde::Serialize;
 

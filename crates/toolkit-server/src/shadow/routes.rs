@@ -21,6 +21,8 @@ pub fn router() -> Router<AppState> {
     Router::new()
         .route("/score", post(score))
         .route("/stats", get(stats))
+        // 流式发音评测(WS):中继到 :8098 /assess/stream。设计 §7。
+        .route("/stream", get(crate::shadow::stream::stream))
 }
 
 #[derive(Debug, Deserialize)]

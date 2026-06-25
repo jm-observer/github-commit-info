@@ -21,7 +21,10 @@ serde_json = { workspace = true }
 chrono = { workspace = true }
 tokio = { workspace = true, features = ["rt", "rt-multi-thread", "macros", "signal", "net", "time", "process"] }
 async-trait = { workspace = true }
-axum = { workspace = true }
+axum = { workspace = true, features = ["ws"] }
+# shadow 流式发音评测中继:axum WS(对桌面端)+ tokio-tungstenite WS 客户端(连 :8098)。
+tokio-tungstenite = "0.24"
+futures-util = "0.3"
 tower-http = { workspace = true }
 clap = { workspace = true, features = ["env"] }
 log = { workspace = true }

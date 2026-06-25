@@ -198,8 +198,17 @@ zero-desktop(webview)        toolkit-server                 GB10 流式评测(:8
   - **结论(措辞收紧)**:Phase 1 通过的是「**在线 Viterbi 原型值得继续**」,**不是**「在线对齐风险完全解除」。
     进 Phase 2 前/中仍需:① 更多**真人**(清晰/中式/错读)样本扩翻判与 live 抖动统计;② **commit 前 live 抖动**
     的 UX 策略(tentative 渲染 + 可能的滞后阈值);③ early-commit 兜底;④ 标定 a/b 重拟(用批量当 oracle)。
-- **Phase 2 — WS 链路(streaming-speech + toolkit-server)**
-  5. `:8098 /assess/stream` WS 端点;toolkit-server `/api/web/shadow/stream` 中继;契约见 §6。
+- **Phase 2 — WS 链路** ⚙️ **代码完成(2026-06-25)**
+  - **2a 服务端(streaming-speech)** ✅ **GB10 实测通过**:`streaming.py`(`StreamingAssessor`:增量
+    push 全左重算后验 + 在线 Viterbi + 落定 → partial;`finish` 调批量 `gop.assess` 出 final)+ app.py
+    `GET /assess/stream` WS(hello/binary/end → ready/partial/final)+ `test_stream_client.py`。
+    实时模式实测:partial 随"说话"渐进流入(词逐个点亮)、final 在 end 后 ~0.8s 出;契约入
+    `docs/pronunciation-assess-api.md`。
+  - **2b 中继(toolkit-server)** ⚙️ **代码完成(编译 + 12 测试 + fmt 绿),运行待 GB10 redeploy**:
+    `shadow/stream.rs`——axum `GET /api/web/shadow/stream` 升级 WS,`tokio-tungstenite` 连 `:8098
+    /assess/stream` 双向转发;**拦截 `final` 落库**(`gop::score_result_from_final` → `record_attempt`,
+    权威分);`GOP_BASE_URL` 未配 → 503(流式无 v1 回退)。单元元信息走 WS query。
+    **待**:toolkit-server 重新部署到 GB10 后端到端验证(桌面 WS → 中继 → :8098)。
 - **Phase 3 — 前端边读边评(zero-desktop)**
   6. 流式采集 + 增量渲染 + WS 不可用降级;`final` 落定走现有展示。
 - **Phase 4 — 混合 finalize + 验收**

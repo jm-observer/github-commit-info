@@ -21,6 +21,9 @@ const ASSESS_TIMEOUT: Duration = Duration::from_secs(60);
 /// `/assess` 成功响应（契约见设计 §4）。所有分值 0~1（已标定）。
 #[derive(Debug, Clone, Deserialize)]
 struct AssessResponse {
+    /// 参考文本（流式 `final` 事件带；批量 `/assess` 响应也带，但批量路径用入参 ref_text）。
+    #[serde(default)]
+    ref_text: Option<String>,
     /// CTC 反推近似文本，optional、非稳定 ASR，仅回看用。
     #[serde(default)]
     transcript: Option<String>,
@@ -114,6 +117,14 @@ pub async fn assess(
     })?;
 
     Ok(map_response(parsed, ref_text, threshold))
+}
+
+/// 把流式 WS 的 `final` 事件 JSON 映射进 `ScoreResult`（供中继落库,见 shadow/stream.rs）。
+/// `final` 事件即批量 `/assess` 响应形状(自带 ref_text);解析失败返回 None。
+pub fn score_result_from_final(v: &serde_json::Value, threshold: f64) -> Option<ScoreResult> {
+    let parsed: AssessResponse = serde_json::from_value(v.clone()).ok()?;
+    let ref_text = parsed.ref_text.clone().unwrap_or_default();
+    Some(map_response(parsed, &ref_text, threshold))
 }
 
 /// 把 `/assess` 响应映射进 `ScoreResult`：
