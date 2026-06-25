@@ -27,10 +27,36 @@ export interface Package {
   [key: string]: any
 }
 
-/** 单个参考词的判定结果（逐词标色用）。与后端 shadow::WordResult 对齐。 */
+/** 发音三档（GOP 后端）。与后端 PhoneResult/WordResult 的 pron_status 对齐。 */
+export type ShadowPronStatus = 'ok' | 'warn' | 'bad'
+
+/** 单个参考音素的发音评测结果（GOP 后端）。与后端 shadow::PhoneResult 对齐。 */
+export interface ShadowPhoneResult {
+  ph: string
+  score: number
+  pron_status: ShadowPronStatus
+  /** 错读时的期望/实际音素（结构化，展示以此为准；hint 仅兜底文案）。 */
+  expected_ph?: string
+  actual_ph?: string
+  hint?: string
+}
+
+/**
+ * 单个参考词的判定结果（逐词标色用）。与后端 shadow::WordResult 对齐。
+ *
+ * `status`（内容对错，v1 + 回退态恒有）与 `pron_status`/`score`/`phones`（发音维度，
+ * 仅 GOP 后端）是两套独立维度——见 docs/english-shadow-gop-design.md §5。
+ * GOP 未启用时后三者缺失，按 `status` 回退渲染，零回归。
+ */
 export interface ShadowWordResult {
   ref: string
   status: 'ok' | 'wrong' | 'missing'
+  /** 词级发音分 0~1（GOP）。 */
+  score?: number
+  /** 发音三档（GOP）。 */
+  pron_status?: ShadowPronStatus
+  /** 逐音素明细（GOP；granularity=sentence 时上游省略）。 */
+  phones?: ShadowPhoneResult[]
 }
 
 /** 一个跟读单元的累计统计。与后端 shadow::store::StatRow 对齐。 */
@@ -53,6 +79,10 @@ export interface ShadowScore {
   passed: boolean
   asr_model?: string
   words: ShadowWordResult[]
+  /** 严重错读音素总数（GOP 后端）。 */
+  bad_phone_count?: number
+  /** 评测模型标识（GOP 后端，如 wav2vec2-gop-v1）。 */
+  model?: string
   stat?: ShadowStat | null
 }
 

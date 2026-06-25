@@ -12,7 +12,7 @@ import { useCallback, useEffect, useRef, useState } from 'react'
 import { Mic, Square, SkipForward, RotateCcw, Star, Loader2, CheckCircle2, XCircle } from 'lucide-react'
 import { AudioPlayerService } from '../services/AudioPlayerService'
 import ApiService from '../services/ApiService'
-import type { Sentence, ShadowScore, ShadowStat } from '../types'
+import type { Sentence, ShadowScore, ShadowStat, ShadowWordResult } from '../types'
 import { Button } from '../../speech/components/ui/Button'
 import {
   captureUtterance,
@@ -30,6 +30,40 @@ import {
 } from './shadowPrefs'
 
 type Phase = 'idle' | 'awaiting' | 'recording' | 'scoring' | 'result'
+
+/**
+ * 逐词配色：GOP 后端有 `pron_status`（发音三档 ok/warn/bad）则优先按发音上色；
+ * 否则回退 v1 的内容维度 `status`（ok/wrong/missing）——GOP 未启用时零回归。
+ * 见 docs/english-shadow-gop-design.md §6。
+ */
+function wordColorClass(w: ShadowWordResult): string {
+  if (w.pron_status) {
+    switch (w.pron_status) {
+      case 'ok': return 'text-green-600 dark:text-green-400'
+      case 'warn': return 'text-amber-600 underline decoration-dotted dark:text-amber-400'
+      case 'bad': return 'text-red-500 underline decoration-wavy dark:text-red-400'
+    }
+  }
+  return w.status === 'ok'
+    ? 'text-green-600 dark:text-green-400'
+    : w.status === 'wrong'
+      ? 'text-red-500 underline decoration-wavy dark:text-red-400'
+      : 'text-gray-400 line-through dark:text-gray-500'
+}
+
+/** 从判分结果收集需要提示的错读音素（warn/bad），附所属词，供针对性纠音展示。 */
+function collectPhoneHints(score: ShadowScore): { word: string, ph: string, hint: string }[] {
+  const out: { word: string, ph: string, hint: string }[] = []
+  for (const w of score.words) {
+    for (const p of w.phones ?? []) {
+      if (p.pron_status === 'ok') continue
+      const hint = p.hint
+        ?? (p.expected_ph && p.actual_ph ? `${p.expected_ph} 读成了 ${p.actual_ph}` : `${p.ph} 发音偏弱`)
+      out.push({ word: w.ref, ph: p.ph, hint })
+    }
+  }
+  return out
+}
 
 interface ActiveUnit {
   sentence: Sentence
@@ -191,6 +225,9 @@ export default function ShadowPanel() {
       audioService.removeEventListener('onAwaitShadow', onAwait)
       audioService.removeEventListener('onSentenceChange', onSentenceChange)
       captureRef.current?.stop()
+      // 离开跟读页 → 关掉闸门，否则共享的播放单例会停在「请跟读…」等待态，
+      // 切回标注/全部页时无人推进 → 看起来"没法播放"。
+      audioService.setShadowGate(false)
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [audioService])
@@ -328,13 +365,8 @@ export default function ShadowPanel() {
                   {score.words.map((w, i) => (
                     <span
                       key={i}
-                      className={
-                        w.status === 'ok'
-                          ? 'text-green-600 dark:text-green-400'
-                          : w.status === 'wrong'
-                            ? 'text-red-500 underline decoration-wavy dark:text-red-400'
-                            : 'text-gray-400 line-through dark:text-gray-500'
-                      }
+                      className={wordColorClass(w)}
+                      title={w.pron_status && w.score != null ? `发音 ${Math.round(w.score * 100)}%` : undefined}
                     >
                       {w.ref}{' '}
                     </span>
@@ -343,6 +375,24 @@ export default function ShadowPanel() {
               )
               : <span className="text-gray-700 dark:text-gray-200">{refText || '—'}</span>}
           </div>
+
+          {/* 错读音素提示（仅 GOP 后端有 phones 时显示；针对性纠音） */}
+          {score && (() => {
+            const hints = collectPhoneHints(score)
+            if (hints.length === 0) return null
+            return (
+              <div className="flex flex-wrap gap-1.5 text-xs">
+                {hints.map((h, i) => (
+                  <span
+                    key={i}
+                    className="rounded bg-red-50 px-1.5 py-0.5 text-red-600 dark:bg-red-900/30 dark:text-red-300"
+                  >
+                    <b>{h.word}</b> · {h.hint}
+                  </span>
+                ))}
+              </div>
+            )
+          })()}
 
           {/* 状态 + 分数 */}
           <div className="flex min-h-6 items-center gap-2 text-sm">

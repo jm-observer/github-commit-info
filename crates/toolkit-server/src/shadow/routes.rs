@@ -74,22 +74,44 @@ async fn score(
     let mime = p.mime.unwrap_or_else(|| "audio/webm".to_string());
     let file_name = mime_filename(&mime);
 
-    // 转写：vad=false → 整段一锤识别（跟读 clip 短，不需要切段）。
-    let client = AsrClient::new(shadow::asr_base());
-    let transcription = match client
-        .transcribe_bytes(
-            body.to_vec(),
-            file_name,
-            mime,
-            TranscribeOpts { vad: false },
-        )
-        .await
-    {
-        Ok(t) => t,
-        Err(e) => return bad_gateway(format!("ASR 转写失败: {e}")),
+    // 后端切换（设计 §5）：配了 GOP_BASE_URL 走音素级发音评测（直接转录音到 :8098，
+    // 不经 FunASR）；未配回退 v1-ASR 文本对齐。GOP 上游不可达/报错 → 502。
+    let (result, asr_model) = match shadow::select_backend() {
+        shadow::ScoreBackend::Gop(base) => {
+            match shadow::gop::assess(
+                &base,
+                body.to_vec(),
+                &mime,
+                file_name,
+                &p.ref_text,
+                kind,
+                threshold,
+            )
+            .await
+            {
+                Ok(r) => (r, None),
+                Err(e) => return bad_gateway(format!("发音评测 /assess 失败: {e}")),
+            }
+        }
+        shadow::ScoreBackend::AsrAlign => {
+            // 转写：vad=false → 整段一锤识别（跟读 clip 短，不需要切段）。
+            let client = AsrClient::new(shadow::asr_base());
+            let transcription = match client
+                .transcribe_bytes(
+                    body.to_vec(),
+                    file_name,
+                    &mime,
+                    TranscribeOpts { vad: false },
+                )
+                .await
+            {
+                Ok(t) => t,
+                Err(e) => return bad_gateway(format!("ASR 转写失败: {e}")),
+            };
+            let r = shadow::score(kind, &p.ref_text, &transcription.text, threshold);
+            (r, Some(transcription.model))
+        }
     };
-
-    let result = shadow::score(kind, &p.ref_text, &transcription.text, threshold);
 
     // 落库 + 累加统计。DB 失败不该吞掉判分结果——记日志但仍把分数返回前端。
     let stat = match store::record_attempt(
@@ -112,8 +134,10 @@ async fn score(
         "ref_text": result.ref_text,
         "score": result.score,
         "passed": result.passed,
-        "asr_model": transcription.model,
+        "asr_model": asr_model,
         "words": result.words,
+        "bad_phone_count": result.bad_phone_count,
+        "model": result.model,
         "stat": stat,
     }))
     .into_response()

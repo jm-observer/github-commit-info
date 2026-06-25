@@ -43,11 +43,13 @@ pub fn record_attempt(
     let conn = pool.get()?;
     let now = now_iso8601();
     let passed_i = if result.passed { 1 } else { 0 };
+    // 仅 GOP 后端有音素/词级发音明细时落 detail_json；v1-ASR 内核为 NULL。
+    let detail_json = build_detail_json(result);
 
     conn.execute(
         "INSERT INTO shadow_attempt
-            (id, customer_id, kind, sentence_id, word_index, ref_text, transcript, score, passed, created_at)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+            (id, customer_id, kind, sentence_id, word_index, ref_text, transcript, score, passed, detail_json, created_at)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
         params![
             new_task_id(),
             customer_id,
@@ -58,6 +60,7 @@ pub fn record_attempt(
             result.transcript,
             result.score,
             passed_i,
+            detail_json,
             now,
         ],
     )
@@ -101,6 +104,23 @@ pub fn record_attempt(
         )
         .context("read back shadow_stat")?;
     Ok(row)
+}
+
+/// 构造发音级明细 JSON（落 `shadow_attempt.detail_json`）：仅当结果带 GOP 明细
+/// （`bad_phone_count` 有值或任一词带 `pron_status`）时返回 `Some`，否则 `None`（v1 不落）。
+/// 存 `{words, bad_phone_count, model}`，便于回看/按 attempt 重算，不重复 ref/transcript。
+fn build_detail_json(result: &ScoreResult) -> Option<String> {
+    let has_detail =
+        result.bad_phone_count.is_some() || result.words.iter().any(|w| w.pron_status.is_some());
+    if !has_detail {
+        return None;
+    }
+    serde_json::to_string(&serde_json::json!({
+        "words": result.words,
+        "bad_phone_count": result.bad_phone_count,
+        "model": result.model,
+    }))
+    .ok()
 }
 
 /// 批量查询某用户在给定句子（及其词单元）上的统计，供进入播放时一次性回填。
