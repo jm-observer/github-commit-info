@@ -17,9 +17,12 @@ import { Button } from '../../speech/components/ui/Button'
 import {
   captureUtterance,
   scoreShadow,
+  streamScore,
   fetchShadowStats,
   splitWords,
-  type CaptureHandle
+  type CaptureHandle,
+  type StreamHandle,
+  type ShadowPartial
 } from './ShadowService'
 import {
   readShadowPrefs,
@@ -87,11 +90,14 @@ export default function ShadowPanel() {
   const [stat, setStat] = useState<ShadowStat | null>(null)
   const [error, setError] = useState<string | null>(null)
   const [info, setInfo] = useState<string | null>(null)
+  // 流式 partial:逐词落定的临时分(committed,渲染为 tentative);final 到达即清空改用 score。
+  const [partials, setPartials] = useState<Map<number, ShadowPartial>>(new Map())
 
   // 异步流程里读到的「当前态」走 ref，避开事件回调闭包过期。
   const prefsRef = useRef(prefs)
   const unitRef = useRef<ActiveUnit | null>(null)
   const captureRef = useRef<CaptureHandle | null>(null)
+  const streamRef = useRef<StreamHandle | null>(null)
   prefsRef.current = prefs
 
   const persist = useCallback((next: ShadowPrefs) => {
@@ -130,6 +136,57 @@ export default function ShadowPanel() {
     void passed
   }, [audioService])
 
+  // 流式路径:边读边逐词点亮 + 整句结束权威分落定。返回 true=已处理;null/false=流式不可用须回退批量。
+  const runStream = useCallback(async (u: ActiveUnit, p: ShadowPrefs, refText: string): Promise<boolean> => {
+    setPhase('recording')
+    let finalArrived = false
+    const handle = await streamScore(
+      {
+        kind: p.granularity,
+        sentenceId: u.sentence.id,
+        wordIndex: p.granularity === 'word' ? u.wordPos : undefined,
+        refText,
+        threshold: p.passThreshold
+      },
+      {
+        onReady: () => setInfo('评估中…'),
+        onPartial: (pt: ShadowPartial) => {
+          setPartials(prev => new Map(prev).set(pt.word_index, pt))
+        },
+        onFinal: (result: ShadowScore) => {
+          finalArrived = true
+          setPartials(new Map())
+          setScore(result)
+          setInfo(null)
+          setPhase('result')
+          // final 不带 stat(中继直透上游),刷新一次计数。
+          void fetchShadowStats([u.sentence.id]).then(stats => {
+            const match = stats.find(s => s.kind === p.granularity &&
+              (p.granularity === 'word' ? s.word_index === u.wordPos : true))
+            setStat(match ?? null)
+          }).catch(() => { /* 忽略 */ })
+          if (result.passed && p.autoAdvanceOnPass) {
+            window.setTimeout(() => advanceUnit(true), 600)
+          }
+        },
+        onError: (msg: string) => {
+          if (!finalArrived) { setInfo(null); setError('流式评测：' + msg) }
+        }
+      },
+      dynamicMaxMs(refText)
+    )
+    if (!handle) return false // 流式不可用 → 回退批量
+    streamRef.current = handle
+    await handle.done
+    streamRef.current = null
+    // 没等到 final(出错/无声/中途关)→ 回 awaiting 等手动;final 已把 phase 设为 result。
+    if (!finalArrived) setPhase('awaiting')
+    return true
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [advanceUnit])
+  const runStreamRef = useRef(runStream)
+  runStreamRef.current = runStream
+
   // 跑一次采集 + 判分。done=null（没出声）→ 回到 awaiting 等手动。
   const runCapture = useCallback(async () => {
     const u = unitRef.current
@@ -141,6 +198,15 @@ export default function ShadowPanel() {
     setError(null)
     setInfo(null)
     setScore(null)
+    setPartials(new Map())
+
+    // 流式路径(opt-in):边读边逐词点亮 + 整句结束权威分落定。WS 不可用 → 返回 null,回退批量。
+    if (p.streaming) {
+      const streamed = await runStream(u, p, refText)
+      if (streamed) return
+      // null → 流式不可用,继续走下面批量。
+    }
+
     setPhase('recording')
 
     const handle = captureUtterance({ mode: p.captureMode, maxMs: dynamicMaxMs(refText) })
@@ -213,9 +279,11 @@ export default function ShadowPanel() {
     // 用户手动切句 → 取消当前跟读态。
     const onSentenceChange = () => {
       captureRef.current?.stop()
+      streamRef.current?.stop()
       unitRef.current = null
       setPhase('idle')
       setScore(null)
+      setPartials(new Map())
     }
 
     audioService.addEventListener('onAwaitShadow', onAwait)
@@ -225,6 +293,7 @@ export default function ShadowPanel() {
       audioService.removeEventListener('onAwaitShadow', onAwait)
       audioService.removeEventListener('onSentenceChange', onSentenceChange)
       captureRef.current?.stop()
+      streamRef.current?.stop()
       // 离开跟读页 → 关掉闸门，否则共享的播放单例会停在「请跟读…」等待态，
       // 切回标注/全部页时无人推进 → 看起来"没法播放"。
       audioService.setShadowGate(false)
@@ -319,6 +388,15 @@ export default function ShadowPanel() {
               />
               通过即自动跳
             </label>
+            <label className="flex items-center gap-1" title="边读边逐词点亮发音分（需 GOP 流式后端，不可用时自动回退）">
+              <input
+                type="checkbox"
+                checked={prefs.streaming}
+                onChange={e => persist({ ...prefs, streaming: e.target.checked })}
+                className="rounded"
+              />
+              流式评测
+            </label>
             <div className="flex items-center gap-1">
               <span>采集：</span>
               {(['auto', 'button'] as ShadowCaptureMode[]).map(m => (
@@ -357,7 +435,7 @@ export default function ShadowPanel() {
             )}
           </div>
 
-          {/* 参考文本 / 逐词标色 */}
+          {/* 参考文本 / 逐词标色。final 用权威分;否则流式 partial 渐进点亮(tentative 半透明);都没有则纯文本。 */}
           <div className="min-h-10 rounded-md bg-gray-50 px-3 py-2 text-sm dark:bg-gray-800">
             {score
               ? (
@@ -373,7 +451,26 @@ export default function ShadowPanel() {
                   ))}
                 </span>
               )
-              : <span className="text-gray-700 dark:text-gray-200">{refText || '—'}</span>}
+              : partials.size > 0
+                ? (
+                  <span className="leading-relaxed">
+                    {splitWords(refText).map((w, i) => {
+                      const pt = partials.get(i)
+                      return (
+                        <span
+                          key={i}
+                          className={pt
+                            ? `${wordColorClass({ ref: w, status: 'ok', pron_status: pt.pron_status, score: pt.score })} opacity-70`
+                            : 'text-gray-400 dark:text-gray-500'}
+                          title={pt?.score != null ? `评估中 ${Math.round(pt.score * 100)}%` : '评估中…'}
+                        >
+                          {w}{' '}
+                        </span>
+                      )
+                    })}
+                  </span>
+                )
+                : <span className="text-gray-700 dark:text-gray-200">{refText || '—'}</span>}
           </div>
 
           {/* 错读音素提示（仅 GOP 后端有 phones 时显示；针对性纠音） */}

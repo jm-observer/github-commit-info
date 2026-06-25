@@ -209,8 +209,16 @@ zero-desktop(webview)        toolkit-server                 GB10 流式评测(:8
     /assess/stream` 双向转发;**拦截 `final` 落库**(`gop::score_result_from_final` → `record_attempt`,
     权威分);`GOP_BASE_URL` 未配 → 503(流式无 v1 回退)。单元元信息走 WS query。
     **待**:toolkit-server 重新部署到 GB10 后端到端验证(桌面 WS → 中继 → :8098)。
-- **Phase 3 — 前端边读边评(zero-desktop)**
-  6. 流式采集 + 增量渲染 + WS 不可用降级;`final` 落定走现有展示。
+- **Phase 3 — 前端边读边评(zero-desktop)** ⚙️ **代码完成(编译/tsc 绿),运行待桌面端 + redeploy**
+  - **采集**:`streamingCapture.ts`——Web Audio 取原始 PCM + 线性重采样到 16k s16le 逐块回调(区别于
+    批量的 MediaRecorder/webm);能量 VAD 判停。
+  - **service**:`ShadowService.streamScore`——`english_shadow_stream_url`(新 Tauri 命令,Rust 侧拼
+    ws/wss URL + token query)→ 开 WS → hello → 推 PCM → 收 ready/partial/final;返回 `null` 即流式
+    不可用,调用方**回退批量** `scoreShadow`(零回归)。
+  - **UI**:`ShadowPanel` 加「流式评测」开关(opt-in,默认关);partial 逐词**渐进点亮**(tentative 半透明
+    + "评估中"),`final` 用权威分覆盖走现有展示;切句/卸载停流。中继已把 `final` 规范化为与批量同形的
+    `ScoreResult`(stream.rs `finalize_or_passthrough`),桌面端零分叉。
+  - **待**:真机验证(桌面 mic + 已配 GOP_BASE_URL 的 toolkit-server,即 2b/3 一起 redeploy 后端到端跑)。
 - **Phase 4 — 混合 finalize + 验收**
   7. 整句结束触发批量 `/assess` 出权威分覆盖 + 落库;补 `docs/runbook-shadow-realtime-e2e.md`
      (真录音边读边点亮 → 故意错读实时高亮 → 整句权威分落定)。

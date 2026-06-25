@@ -17,6 +17,8 @@ export interface ShadowPrefs {
   passThreshold: number
   /** auto=播完自动开麦+静音判停；button=点按钮才录。 */
   captureMode: ShadowCaptureMode
+  /** 流式发音评测（边读边逐词点亮）。需 GOP 流式后端可用,否则自动回退批量。默认关。 */
+  streaming: boolean
 }
 
 const KEY = 'english_shadow_prefs_v1'
@@ -26,7 +28,8 @@ export const DEFAULT_SHADOW_PREFS: ShadowPrefs = {
   granularity: 'sentence',
   autoAdvanceOnPass: true,
   passThreshold: 0.9,
-  captureMode: 'auto'
+  captureMode: 'auto',
+  streaming: false
 }
 
 export function readShadowPrefs(): ShadowPrefs {

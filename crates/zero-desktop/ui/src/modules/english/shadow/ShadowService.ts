@@ -11,8 +11,9 @@
 
 import { invoke } from '@tauri-apps/api/core'
 import EnvConfigService from '../services/EnvConfigService'
-import type { ShadowScore, ShadowStat } from '../types'
+import type { ShadowScore, ShadowStat, ShadowPhoneResult, ShadowPronStatus } from '../types'
 import type { ShadowCaptureMode, ShadowGranularity } from './shadowPrefs'
+import { startStreamingCapture, type StreamCaptureHandle } from './streamingCapture'
 
 export interface CapturedAudio {
   bytes: number[]
@@ -186,6 +187,96 @@ export async function scoreShadow(audio: CapturedAudio, unit: ScoreUnit): Promis
     refText: unit.refText,
     threshold: unit.threshold ?? null
   })
+}
+
+/** 流式 partial 事件:某词落定的临时分(committed,落定后稳)。无 v1 `status`(纯发音维度)。 */
+export interface ShadowPartial {
+  word_index: number
+  ref: string
+  score?: number
+  pron_status?: ShadowPronStatus
+  phones?: ShadowPhoneResult[]
+}
+
+export interface StreamHandlers {
+  onReady?: () => void
+  /** 某词落定 → 渐进点亮(tentative 渲染)。 */
+  onPartial?: (p: ShadowPartial) => void
+  /** 整句权威分(批量 finalizer)。 */
+  onFinal?: (score: ShadowScore) => void
+  onError?: (message: string) => void
+}
+
+export interface StreamHandle {
+  /** 手动结束(button 模式 / 兜底):停采集并发 end。 */
+  stop: () => void
+  /** 收到 final(或出错/无声)后 resolve。 */
+  done: Promise<void>
+}
+
+/**
+ * 流式跟读评测:开 WS → hello → 边采 16k PCM 边推 → 收 partial/final。
+ * 返回 `null` 表示流式不可用(未配 / 拿不到 URL),调用方应回退批量 `scoreShadow`。
+ */
+export async function streamScore(unit: ScoreUnit, handlers: StreamHandlers, maxMs?: number): Promise<StreamHandle | null> {
+  const customerId = (await EnvConfigService.getInstance().getCustomerId()) ?? 1
+  const url = await invoke<string>('english_shadow_stream_url', {
+    customerId,
+    kind: unit.kind,
+    sentenceId: unit.sentenceId,
+    wordIndex: unit.wordIndex ?? null,
+    threshold: unit.threshold ?? null
+  })
+  if (!url) return null // 未配置 → 调用方回退批量
+
+  let capture: StreamCaptureHandle | null = null
+  let ended = false
+  let resolveDone!: () => void
+  const done = new Promise<void>((res) => { resolveDone = res })
+  const ws = new WebSocket(url)
+  ws.binaryType = 'arraybuffer'
+
+  const finish = () => {
+    if (ended) return
+    ended = true
+    try { capture?.stop() } catch { /* ignore */ }
+    try { if (ws.readyState === WebSocket.OPEN) ws.close() } catch { /* ignore */ }
+    resolveDone()
+  }
+
+  const sendEnd = () => {
+    try { if (ws.readyState === WebSocket.OPEN) ws.send(JSON.stringify({ type: 'end' })) } catch { /* ignore */ }
+  }
+
+  ws.onopen = () => {
+    ws.send(JSON.stringify({ type: 'hello', ref_text: unit.refText, granularity: unit.kind }))
+    capture = startStreamingCapture({
+      mode: 'auto',
+      maxMs,
+      onChunk: (pcm) => { try { if (ws.readyState === WebSocket.OPEN) ws.send(pcm) } catch { /* ignore */ } }
+    })
+    // 采集自然结束(VAD/超时)→ 发 end 让服务端 finalize。
+    void capture.done.then(({ spoke }) => {
+      if (!spoke) { handlers.onError?.('未检测到朗读'); finish(); return }
+      sendEnd()
+    }).catch((e) => { handlers.onError?.('录音失败：' + (e?.message || '检查麦克风')); finish() })
+  }
+
+  ws.onmessage = (ev) => {
+    if (typeof ev.data !== 'string') return
+    let d: any
+    try { d = JSON.parse(ev.data) } catch { return }
+    switch (d.type) {
+      case 'ready': handlers.onReady?.(); break
+      case 'partial': handlers.onPartial?.(d as ShadowPartial); break
+      case 'final': handlers.onFinal?.(d as ShadowScore); finish(); break
+      case 'error': handlers.onError?.(d.message || '流式评测错误'); finish(); break
+    }
+  }
+  ws.onerror = () => { handlers.onError?.('流式连接错误'); finish() }
+  ws.onclose = () => finish()
+
+  return { stop: () => { capture?.stop(); sendEnd() }, done }
 }
 
 /** 批量回读统计。 */

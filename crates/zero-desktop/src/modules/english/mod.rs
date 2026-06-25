@@ -299,6 +299,41 @@ pub async fn english_shadow_stats(
     serde_json::from_str(&text).map_err(|e| format!("解析统计 JSON 失败: {e}"))
 }
 
+/// 解析跟读**流式**评测 WS 完整 URL：`ws(s)://<host>/api/web/shadow/stream?customer_id=…&kind=…`。
+/// 单元元信息走 query(供中继 StreamParams + final 落库);token 作 query(浏览器 WS 设不了头)。
+/// `ref_text` 不进 URL——由 webview 在 WS `hello` 帧发。未配置 → 返回空串(前端据此回退批量评测)。
+#[tauri::command]
+pub async fn english_shadow_stream_url(
+    state: State<'_, AppState>,
+    customer_id: i64,
+    kind: String,
+    sentence_id: i64,
+    word_index: Option<i64>,
+    threshold: Option<f64>,
+) -> Result<String, String> {
+    let resolved = state.net.resolve(&state.workspace).await;
+    let Some(endpoint) = resolved.shadow_stream_endpoint() else {
+        return Ok(String::new());
+    };
+    let mut url = reqwest::Url::parse(&endpoint).map_err(|e| format!("拼流式 URL 失败: {e}"))?;
+    {
+        let mut q = url.query_pairs_mut();
+        q.append_pair("customer_id", &customer_id.to_string());
+        q.append_pair("kind", &kind);
+        q.append_pair("sentence_id", &sentence_id.to_string());
+        if let Some(wi) = word_index {
+            q.append_pair("word_index", &wi.to_string());
+        }
+        if let Some(th) = threshold {
+            q.append_pair("threshold", &th.to_string());
+        }
+        if let Some(tok) = resolved.g10_token.as_deref().filter(|s| !s.is_empty()) {
+            q.append_pair("token", tok);
+        }
+    }
+    Ok(url.to_string())
+}
+
 /// 确认替换：读取预览 WAV 文件（`preview_path`，须为上一步 english_tts_preview 落盘的预览文件），
 /// multipart 上传到 english 后端 `{g10_base}/sentence/replace-audio`，原子地改句子文本 + 换音频。
 /// 带 g10_token 作 Bearer（后端开 `DESKTOP_REPLACE_TOKEN` 时必需）。

@@ -93,9 +93,10 @@ async fn relay(client: WebSocket, base: String, state: AppState, p: StreamParams
     while let Some(Ok(msg)) = up_rx.next().await {
         match msg {
             TMessage::Text(t) => {
-                let s = t.to_string();
-                maybe_record_final(&s, &state, &p, kind, threshold);
-                if cli_tx.send(Message::Text(s.into())).await.is_err() {
+                // final 事件:解析→落库→**规范化为 ScoreResult 形状**(与批量 /score 一致,
+                // 桌面端零分叉);其它事件(ready/partial/error)原样透传。
+                let out = finalize_or_passthrough(&t.to_string(), &state, &p, kind, threshold);
+                if cli_tx.send(Message::Text(out.into())).await.is_err() {
                     break;
                 }
             }
@@ -118,33 +119,44 @@ async fn relay(client: WebSocket, base: String, state: AppState, p: StreamParams
     client_to_upstream.abort();
 }
 
-/// 若是 `final` 事件 → 解析为 `ScoreResult` 落 `shadow_attempt`(权威分)。DB 失败仅记日志。
-fn maybe_record_final(
+/// `final` 事件:解析为 `ScoreResult` → 落库 → **重新序列化为 `{type:"final", <ScoreResult>}`**
+/// (与批量 `/score` 同形,桌面端零分叉)。其它事件原样返回。解析失败也原样返回(不阻断转发)。
+fn finalize_or_passthrough(
     text: &str,
     state: &AppState,
     p: &StreamParams,
     kind: Option<ShadowKind>,
     threshold: f64,
-) {
+) -> String {
     let Ok(v) = serde_json::from_str::<serde_json::Value>(text) else {
-        return;
+        return text.to_string();
     };
     if v.get("type").and_then(|x| x.as_str()) != Some("final") {
-        return;
+        return text.to_string();
     }
-    let (Some(kind), Some(result)) = (kind, shadow::gop::score_result_from_final(&v, threshold))
-    else {
-        return;
+    let Some(result) = shadow::gop::score_result_from_final(&v, threshold) else {
+        return text.to_string();
     };
-    if let Err(e) = store::record_attempt(
-        &state.pool,
-        p.customer_id,
-        kind,
-        p.sentence_id,
-        p.word_index,
-        &result,
-    ) {
-        log::warn!("shadow stream final 落库失败: {e:#}");
+    if let Some(kind) = kind {
+        if let Err(e) = store::record_attempt(
+            &state.pool,
+            p.customer_id,
+            kind,
+            p.sentence_id,
+            p.word_index,
+            &result,
+        ) {
+            log::warn!("shadow stream final 落库失败: {e:#}");
+        }
+    }
+    match serde_json::to_value(&result) {
+        Ok(mut out) => {
+            if let Some(obj) = out.as_object_mut() {
+                obj.insert("type".into(), serde_json::Value::String("final".into()));
+            }
+            out.to_string()
+        }
+        Err(_) => text.to_string(),
     }
 }
 

@@ -243,6 +243,7 @@ fn run_gui(workspace: PathBuf) -> Result<()> {
             modules::english::english_replace_sentence_audio,
             modules::english::english_shadow_score,
             modules::english::english_shadow_stats,
+            modules::english::english_shadow_stream_url,
             // Speech 模块
             modules::speech::commands::device::speech_list_input_devices,
             modules::speech::commands::device::speech_set_input_device,

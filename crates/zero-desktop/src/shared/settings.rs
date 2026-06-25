@@ -206,6 +206,16 @@ impl ResolvedEndpoint {
         self.join("/api/web/shadow/stats")
     }
 
+    /// 跟读**流式**评测 WS 端点：`{g10_base}/api/web/shadow/stream`，scheme 换成 ws/wss。
+    /// 桌面端 webview 直连(与 speech/voice 的 WS 同模式);消费 GOP 流式发音评测。
+    pub fn shadow_stream_endpoint(&self) -> Option<String> {
+        let http = self.join("/api/web/shadow/stream")?;
+        Some(
+            http.replacen("https://", "wss://", 1)
+                .replacen("http://", "ws://", 1),
+        )
+    }
+
     /// 公共大模型层端点 `{g10_base}/api/web/llm{path}`（`path` 以 `/` 开头，如 `/config`）。
     pub fn llm_endpoint(&self, path: &str) -> Option<String> {
         self.join(&format!("/api/web/llm{path}"))
