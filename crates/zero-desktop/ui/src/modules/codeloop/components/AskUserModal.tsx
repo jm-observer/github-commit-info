@@ -18,7 +18,9 @@ export function AskUserModal({ question, seq, askedBy, onAnswer }: Props) {
           {askedBy === 'codex' ? 'Codex' : askedBy === 'claude' ? 'Claude' : '循环'} 需要你拍板（seq {seq}）
         </div>
         <div className="mb-4 whitespace-pre-wrap text-sm font-medium text-gray-800 dark:text-gray-100">
-          {question.question}
+          {question.question?.trim() || (
+            <span className="italic text-gray-400">（未能解析出问题文本，可自由作答）</span>
+          )}
         </div>
 
         {question.options && question.options.length > 0 && (

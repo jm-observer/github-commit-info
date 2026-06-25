@@ -49,6 +49,10 @@ pub struct ServiceDef {
     /// 一键部署定义。`None` → 该服务暂不支持一键部署（仅观测）。
     #[serde(default)]
     pub deploy: Option<DeployDef>,
+    /// 上次部署成功的时间（ISO8601 / RFC3339 UTC）。**仅部署成功后由后端写入**，
+    /// 不进面板编辑流程；从未成功部署过则为 `None`。
+    #[serde(default)]
+    pub last_deployed_at: Option<String>,
 }
 
 /// 一条注入 systemd unit 的环境变量。`value` 允许含 `=`，但**不应含逗号**
@@ -99,6 +103,7 @@ pub fn builtin() -> Vec<ServiceDef> {
                 script: "deploy-g10.ps1".into(),
                 args: vec!["-Service".into(), "toolkit-server".into()],
             }),
+            last_deployed_at: None,
         },
         ServiceDef {
             name: "english".into(),
@@ -119,25 +124,28 @@ pub fn builtin() -> Vec<ServiceDef> {
                 script: "deploy-g10.ps1".into(),
                 args: vec!["-Service".into(), "english".into()],
             }),
+            last_deployed_at: None,
         },
         ServiceDef {
             name: "trace-hub".into(),
             label: "trace-hub（全链路追踪）".into(),
             note: "axum 追踪后端；deploy-g10.ps1 交叉编译，端口经 TRACE_HUB_BIND 注入".into(),
             repo_dir: r"D:\git\trace-hub".into(),
-            health_url: "http://192.168.0.68:9100/health".into(),
+            health_url: "http://192.168.0.68:9120/health".into(),
             remote_service: Some("trace-hub.service".into()),
             // 追踪 Web UI 挂主端口根路径（随 TRACE_HUB_BIND）。
-            web_url: "http://192.168.0.68:9100".into(),
+            // 端口 9100 已让给 FunASR(streaming-speech),trace-hub 挪到 9120。
+            web_url: "http://192.168.0.68:9120".into(),
             env: vec![EnvVar {
                 key: "TRACE_HUB_BIND".into(),
-                value: "0.0.0.0:9100".into(),
+                value: "0.0.0.0:9120".into(),
                 note: bind_note(),
             }],
             deploy: Some(DeployDef {
                 script: "deploy-g10.ps1".into(),
                 args: vec!["-Service".into(), "trace-hub".into()],
             }),
+            last_deployed_at: None,
         },
         ServiceDef {
             name: "system-prompt-show".into(),
@@ -160,6 +168,7 @@ pub fn builtin() -> Vec<ServiceDef> {
                 script: "deploy-g10.ps1".into(),
                 args: vec!["-Service".into(), "system-prompt-show".into()],
             }),
+            last_deployed_at: None,
         },
         ServiceDef {
             name: "alarm-server".into(),
@@ -179,6 +188,7 @@ pub fn builtin() -> Vec<ServiceDef> {
                 script: "deploy-g10.ps1".into(),
                 args: vec!["-Service".into(), "alarm-server".into()],
             }),
+            last_deployed_at: None,
         },
         ServiceDef {
             name: "zero".into(),
@@ -202,7 +212,7 @@ pub fn builtin() -> Vec<ServiceDef> {
                 },
                 EnvVar {
                     key: "TRACE_HUB_ENDPOINT".into(),
-                    value: "http://127.0.0.1:9100/v1/spans".into(),
+                    value: "http://127.0.0.1:9120/v1/spans".into(),
                     note: "trace-hub 宿主端点（未设则零追踪）".into(),
                 },
             ],
@@ -210,6 +220,7 @@ pub fn builtin() -> Vec<ServiceDef> {
                 script: "deploy-g10.ps1".into(),
                 args: vec!["-Service".into(), "zero.service".into()],
             }),
+            last_deployed_at: None,
         },
         // orchestrator(原 :8090 独立服务)已并入 toolkit-server :8788/api/asr 同进程,
         // 2026-06-20 物理退役。语音控制台入口见 toolkit-server 主面板「语音」tab。
@@ -238,6 +249,18 @@ pub fn load(workspace: &Path) -> (Vec<ServiceDef>, Option<String>) {
             Some(format!("解析 {} 失败，已回退内置默认：{e}", path.display())),
         ),
     }
+}
+
+/// 部署成功后给某服务盖上「上次部署时间」（RFC3339 UTC）并落盘。读当前清单 → 改该服务
+/// 的 `last_deployed_at` → 整体写回覆盖文件（顺带把内置默认物化成覆盖文件，符合既有覆盖语义）。
+/// 找不到该服务名时静默返回 `Ok(())`（部署链路不因此报错）。
+pub fn mark_deployed(workspace: &Path, name: &str, when: String) -> Result<(), String> {
+    let (mut list, _) = load(workspace);
+    let Some(svc) = list.iter_mut().find(|s| s.name == name) else {
+        return Ok(());
+    };
+    svc.last_deployed_at = Some(when);
+    save(workspace, &list)
 }
 
 /// 把编辑后的服务清单写回 workspace 的 `g10-services.json`（覆盖文件）。

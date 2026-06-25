@@ -10,13 +10,14 @@
 //! - `POST /summarize`        对话总结：用 `chat_summary` 提示词总结粘贴的会话文本。
 
 use crate::state::AppState;
-use axum::extract::{Path, State};
+use axum::extract::{Path, Query, State};
 use axum::http::StatusCode;
 use axum::response::Json;
 use axum::routing::{get, post};
 use axum::Router;
 use serde::Deserialize;
 use serde_json::{json, Value};
+use toolkit_core::llm_sessions;
 use toolkit_core::llm_store::{self, StoredLlmConfig};
 use toolkit_llm::prompt_hash;
 
@@ -30,6 +31,9 @@ pub fn router() -> Router<AppState> {
         )
         .route("/ping", post(ping))
         .route("/summarize", post(summarize))
+        .route("/sessions", get(list_sessions_h).post(create_chat_h))
+        .route("/sessions/{id}", get(get_session_h))
+        .route("/sessions/{id}/messages", post(chat_send_h))
 }
 
 fn err(code: StatusCode, msg: String) -> (StatusCode, Json<Value>) {
@@ -260,7 +264,195 @@ async fn summarize(
     let template = super::resolve_prompt(&s.pool, super::NAME_CHAT_SUMMARY).map_err(internal)?;
     let prompt = template.replace("{CONVERSATION}", body.text.trim());
     match client.complete(&prompt).await {
-        Ok(summary) => Ok(Json(json!({ "summary": summary, "model": client.model() }))),
+        Ok(summary) => {
+            let title: String = body.text.trim().chars().take(40).collect();
+            super::record::record_exchange(
+                &s.pool,
+                super::NAME_CHAT_SUMMARY,
+                &title,
+                client.model(),
+                super::NAME_CHAT_SUMMARY,
+                &prompt,
+                &summary,
+                json!({}),
+            );
+            Ok(Json(json!({ "summary": summary, "model": client.model() })))
+        }
         Err(e) => Err(err(StatusCode::BAD_GATEWAY, format!("调用失败：{e:#}"))),
+    }
+}
+
+// ---------------- 会话记录 / 对话测试 ----------------
+
+#[derive(Debug, Deserialize)]
+struct ListQuery {
+    /// 按 kind 过滤（chat_test | douyin_refine | chat_summary）。
+    #[serde(default)]
+    origin: Option<String>,
+    #[serde(default)]
+    limit: Option<i64>,
+}
+
+/// 把 metadata/meta 的 JSON 字符串解析为值；无法解析则回 `{}`。
+fn parse_json(s: &str) -> Value {
+    serde_json::from_str::<Value>(s).unwrap_or_else(|_| json!({}))
+}
+
+fn session_json(s: &llm_sessions::LlmSession) -> Value {
+    json!({
+        "id": s.id,
+        "kind": s.kind,
+        "title": s.title,
+        "model": s.model,
+        "prompt_name": s.prompt_name,
+        "status": s.status,
+        "metadata": parse_json(&s.metadata),
+        "created_at": s.created_at,
+        "updated_at": s.updated_at,
+    })
+}
+
+fn message_json(m: &llm_sessions::LlmMessage) -> Value {
+    json!({
+        "id": m.id,
+        "seq": m.seq,
+        "role": m.role,
+        "content": m.content,
+        "meta": parse_json(&m.meta),
+        "created_at": m.created_at,
+    })
+}
+
+/// GET /sessions?origin=&limit= —— 列会话（倒序，默认 100，clamp ≤500）。
+async fn list_sessions_h(
+    State(s): State<AppState>,
+    Query(q): Query<ListQuery>,
+) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    let limit = q.limit.unwrap_or(100).clamp(1, 500);
+    let origin = q.origin.as_deref().filter(|s| !s.trim().is_empty());
+    let rows = llm_sessions::list_sessions(&s.pool, origin, limit).map_err(internal)?;
+    let sessions: Vec<Value> = rows.iter().map(session_json).collect();
+    Ok(Json(json!({ "sessions": sessions })))
+}
+
+/// GET /sessions/{id} —— 单条会话 + 全部消息（只读回看）。
+async fn get_session_h(
+    State(s): State<AppState>,
+    Path(id): Path<String>,
+) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    let session = llm_sessions::get_session(&s.pool, &id)
+        .map_err(internal)?
+        .ok_or_else(|| err(StatusCode::NOT_FOUND, format!("会话不存在 {id}")))?;
+    let msgs = llm_sessions::get_messages(&s.pool, &id).map_err(internal)?;
+    let mut out = session_json(&session);
+    out["messages"] = Value::Array(msgs.iter().map(message_json).collect());
+    Ok(Json(out))
+}
+
+#[derive(Debug, Deserialize)]
+struct CreateChatBody {
+    /// 可选首条用户消息；带则立刻跑一轮对话。
+    #[serde(default)]
+    message: Option<String>,
+}
+
+/// POST /sessions —— 新建 chat_test 会话，可带首条消息直接对话。
+async fn create_chat_h(
+    State(s): State<AppState>,
+    Json(body): Json<CreateChatBody>,
+) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    let client = super::resolve_client(&s.pool)
+        .map_err(|e| err(StatusCode::BAD_REQUEST, format!("{e:#}")))?;
+    let first = body
+        .message
+        .as_deref()
+        .map(str::trim)
+        .filter(|m| !m.is_empty());
+    let title: String = first
+        .map(|m| m.chars().take(40).collect())
+        .unwrap_or_else(|| "新对话".to_string());
+    let id = llm_sessions::create_session(
+        &s.pool,
+        llm_sessions::NewSession {
+            kind: "chat_test",
+            title: &title,
+            model: Some(client.model()),
+            prompt_name: None,
+            metadata: None,
+        },
+    )
+    .map_err(internal)?;
+
+    if let Some(msg) = first {
+        run_chat_turn(&s, &client, &id, msg).await?;
+    }
+
+    let msgs = llm_sessions::get_messages(&s.pool, &id).map_err(internal)?;
+    Ok(Json(json!({
+        "id": id,
+        "model": client.model(),
+        "messages": msgs.iter().map(message_json).collect::<Vec<_>>(),
+    })))
+}
+
+#[derive(Debug, Deserialize)]
+struct ChatSendBody {
+    message: String,
+}
+
+/// POST /sessions/{id}/messages —— 在已有 chat_test 会话上追加一轮对话。
+async fn chat_send_h(
+    State(s): State<AppState>,
+    Path(id): Path<String>,
+    Json(body): Json<ChatSendBody>,
+) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    if body.message.trim().is_empty() {
+        return Err(err(StatusCode::BAD_REQUEST, "message 不能为空".to_string()));
+    }
+    let session = llm_sessions::get_session(&s.pool, &id)
+        .map_err(internal)?
+        .ok_or_else(|| err(StatusCode::NOT_FOUND, format!("会话不存在 {id}")))?;
+    if session.kind != "chat_test" {
+        return Err(err(
+            StatusCode::BAD_REQUEST,
+            "该会话不可续聊（仅对话测试支持）".to_string(),
+        ));
+    }
+    let client = super::resolve_client(&s.pool)
+        .map_err(|e| err(StatusCode::BAD_REQUEST, format!("{e:#}")))?;
+    let assistant = run_chat_turn(&s, &client, &id, body.message.trim()).await?;
+    Ok(Json(json!({
+        "message": message_json(&assistant),
+        "model": client.model(),
+    })))
+}
+
+/// 跑一轮对话：先持久化 user（即便模型出错也保住该轮）→ 用全量历史调 chat →
+/// 成功落 assistant 返回；失败置会话 error 并 502。
+async fn run_chat_turn(
+    s: &AppState,
+    client: &toolkit_llm::LlmClient,
+    id: &str,
+    user_msg: &str,
+) -> Result<llm_sessions::LlmMessage, (StatusCode, Json<Value>)> {
+    llm_sessions::append_message(&s.pool, id, "user", user_msg, None).map_err(internal)?;
+    let history = llm_sessions::get_messages(&s.pool, id).map_err(internal)?;
+    let msgs: Vec<toolkit_llm::Message> = history
+        .iter()
+        .map(|m| toolkit_llm::Message {
+            role: m.role.clone(),
+            content: m.content.clone(),
+        })
+        .collect();
+    match client.chat(&msgs).await {
+        Ok(reply) => {
+            let assistant = llm_sessions::append_message(&s.pool, id, "assistant", &reply, None)
+                .map_err(internal)?;
+            Ok(assistant)
+        }
+        Err(e) => {
+            let _ = llm_sessions::set_session_status(&s.pool, id, "error");
+            Err(err(StatusCode::BAD_GATEWAY, format!("调用失败：{e:#}")))
+        }
     }
 }

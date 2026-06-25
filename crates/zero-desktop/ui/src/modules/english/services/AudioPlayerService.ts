@@ -139,8 +139,38 @@ export class AudioPlayerService {
   }
 
   async playCurrentAudio(): Promise<void> {
-    const audio = this._getCurrentAudio()
-    const sentence = this._getCurrentSentence()
+    let audio = this._getCurrentAudio()
+    let sentence = this._getCurrentSentence()
+
+    // 当前句没有可播放音频(audios 为空/缺失)：别静默 return 卡死在"准备中...",
+    // 向后跳到第一句有音频的(最多绕整列一圈)。整列都没音频 → 给出明确状态。
+    if (sentence && !audio && this.sentences.length > 0) {
+      console.warn(`[AudioPlayerService] 句子 #${sentence.id} 无音频(audios 为空)，自动跳过`)
+      const total = this.sentences.length
+      let found = -1
+      for (let step = 1; step <= total; step++) {
+        const idx = (this.currentSentenceIndex + step) % total
+        const s = this.sentences[idx]
+        if (s && Array.isArray(s.audios) && s.audios.length > 0) { found = idx; break }
+      }
+      if (found < 0) {
+        this.isPlaying = false
+        this._triggerEvent('onPlayStateChange', { isPlaying: false })
+        this._updateStatusText('当前列表无可播放音频')
+        return
+      }
+      this.currentSentenceIndex = found
+      this.currentAudioIndex = 0
+      this.playCount = 0
+      this._triggerEvent('onSentenceChange', { sentences: this.sentences, currentSentenceIndex: found })
+      this._triggerEvent('onPlayCountChange', {
+        playCount: this.playCount, currentSentenceIndex: this.currentSentenceIndex,
+        currentAudioIndex: this.currentAudioIndex, maxPlayCount: this.maxPlayCount
+      })
+      audio = this._getCurrentAudio()
+      sentence = this._getCurrentSentence()
+    }
+
     if (!audio || !sentence) return
 
     const cacheKey = `${sentence.id}_${audio.id}`

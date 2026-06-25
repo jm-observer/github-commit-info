@@ -32,6 +32,15 @@ function driftHint(probe?: ProbeResult, local?: LocalVersion): string {
   return ''
 }
 
+// 上次部署时间：后端存 RFC3339 UTC，这里展示为本地时间（YYYY-MM-DD HH:mm）。
+function formatDeployedAt(iso?: string | null): string {
+  if (!iso) return '从未部署'
+  const d = new Date(iso)
+  if (Number.isNaN(d.getTime())) return iso
+  const pad = (n: number) => String(n).padStart(2, '0')
+  return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())} ${pad(d.getHours())}:${pad(d.getMinutes())}`
+}
+
 function StatusDot({ probe, configured }: { probe?: ProbeResult; configured: boolean }) {
   let cls = 'text-gray-400'
   let title = '未探测'
@@ -144,6 +153,19 @@ export default function G10DeployPage() {
       }))
       // 部署完成后刷新该服务的连通性/版本
       void refreshOne(done.name)
+      // 部署成功时后端已更新「上次部署时间」，重取清单把该服务的 def 同步到面板。
+      if (done.success) {
+        G10DeployAPI.listServices()
+          .then(list => {
+            const next = list.services.find(s => s.name === done.name)
+            if (next) {
+              setRows(prev =>
+                prev.map(r => (r.def.name === done.name ? { ...r, def: next } : r)),
+              )
+            }
+          })
+          .catch(() => {})
+      }
     }))
 
     return () => {
@@ -375,6 +397,12 @@ export default function G10DeployPage() {
                       <span className="font-mono text-gray-800 dark:text-gray-200">
                         {local?.git_hash ?? (probing ? '…' : '—')}
                         {local?.dirty ? '*' : ''}
+                      </span>
+                    </span>
+                    <span className="text-gray-500">
+                      上次部署：
+                      <span className="font-mono text-gray-800 dark:text-gray-200">
+                        {formatDeployedAt(def.last_deployed_at)}
                       </span>
                     </span>
                     {hint && <span className="text-amber-600 dark:text-amber-400">{hint}</span>}

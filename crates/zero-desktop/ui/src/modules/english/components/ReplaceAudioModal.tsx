@@ -1,20 +1,30 @@
 /**
- * ReplaceAudioModal — 「替换」弹窗：编辑文本 + 选 voice / 语速 → 生成 TTS 预览试听 →
- * 确认后替换当前句子的文本与音频。
+ * ReplaceAudioModal — 「替换」弹窗：编辑文本 + 语速 → **一次性为所有音色生成 TTS 试听** →
+ * 用户逐个试听后选中某个音色 → 确认替换当前句子的文本与音频。
  *
- * 流程：必须先「生成预览」试听，才能「确认替换」；改文本/voice/语速会作废已有预览，
- * 需重新生成（保证「听到的 == 存下的」）。
+ * 设计取舍：不再让用户「先选音色再生成」，而是把全部音色都生成好并列试听、横向对比后再选。
+ * 改文本/语速会作废已生成的全部预览，需重新生成（保证「听到的 == 存下的」）。逐个音色顺序
+ * 生成（上游 TTS 单机串行），生成一个就立即出现在列表里，用户可边等边听。
  */
 
 import { useEffect, useState, useCallback } from 'react'
 import { convertFileSrc } from '@tauri-apps/api/core'
-import { X, Play, Loader2 } from 'lucide-react'
+import { X, Loader2, Sparkles } from 'lucide-react'
 import ApiService from '../services/ApiService'
 import { Button } from '../../speech/components/ui/Button'
 
 interface VoiceOption {
   id: string
   label: string
+}
+
+/** 单个音色的预览结果：成功带 src，失败带 error。 */
+interface PreviewItem {
+  voiceId: string
+  label: string
+  src?: string
+  path?: string
+  error?: string
 }
 
 interface ReplaceAudioModalProps {
@@ -52,11 +62,11 @@ export default function ReplaceAudioModal({
 }: ReplaceAudioModalProps) {
   const [text, setText] = useState(initialText)
   const [voices, setVoices] = useState<VoiceOption[]>([])
-  const [voiceId, setVoiceId] = useState('')
   const [speed, setSpeed] = useState(1.0)
-  const [previewPath, setPreviewPath] = useState<string | null>(null)
-  const [previewSrc, setPreviewSrc] = useState<string | null>(null)
+  const [previews, setPreviews] = useState<PreviewItem[]>([])
+  const [selectedVoiceId, setSelectedVoiceId] = useState<string | null>(null)
   const [generating, setGenerating] = useState(false)
+  const [progress, setProgress] = useState<{ done: number; total: number } | null>(null)
   const [replacing, setReplacing] = useState(false)
   const [error, setError] = useState<string | null>(null)
 
@@ -65,51 +75,64 @@ export default function ReplaceAudioModal({
     if (!open) return
     setText(initialText)
     setSpeed(1.0)
-    setPreviewPath(null)
-    setPreviewSrc(null)
+    setPreviews([])
+    setSelectedVoiceId(null)
+    setProgress(null)
     setError(null)
     let cancelled = false
     ApiService.getInstance().getVoices()
       .then(raw => {
         if (cancelled) return
-        const opts = normalizeVoices(raw)
-        setVoices(opts)
-        setVoiceId(prev => prev || (opts[0]?.id ?? ''))
+        setVoices(normalizeVoices(raw))
       })
       .catch(e => { if (!cancelled) setError('加载音色失败：' + (e?.message || e)) })
     return () => { cancelled = true }
   }, [open, initialText])
 
-  // 任何会改变音频内容的参数变化 → 作废已生成的预览。
-  const invalidatePreview = useCallback(() => {
-    setPreviewPath(null)
-    setPreviewSrc(null)
+  // 任何会改变音频内容的参数变化 → 作废已生成的全部预览。
+  const invalidatePreviews = useCallback(() => {
+    setPreviews([])
+    setSelectedVoiceId(null)
+    setProgress(null)
   }, [])
 
-  const handleGenerate = async () => {
-    if (!text.trim()) { setError('文本不能为空'); return }
+  // 为全部音色逐个生成试听；生成一个就追加进列表（用户可边等边听）。
+  const handleGenerateAll = async () => {
+    const trimmed = text.trim()
+    if (!trimmed) { setError('文本不能为空'); return }
+    if (voices.length === 0) { setError('没有可用音色'); return }
     setGenerating(true)
     setError(null)
-    try {
-      const path = await ApiService.getInstance().previewTts(text.trim(), voiceId, speed)
-      setPreviewPath(path)
-      // 带时间戳击穿 webview 资源缓存，确保每次试听都是最新生成的。
-      setPreviewSrc(convertFileSrc(path) + '?t=' + Date.now())
-    } catch (e: any) {
-      setError(e?.message || String(e))
-      invalidatePreview()
-    } finally {
-      setGenerating(false)
+    setPreviews([])
+    setSelectedVoiceId(null)
+    const stamp = Date.now()
+    const api = ApiService.getInstance()
+    for (let i = 0; i < voices.length; i++) {
+      const v = voices[i]
+      setProgress({ done: i, total: voices.length })
+      try {
+        const path = await api.previewTts(trimmed, v.id, speed)
+        // 带时间戳击穿 webview 资源缓存，确保试听的是这一轮新生成的。
+        const src = convertFileSrc(path) + '?t=' + stamp
+        setPreviews(prev => [...prev, { voiceId: v.id, label: v.label, path, src }])
+        // 默认选中第一个成功的音色。
+        setSelectedVoiceId(prev => prev ?? v.id)
+      } catch (e: any) {
+        setPreviews(prev => [...prev, { voiceId: v.id, label: v.label, error: e?.message || String(e) }])
+      }
     }
+    setProgress({ done: voices.length, total: voices.length })
+    setGenerating(false)
   }
 
   const handleConfirm = async () => {
     if (audioId == null) { setError('当前句子没有可替换的音频'); return }
-    if (!previewPath) { setError('请先生成预览并试听'); return }
+    const chosen = previews.find(p => p.voiceId === selectedVoiceId && p.path)
+    if (!chosen?.path) { setError('请先生成并选择一个音色'); return }
     setReplacing(true)
     setError(null)
     try {
-      await ApiService.getInstance().replaceSentenceAudio(sentenceId, audioId, text.trim(), previewPath)
+      await ApiService.getInstance().replaceSentenceAudio(sentenceId, audioId, text.trim(), chosen.path)
       onReplaced(text.trim())
       onClose()
     } catch (e: any) {
@@ -121,13 +144,15 @@ export default function ReplaceAudioModal({
 
   if (!open) return null
 
+  const hasSelectable = previews.some(p => p.path)
+
   return (
     <div
       className="fixed inset-0 z-50 flex items-center justify-center bg-black/40 p-4"
       onClick={onClose}
     >
       <div
-        className="w-full max-w-lg rounded-xl bg-white p-5 shadow-xl dark:bg-gray-900"
+        className="flex max-h-[90vh] w-full max-w-lg flex-col rounded-xl bg-white p-5 shadow-xl dark:bg-gray-900"
         onClick={e => e.stopPropagation()}
       >
         <div className="mb-4 flex items-center justify-between">
@@ -151,34 +176,14 @@ export default function ReplaceAudioModal({
         <label className="mb-1 block text-xs text-gray-500 dark:text-gray-400">文本</label>
         <textarea
           value={text}
-          onChange={e => { setText(e.target.value); invalidatePreview() }}
+          onChange={e => { setText(e.target.value); invalidatePreviews() }}
           rows={3}
           className="mb-3 w-full resize-y rounded-lg border border-gray-300 px-3 py-2 text-sm text-gray-800 focus:border-blue-500 focus:outline-none dark:border-gray-700 dark:bg-gray-800 dark:text-gray-100"
           placeholder="输入要朗读的英文文本"
         />
 
-        {/* voice + 语速 */}
-        <div className="mb-3 flex gap-3">
-          <div className="flex-1">
-            <label className="mb-1 block text-xs text-gray-500 dark:text-gray-400">音色</label>
-            {voices.length > 0 ? (
-              <select
-                value={voiceId}
-                onChange={e => { setVoiceId(e.target.value); invalidatePreview() }}
-                className="w-full rounded-lg border border-gray-300 px-3 py-2 text-sm text-gray-800 focus:border-blue-500 focus:outline-none dark:border-gray-700 dark:bg-gray-800 dark:text-gray-100"
-              >
-                {voices.map(v => <option key={v.id} value={v.id}>{v.label}</option>)}
-              </select>
-            ) : (
-              <input
-                type="text"
-                value={voiceId}
-                onChange={e => { setVoiceId(e.target.value); invalidatePreview() }}
-                className="w-full rounded-lg border border-gray-300 px-3 py-2 text-sm text-gray-800 focus:border-blue-500 focus:outline-none dark:border-gray-700 dark:bg-gray-800 dark:text-gray-100"
-                placeholder="voice id"
-              />
-            )}
-          </div>
+        {/* 语速 + 一键生成全部试听 */}
+        <div className="mb-3 flex items-end gap-3">
           <div className="w-40">
             <label className="mb-1 block text-xs text-gray-500 dark:text-gray-400">语速 {speed.toFixed(1)}x</label>
             <input
@@ -187,20 +192,62 @@ export default function ReplaceAudioModal({
               max={2.0}
               step={0.1}
               value={speed}
-              onChange={e => { setSpeed(parseFloat(e.target.value)); invalidatePreview() }}
+              onChange={e => { setSpeed(parseFloat(e.target.value)); invalidatePreviews() }}
               className="w-full"
             />
           </div>
+          <Button
+            variant="outline"
+            size="sm"
+            onClick={handleGenerateAll}
+            disabled={generating || !text.trim() || voices.length === 0}
+          >
+            {generating ? <Loader2 size={14} className="animate-spin" /> : <Sparkles size={14} />}
+            {generating
+              ? `生成中 ${progress?.done ?? 0}/${progress?.total ?? voices.length}`
+              : `生成全部试听（${voices.length} 个音色）`}
+          </Button>
         </div>
 
-        {/* 预览 */}
-        <div className="mb-4 flex items-center gap-3">
-          <Button variant="outline" size="sm" onClick={handleGenerate} disabled={generating || !text.trim()}>
-            {generating ? <Loader2 size={14} className="animate-spin" /> : <Play size={14} />}
-            {generating ? '生成中...' : '生成预览'}
-          </Button>
-          {previewSrc && (
-            <audio key={previewSrc} src={previewSrc} controls className="h-8 flex-1" />
+        {/* 全部音色试听列表：逐个出现，选中一个用于替换 */}
+        <div className="mb-4 min-h-0 flex-1 overflow-y-auto rounded-lg border border-gray-200 dark:border-gray-700">
+          {previews.length === 0 ? (
+            <div className="px-3 py-6 text-center text-sm text-gray-400 dark:text-gray-500">
+              点击「生成全部试听」为每个音色生成预览，听完后选择一个替换。
+            </div>
+          ) : (
+            <ul className="divide-y divide-gray-100 dark:divide-gray-800">
+              {previews.map(p => (
+                <li
+                  key={p.voiceId}
+                  className={`flex items-center gap-3 px-3 py-2 ${
+                    p.path && selectedVoiceId === p.voiceId ? 'bg-blue-50 dark:bg-blue-900/20' : ''
+                  }`}
+                >
+                  <input
+                    type="radio"
+                    name="voice-pick"
+                    className="shrink-0"
+                    disabled={!p.path}
+                    checked={selectedVoiceId === p.voiceId}
+                    onChange={() => setSelectedVoiceId(p.voiceId)}
+                  />
+                  <span className="w-32 shrink-0 truncate text-sm text-gray-700 dark:text-gray-200" title={p.label}>
+                    {p.label}
+                  </span>
+                  {p.error ? (
+                    <span className="flex-1 truncate text-xs text-red-500" title={p.error}>生成失败：{p.error}</span>
+                  ) : (
+                    <audio key={p.src} src={p.src} controls preload="none" className="h-8 flex-1" />
+                  )}
+                </li>
+              ))}
+              {generating && (
+                <li className="flex items-center gap-2 px-3 py-2 text-xs text-gray-400">
+                  <Loader2 size={12} className="animate-spin" /> 正在生成剩余音色…
+                </li>
+              )}
+            </ul>
           )}
         </div>
 
@@ -211,8 +258,8 @@ export default function ReplaceAudioModal({
             variant="primary"
             size="sm"
             onClick={handleConfirm}
-            disabled={replacing || !previewPath || audioId == null}
-            title={!previewPath ? '请先生成预览并试听' : undefined}
+            disabled={replacing || !hasSelectable || !selectedVoiceId || audioId == null}
+            title={!hasSelectable ? '请先生成并选择一个音色' : undefined}
           >
             {replacing ? <Loader2 size={14} className="animate-spin" /> : null}
             {replacing ? '替换中...' : '确认替换'}

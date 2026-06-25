@@ -4,6 +4,7 @@
 
 pub mod db;
 pub mod ids;
+pub mod llm_sessions;
 pub mod llm_store;
 pub mod migrations;
 pub mod models;

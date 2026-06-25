@@ -59,7 +59,10 @@ class ApiService {
   }
 
   async getAllSentences() {
-    return this.request('sentences.all')
+    // 带 customer_id 才能回显「全部」视图里的标注/报错/已读状态（否则报错感叹号
+    // 只是会话内乐观更新，刷新/重启后丢失）。缺 customer_id 时退化为不带（全 false）。
+    const customerId = await EnvConfigService.getInstance().getCustomerId()
+    return this.request('sentences.all', customerId ? { customer_id: customerId } : {})
   }
 
   /** 取音频包列表（「按包来听」）。对应 mini-program 的 package.list。 */

@@ -211,9 +211,28 @@ impl ResolvedEndpoint {
         self.join(&format!("/api/web/llm{path}"))
     }
 
-    /// 句子整体替换端点 `{g10_base}/api/sentence/replace-audio`（english 后端）。
+    /// english 后端的可达 base。english 与 toolkit-server **不在一个进程**：
+    /// - LAN：english 自签 HTTPS 直连会被 Tauri plugin-http 拒，须经 toolkit-server 的
+    ///   `/api/english` 反代（明文 http :8788）。
+    /// - WAN：:28080 反代有真证书且按路径分流到 english，直接用 `g10_base` 即可。
+    ///
+    /// 与 `english::english_get_g10_base`（前端 ApiService 用）派生口径一致。
+    fn english_base(&self) -> Option<String> {
+        if !self.is_configured() {
+            return None;
+        }
+        let base = self.g10_base.trim_end_matches('/');
+        Some(match self.picked {
+            NetMode::Lan => format!("{base}/api/english"),
+            NetMode::Wan | NetMode::Auto => base.to_string(),
+        })
+    }
+
+    /// 句子整体替换端点 `{english_base}/api/sentence/replace-audio`（english 后端）。
+    /// LAN 走 toolkit-server 反代前缀，WAN 直连——见 [`english_base`](Self::english_base)。
     pub fn replace_sentence_audio_endpoint(&self) -> Option<String> {
-        self.join("/api/sentence/replace-audio")
+        self.english_base()
+            .map(|b| format!("{b}/api/sentence/replace-audio"))
     }
 
     /// 任意子路径端点（给少数 handler 内联拼接的 `/api/web/...` 用）。
@@ -423,6 +442,29 @@ mod tests {
         let r = s.resolved(NetMode::Wan);
         assert_eq!(r.g10_base, "https://www.for-memory.cloud:28080");
         assert_eq!(r.asr_url, "wss://www.for-memory.cloud:28080/api/asr/stream");
+    }
+
+    #[test]
+    fn replace_audio_endpoint_uses_english_proxy_in_lan() {
+        // english 不在 toolkit-server 进程里：LAN 必须带 /api/english 反代前缀，
+        // 否则 toolkit-server 无此路由 → 404（线上实测 bug）。
+        let s = AppSettings {
+            lan_host: "192.168.1.100".to_string(),
+            ..AppSettings::default()
+        };
+        assert_eq!(
+            s.resolved(NetMode::Lan)
+                .replace_sentence_audio_endpoint()
+                .as_deref(),
+            Some("http://192.168.1.100:8788/api/english/api/sentence/replace-audio")
+        );
+        // WAN 直连 :28080 反代（按路径分流到 english），不加前缀。
+        assert_eq!(
+            s.resolved(NetMode::Wan)
+                .replace_sentence_audio_endpoint()
+                .as_deref(),
+            Some("https://www.for-memory.cloud:28080/api/sentence/replace-audio")
+        );
     }
 
     #[test]

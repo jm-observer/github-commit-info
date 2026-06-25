@@ -9,7 +9,7 @@ const ENVS = [
 // 每个模块默认端口 = `port`；某环境端口不同时用 `ports: {envId: N}` 覆盖
 const MODULES = [
   { id: 'toolkit',      name: 'Toolkit',      port: 8788, health: '/api/web/health' },
-  { id: 'trace-hub',    name: 'Trace Hub',    port: 9100, health: '/v1/traces' },
+  { id: 'trace-hub',    name: 'Trace Hub',    port: 9120, health: '/v1/traces' },
   { id: 'orchestrator', name: 'Orchestrator', port: 8090, health: '/api/stats' },
   { id: 'prompt-show',  name: 'Prompt Show',  port: 8267, ports: { g10: 9201 }, health: '/api/sessions' },
   { id: 'alarm',        name: 'Alarm',        port: 3030, ports: { g10: 9080 }, health: '/api/health' },

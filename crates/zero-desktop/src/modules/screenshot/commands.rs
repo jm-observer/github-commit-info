@@ -4,10 +4,82 @@
 //! `do_capture` 用 `cfg` 分流——Windows 走真实抓屏，非 Windows 走 stub 返回「不支持」，
 //! 这样非 Windows 也能正常编译，只是调用即报错。
 
+use std::io::Write;
+use std::path::Path;
+use std::sync::atomic::{AtomicBool, Ordering};
+
 use serde::{Deserialize, Serialize};
 use tauri::{AppHandle, Manager};
 
 use crate::app_state::AppState;
+
+// ---- 重入锁 + trace 工具（卡死修复：design.md §3.4 / §3.6） ----
+
+/// `do_capture` 入口重入锁：连按热键时第二次直接早返，不叠加触发。
+static CAPTURE_IN_PROGRESS: AtomicBool = AtomicBool::new(false);
+
+struct CaptureGuard;
+impl CaptureGuard {
+    /// 获取锁。已被占用返回 `None`（调用方应早返）。
+    fn acquire() -> Option<Self> {
+        CAPTURE_IN_PROGRESS
+            .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+            .ok()
+            .map(|_| CaptureGuard)
+    }
+}
+impl Drop for CaptureGuard {
+    fn drop(&mut self) {
+        CAPTURE_IN_PROGRESS.store(false, Ordering::SeqCst);
+    }
+}
+
+/// trace 文件单文件上限（超过即旋转一次到 `*.1`）。
+const TRACE_MAX_BYTES: u64 = 1_000_000;
+
+fn append_trace(path: &Path, stage: &str, detail: &str) {
+    if let Some(parent) = path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    if let Ok(meta) = std::fs::metadata(path) {
+        if meta.len() > TRACE_MAX_BYTES {
+            let rotated = path.with_extension("log.1");
+            let _ = std::fs::rename(path, &rotated);
+        }
+    }
+    let line = format!(
+        "[{}] {} | {}\n",
+        chrono::Local::now().format("%Y-%m-%d %H:%M:%S%.3f"),
+        stage,
+        detail
+    );
+    if let Ok(mut f) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)
+    {
+        let _ = f.write_all(line.as_bytes());
+    }
+}
+
+/// 追加一行 capture trace 到 `<workspace>/screenshots/.capture-trace.log`。
+/// 暴露给 `overlay::open_overlay` 里的 watchdog 用。
+pub(crate) fn trace_capture(workspace: &Path, stage: &str, detail: &str) {
+    let path = super::output::screenshots_dir(workspace).join(".capture-trace.log");
+    append_trace(&path, stage, detail);
+    log::info!(target: "screenshot", "[capture] {stage} | {detail}");
+}
+
+/// 失败时弹一条系统通知，不再「按了没反应」。
+pub(crate) fn notify_capture_failed(app: &AppHandle, msg: &str) {
+    use tauri_plugin_notification::NotificationExt;
+    let _ = app
+        .notification()
+        .builder()
+        .title("截图失败")
+        .body(msg)
+        .show();
+}
 
 /// 截图设置（P1 仅落地存取，热键当前写死见 `mod::DEFAULT_HOTKEY`，可配为 P2）。
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -36,23 +108,83 @@ impl Default for ScreenshotSettings {
 // ---- 抓屏触发：平台分流 ----
 
 /// 触发截图：抓鼠标所在屏（含冻结帧落盘）→ 打开叠加窗。被命令与全局热键共用。
+///
+/// **重入保护**：入口加 `CaptureGuard`，连按热键的第二次直接早返。
+/// **失败可见**：每个阶段写 `.capture-trace.log`（append + 体积旋转）；任一阶段失败
+/// 弹 notification，避免「按了没反应」。
 #[cfg(windows)]
 pub fn do_capture(app: &AppHandle) -> Result<(), String> {
     use super::{capture, monitor, output, overlay};
 
-    let state = app.state::<AppState>();
-    let workspace = state.workspace.clone();
+    let workspace = app.state::<AppState>().workspace.clone();
+    let trace_path = output::screenshots_dir(&workspace).join(".capture-trace.log");
+    let trace = |stage: &str, detail: &str| append_trace(&trace_path, stage, detail);
 
-    let rect = monitor::monitor_at_cursor().map_err(|e| e.to_string())?;
-    let png = capture::capture_rect_png(&rect).map_err(|e| e.to_string())?;
+    let _guard = match CaptureGuard::acquire() {
+        Some(g) => g,
+        None => {
+            trace("skip-reentrant", "");
+            return Ok(());
+        }
+    };
+
+    let session_id = overlay::next_session_id();
+    trace("session", &session_id.to_string());
+    trace("enter", "");
+
+    let rect = match monitor::monitor_at_cursor() {
+        Ok(r) => {
+            trace(
+                "monitor-ok",
+                &format!("x={} y={} w={} h={}", r.x, r.y, r.width, r.height),
+            );
+            r
+        }
+        Err(e) => {
+            let m = e.to_string();
+            trace("monitor-fail", &m);
+            notify_capture_failed(app, &m);
+            return Err(m);
+        }
+    };
+
+    let png = match capture::capture_rect_png(&rect) {
+        Ok(p) => {
+            trace("capture-ok", &format!("bytes={}", p.len()));
+            p
+        }
+        Err(e) => {
+            let m = e.to_string();
+            trace("capture-fail", &m);
+            notify_capture_failed(app, &m);
+            return Err(m);
+        }
+    };
 
     let frame_path = output::frozen_frame_path(&workspace);
     if let Some(parent) = frame_path.parent() {
-        std::fs::create_dir_all(parent).map_err(|e| format!("创建截图目录失败: {e}"))?;
+        if let Err(e) = std::fs::create_dir_all(parent) {
+            let m = format!("创建截图目录失败: {e}");
+            trace("mkdir-fail", &m);
+            notify_capture_failed(app, &m);
+            return Err(m);
+        }
     }
-    std::fs::write(&frame_path, &png).map_err(|e| format!("写冻结帧失败: {e}"))?;
+    if let Err(e) = std::fs::write(&frame_path, &png) {
+        let m = format!("写冻结帧失败: {e}");
+        trace("write-fail", &m);
+        notify_capture_failed(app, &m);
+        return Err(m);
+    }
+    trace("frame-saved", &frame_path.to_string_lossy());
 
-    overlay::open_overlay(app, &rect, &frame_path.to_string_lossy()).map_err(|e| e.to_string())?;
+    if let Err(e) = overlay::open_overlay(app, &rect, &frame_path.to_string_lossy(), session_id) {
+        let m = e.to_string();
+        trace("overlay-fail", &m);
+        notify_capture_failed(app, &m);
+        return Err(m);
+    }
+    trace("overlay-shown", &session_id.to_string());
     Ok(())
 }
 
@@ -67,6 +199,25 @@ pub fn screenshot_capture(app: AppHandle) -> Result<(), String> {
     do_capture(&app)
 }
 
+/// 命令：前端 overlay 已挂载完成首帧渲染 → 通知 Rust watchdog，避免误关。
+/// `session_id` 来自 overlay URL 查询串 `sid=...`。未知 session 静默忽略
+/// （前端误传 / watchdog 已超时 unregister）。
+#[tauri::command]
+pub fn screenshot_overlay_ready(app: AppHandle, session_id: u64) -> Result<(), String> {
+    let hit = super::overlay::mark_ready(session_id);
+    let workspace = app.state::<AppState>().workspace.clone();
+    trace_capture(
+        &workspace,
+        if hit {
+            "overlay-ack"
+        } else {
+            "overlay-ack-stale"
+        },
+        &session_id.to_string(),
+    );
+    Ok(())
+}
+
 /// 命令：提交最终成图（前端 canvas 合成的 PNG，base64）→ 落盘 + 写剪贴板 + 通知 → 关窗。
 /// 落盘与剪贴板互不阻断：任一失败仍尽力完成另一个，错误进日志/通知。返回落盘绝对路径。
 ///
@@ -78,14 +229,8 @@ pub fn screenshot_commit(app: AppHandle, png_base64: String) -> Result<String, S
     let workspace = app.state::<AppState>().workspace.clone();
     let trace_path = super::output::screenshots_dir(&workspace).join(".commit-trace.log");
     let trace = |stage: &str, detail: &str| {
-        let _ = std::fs::create_dir_all(super::output::screenshots_dir(&workspace));
-        let line = format!(
-            "[{}] {} | {}\n",
-            chrono::Local::now().format("%Y-%m-%d %H:%M:%S%.3f"),
-            stage,
-            detail
-        );
-        let _ = std::fs::write(&trace_path, line);
+        // append + 体积旋转：单次 commit 多阶段日志、多次 commit 累积都能完整看到。
+        append_trace(&trace_path, stage, detail);
         log::info!(target: "screenshot", "[commit] {} | {}", stage, detail);
     };
 

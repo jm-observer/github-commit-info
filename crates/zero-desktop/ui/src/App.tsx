@@ -9,6 +9,7 @@ import CookiePage from "./modules/cookie/CookiePage";
 import NetPolicyPage from "./modules/net-policy/NetPolicyPage";
 import CodeloopPage from "./modules/codeloop/CodeloopPage";
 import ChatSummaryPage from "./modules/chat-summary/ChatSummaryPage";
+import LlmChatPage from "./modules/llmchat/LlmChatPage";
 import G10DeployPage from "./modules/g10-deploy/G10DeployPage";
 import SettingsPage from "./modules/settings/SettingsPage";
 import MusicPage from "./modules/music/MusicPage";
@@ -33,6 +34,7 @@ export default function App() {
             <Route path="net-policy" element={<NetPolicyPage />} />
             <Route path="codeloop" element={<CodeloopPage />} />
             <Route path="chat-summary" element={<ChatSummaryPage />} />
+            <Route path="llmchat" element={<LlmChatPage />} />
             <Route path="music" element={<MusicPage />} />
             <Route path="screenshot" element={<ScreenshotPage />} />
             <Route path="g10-deploy" element={<G10DeployPage />} />

@@ -302,6 +302,10 @@ fn run_gui(workspace: PathBuf) -> Result<()> {
             modules::llm::llm_reset_prompt,
             modules::llm::llm_ping,
             modules::llm::llm_summarize,
+            modules::llm::llm_list_sessions,
+            modules::llm::llm_get_session,
+            modules::llm::llm_create_chat,
+            modules::llm::llm_chat_send,
             // codeloop 模块（Codex⇄Claude 复核循环）
             modules::codeloop::codeloop_list_sessions,
             modules::codeloop::codeloop_new_codex_session,
@@ -346,6 +350,7 @@ fn run_gui(workspace: PathBuf) -> Result<()> {
             modules::screenshot::screenshot_capture,
             modules::screenshot::screenshot_commit,
             modules::screenshot::screenshot_cancel,
+            modules::screenshot::screenshot_overlay_ready,
             modules::screenshot::screenshot_get_settings,
             modules::screenshot::screenshot_save_settings,
             modules::screenshot::screenshot_list_history,

@@ -13,8 +13,29 @@ const VOICES_TIMEOUT: Duration = Duration::from_secs(30);
 const REPLACE_TIMEOUT: Duration = Duration::from_secs(60);
 /// 跟读判分：上传短 clip + FunASR 转写（单机串行可能排队），给足 90s。
 const SHADOW_TIMEOUT: Duration = Duration::from_secs(90);
-/// 预览 WAV 落盘文件名（每次生成覆盖；前端用查询串做缓存击穿）。
-const PREVIEW_FILE: &str = "_tts_preview.wav";
+/// 预览 WAV 文件名前缀。每个音色一份独立文件（`_tts_preview_<voice>.wav`），便于「全部
+/// 音色一次性生成、并列试听」；前端再用查询串做缓存击穿。替换时只认这个前缀下的文件。
+const PREVIEW_PREFIX: &str = "_tts_preview_";
+
+/// 把 voice_id 收敛成安全文件名片段（仅保留字母数字/`_`/`-`，其余替换为 `_`），避免路径穿越
+/// 与非法文件名。空 → `default`。
+fn sanitize_voice(voice_id: &str) -> String {
+    let s: String = voice_id
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || c == '_' || c == '-' {
+                c
+            } else {
+                '_'
+            }
+        })
+        .collect();
+    if s.is_empty() {
+        "default".to_string()
+    } else {
+        s
+    }
+}
 
 /// English 模块状态（前端通过 plugin-store / plugin-fs 管理自身 KV 和音频缓存）。
 #[derive(Default)]
@@ -159,7 +180,7 @@ pub async fn english_tts_preview(
     tokio::fs::create_dir_all(&cache_dir)
         .await
         .map_err(|e| format!("创建缓存目录失败: {e}"))?;
-    let out_path = cache_dir.join(PREVIEW_FILE);
+    let out_path = cache_dir.join(format!("{PREVIEW_PREFIX}{}.wav", sanitize_voice(&voice_id)));
     tokio::fs::write(&out_path, &bytes)
         .await
         .map_err(|e| format!("落盘预览失败: {e}"))?;
@@ -293,13 +314,19 @@ pub async fn english_replace_sentence_audio(
     if text.is_empty() {
         return Err("文本不能为空".to_string());
     }
-    // 只允许读 english 音频缓存目录下的预览文件，避免被诱导上传任意本地文件。
+    // 只允许读 english 音频缓存目录下、以预览前缀命名的 WAV，避免被诱导上传任意本地文件。
     let cache_dir = crate::shared::workspace::english_audio_cache_dir(&state.workspace);
-    let expected = cache_dir.join(PREVIEW_FILE);
-    if std::path::Path::new(&preview_path) != expected.as_path() {
+    let path = std::path::Path::new(&preview_path);
+    let is_preview = path.parent() == Some(cache_dir.as_path())
+        && path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .map(|n| n.starts_with(PREVIEW_PREFIX) && n.ends_with(".wav"))
+            .unwrap_or(false);
+    if !is_preview {
         return Err("非法的预览文件路径".to_string());
     }
-    let bytes = tokio::fs::read(&expected)
+    let bytes = tokio::fs::read(path)
         .await
         .map_err(|e| format!("读预览文件失败（请先生成预览）: {e}"))?;
 

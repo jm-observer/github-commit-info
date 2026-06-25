@@ -143,6 +143,10 @@ export default function AnnotationPlayer({ autoStart = true, dataSource = 'annot
   const initAudioPlayer = async (sentencesList: Sentence[]) => {
     if (!sentencesList.length) throw new Error('没有可播放的句子')
 
+    // 「启动自动播放」只在本次会话**首次进入英语听力**时生效一次：之前没有单例 = 首次。
+    // 之后切子标签(标注/全部/听包)都属于"换歌单"，载入后保持暂停、等用户手动播，不再自己响。
+    const hadInstance = AudioPlayerService.hasInstance()
+
     const envConfig = await EnvConfigService.getInstance().getConfig()
     const cacheManager = FileCacheManager.getInstance()
     const audioAdapter = new HtmlAudioAdapter()
@@ -158,8 +162,8 @@ export default function AnnotationPlayer({ autoStart = true, dataSource = 'annot
     audioService.setMaxPlayCount(4)
     audioService.resetPlayer()
 
-    // prop 上的 autoStart 是默认值;用户偏好(localStorage)进一步覆盖,关掉就不自动播。
-    if (autoStart && readAutoStartPref() && !autoPlayStartedRef.current) {
+    // prop 上的 autoStart 是默认值;用户偏好(localStorage)进一步覆盖;且仅首次进入(无旧单例)才自动播。
+    if (autoStart && readAutoStartPref() && !hadInstance && !autoPlayStartedRef.current) {
       autoPlayStartedRef.current = true
       setTimeout(() => {
         try { void audioService.playCurrentAudio() }
@@ -221,7 +225,7 @@ export default function AnnotationPlayer({ autoStart = true, dataSource = 'annot
       {initialized && (
         <>
           <AudioPlayer showAnnotation={true} showReport={true} showOptions={true} />
-          {/* 跟读判分（静默叠加在播放循环上；默认关，开关在面板内） */}
+          {/* 跟读判分：叠加在当前歌单的播放循环上的模式开关（面板内默认关，点「开启」生效）。 */}
           <ShadowPanel />
         </>
       )}

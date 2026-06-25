@@ -118,6 +118,7 @@ pwsh ./deploy-g10.ps1 -SkipBuild # 仅复制已有产物
 | `:9101` | FunASR `/transcribe` + `/embed`（离线 ASR / 声纹） | streaming-speech |
 | `:8095` | CosyVoice2 TTS | streaming-speech |
 | `:8097` | audio-cleanup `/clean`（音频清洗） | streaming-speech |
+| `:8098` | pronunciation-assess `/assess`（英语发音评测 GOP；shadow GOP 后端上游，`GOP_BASE_URL`） | streaming-speech |
 | `:8788` | toolkit-server（Web API + 代理 + 控制台 + **内嵌 ASR 编排**） | 本仓 |
 | `:8000` | vLLM（OpenAI 兼容 LLM） | 第三方/外部 |
 
@@ -211,6 +212,10 @@ pwsh ./deploy-g10.ps1 -SkipBuild # 仅复制已有产物
 - [docs/rag-service-design.md](docs/rag-service-design.md) — RAG 检索服务设计。
 - [docs/runbook-pipeline-e2e.md](docs/runbook-pipeline-e2e.md) — 抖音知识管线端到端验收 runbook（Phase 2）。
 - [docs/runbook-audioforge-e2e.md](docs/runbook-audioforge-e2e.md) — 英语音频生产线端到端验收 runbook（Phase 3）。
+- [docs/audio-store-design.md](docs/audio-store-design.md) — 音频统一仓库（audio-store）设计：blob 内容寻址仓库收拢音频字节，english 持引用消复制。
+- [docs/english-shadow-design.md](docs/english-shadow-design.md) — 英语跟读判分（v1：ASR 文本对齐）设计。
+- [docs/english-shadow-todo.md](docs/english-shadow-todo.md) — 跟读判分优化需求 TODO（全自动 / 实时录评 / 发音级评分）。
+- [docs/english-shadow-gop-design.md](docs/english-shadow-gop-design.md) — 跟读发音级评测（GOP 音素评分）设计。
 - [docs/distributed-worker-design.md](docs/distributed-worker-design.md) — 分布式 worker 设计：多 IP 节点 + pull 调度 + 两段式自更新。
 - [docs/toolkit-rfc/2026-06-04-initial-skeleton/data-model.md](docs/toolkit-rfc/2026-06-04-initial-skeleton/data-model.md) — SQLite 数据模型。
 - [docs/toolkit-rfc/2026-06-10-toolkit-elevation/plan.md](docs/toolkit-rfc/2026-06-10-toolkit-elevation/plan.md) — 提级为统一工具中台的分阶段规划。

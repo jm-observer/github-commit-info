@@ -45,23 +45,88 @@ pub fn parse_verdict(reply: &str) -> Option<Verdict> {
 
 /// 解析 ASK_USER：取**第一行**以 `ASK_USER:` 开头者，后接一段 JSON。
 ///
-/// JSON 解析失败兜底：把 `ASK_USER:` 之后整段当纯文本 question（options 空）。
+/// JSON 可在同一行，也可换行/美化（pretty-print）跨多行——从标记处取到文末，
+/// 先整段试 JSON，再用花括号配平抽出首个完整 JSON 对象试 JSON。
+/// 全部失败兜底：把 `ASK_USER:` 之后整段当纯文本 question（options 空）。
 /// 无 ASK_USER 行返回 `None`。
 pub fn parse_ask_user(reply: &str) -> Option<AskUser> {
+    // 定位标记：单行 trim 后以 `ASK_USER:` 开头。记下标记冒号之后到文末的整段，
+    // 以便容纳 JSON 跨行的情形。
+    let mut tail = None;
     for line in reply.lines() {
-        let t = line.trim();
-        let Some(rest) = t.strip_prefix("ASK_USER:") else {
-            continue;
-        };
-        let payload = rest.trim();
-        if let Ok(parsed) = serde_json::from_str::<AskUser>(payload) {
+        if let Some(rest) = line.trim().strip_prefix("ASK_USER:") {
+            // 同一行可能就是完整 JSON；也可能为空（JSON 在后续行）。
+            // 用原文中该行之后的剩余文本拼出 tail，避免丢掉换行的 JSON。
+            let after_marker = rest.trim_start();
+            tail = Some((after_marker.to_string(), line));
+            break;
+        }
+    }
+    let (same_line, marker_line) = tail?;
+
+    // 从标记行之后取整段剩余原文（含换行），用于跨行 JSON。
+    let rest_from_marker = reply
+        .split_once(marker_line)
+        .map(|(_, after)| after)
+        .unwrap_or("");
+    let multiline = format!("{same_line}\n{rest_from_marker}");
+    let multiline = multiline.trim();
+
+    // 1) 同行整段直接试。
+    if !same_line.is_empty() {
+        if let Ok(parsed) = serde_json::from_str::<AskUser>(&same_line) {
             return Some(parsed);
         }
-        // 兜底：整段当纯文本问题。
-        return Some(AskUser {
-            question: payload.to_string(),
-            options: Vec::new(),
-        });
+    }
+    // 2) 跨行：花括号配平抽出首个完整 JSON 对象再试。
+    if let Some(obj) = extract_first_json_object(multiline) {
+        if let Ok(parsed) = serde_json::from_str::<AskUser>(obj) {
+            return Some(parsed);
+        }
+    }
+    // 3) 兜底：取首个非空文本行当纯文本问题（绝不返回空串）。
+    let question = multiline
+        .lines()
+        .map(str::trim)
+        .find(|l| !l.is_empty())
+        .unwrap_or("")
+        .to_string();
+    Some(AskUser {
+        question,
+        options: Vec::new(),
+    })
+}
+
+/// 从文本里用花括号配平抽出**首个**完整 JSON 对象子串（含起止花括号）。
+/// 简单跳过字符串字面量内的花括号与转义，足够应付 agent 输出的拍板 JSON。
+fn extract_first_json_object(s: &str) -> Option<&str> {
+    let bytes = s.as_bytes();
+    let start = bytes.iter().position(|&b| b == b'{')?;
+    let mut depth = 0i32;
+    let mut in_str = false;
+    let mut escaped = false;
+    for (i, &b) in bytes.iter().enumerate().skip(start) {
+        if in_str {
+            if escaped {
+                escaped = false;
+            } else if b == b'\\' {
+                escaped = true;
+            } else if b == b'"' {
+                in_str = false;
+            }
+            continue;
+        }
+        match b {
+            b'"' => in_str = true,
+            b'{' => depth += 1,
+            b'}' => {
+                depth -= 1;
+                if depth == 0 {
+                    return Some(&s[start..=i]);
+                }
+            }
+            _ => {}
+        }
     }
     None
 }
@@ -144,6 +209,58 @@ mod tests {
     #[test]
     fn ask_user_none_when_absent() {
         assert!(parse_ask_user("普通回复\nVERDICT: PASS").is_none());
+    }
+
+    #[test]
+    fn ask_user_json_on_next_line() {
+        // 标记单独成行、JSON 在下一行（旧实现会得到空 question）。
+        let reply = "ASK_USER:\n{\"question\": \"用哪种方案？\", \"options\": [\"A\", \"B\"]}";
+        let q = parse_ask_user(reply).unwrap();
+        assert_eq!(q.question, "用哪种方案？");
+        assert_eq!(q.options, vec!["A", "B"]);
+    }
+
+    #[test]
+    fn ask_user_pretty_printed_multiline_json() {
+        let reply = "ASK_USER:\n{\n  \"question\": \"要不要砍掉模块 X？\",\n  \"options\": [\n    \"砍\",\n    \"留\"\n  ]\n}\n";
+        let q = parse_ask_user(reply).unwrap();
+        assert_eq!(q.question, "要不要砍掉模块 X？");
+        assert_eq!(q.options, vec!["砍", "留"]);
+    }
+
+    #[test]
+    fn ask_user_marker_with_surrounding_reply_and_multiline_json() {
+        // 复现 ID21 实际场景：回复里有铺垫文本、VERDICT 行、标记单独成行、
+        // 美化后的 JSON 跨多行、选项含中文逗号/引号。旧实现会返回空 question。
+        let reply = r#"我已查看现有实现，需要你拍板下一步走向。
+
+VERDICT: NEEDS_WORK
+
+ASK_USER:
+{
+  "question": "下一步走哪条路？",
+  "options": [
+    "方案 A：保持现状，仅补测试",
+    "方案 B：重写解析层"
+  ]
+}
+
+继续等待你的答复。"#;
+        let q = parse_ask_user(reply).unwrap();
+        assert_eq!(q.question, "下一步走哪条路？");
+        assert_eq!(
+            q.options,
+            vec!["方案 A：保持现状，仅补测试", "方案 B：重写解析层"]
+        );
+    }
+
+    #[test]
+    fn ask_user_marker_then_plain_text_lines() {
+        // 标记后无合法 JSON，跨行也只有纯文本：取首个非空行，绝不空串。
+        let reply = "ASK_USER:\n这是个无 JSON 的问题\n第二行";
+        let q = parse_ask_user(reply).unwrap();
+        assert_eq!(q.question, "这是个无 JSON 的问题");
+        assert!(q.options.is_empty());
     }
 
     #[test]

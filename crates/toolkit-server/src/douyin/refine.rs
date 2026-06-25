@@ -133,6 +133,8 @@ impl TaskKind for DouyinTextRefine {
                 }
             };
 
+            // 复现 douyin crate 实际发送的 user 消息（{TRANSCRIPT} 是稳定契约），供会话记录。
+            let rendered = prompt_template.replace("{TRANSCRIPT}", asr_text.trim());
             match refine_one_traced(
                 &client,
                 &prompt_template,
@@ -144,7 +146,25 @@ impl TaskKind for DouyinTextRefine {
             )
             .await
             {
-                Ok(_) => refined_ids.push(id.clone()),
+                Ok(refined) => {
+                    // 每条整理落一个 session（kind=douyin_refine），失败只 warn 不拖垮批处理。
+                    crate::llm::record::record_exchange(
+                        &ctx.pool,
+                        crate::llm::NAME_DOUYIN_REFINE,
+                        &format!("整理 {id}"),
+                        &model,
+                        crate::llm::NAME_DOUYIN_REFINE,
+                        &rendered,
+                        &refined.refined_text,
+                        json!({
+                            "aweme_id": id,
+                            "unique_id": input.unique_id,
+                            "prompt_version": refined.prompt_version,
+                            "prompt_hash": refined.prompt_hash,
+                        }),
+                    );
+                    refined_ids.push(id.clone());
+                }
                 Err(e) => failures.push(RefineFailure {
                     aweme_id: id.clone(),
                     error: format!("{e:#}"),

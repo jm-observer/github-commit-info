@@ -1,19 +1,22 @@
-import { NavLink, Outlet } from 'react-router-dom'
+import { NavLink, Outlet, useLocation } from 'react-router-dom'
 import { useEffect, useState } from 'react'
-import { BookOpen, Mic, Wand2, Cookie, ShieldCheck, GitCompareArrows, MessageSquareText, Music, Rocket, Settings, Crop } from 'lucide-react'
+import { BookOpen, Mic, Wand2, Cookie, ShieldCheck, GitCompareArrows, MessageSquareText, MessagesSquare, Music, Rocket, Settings, Crop } from 'lucide-react'
 import { invoke } from '@tauri-apps/api/core'
 import { listen } from '@tauri-apps/api/event'
 import EnvConfigService from '../modules/english/services/EnvConfigService'
+import { readLastEnglishRoute } from '../modules/english/englishRoute'
 import BottomPlayerBar from './BottomPlayerBar'
 
+// `match` 设了的项：`to` 动态取(英语听力跳回上次子标签),且 path 以 match 前缀打头即高亮。
 const navItems = [
-  { to: '/english/annotated', icon: BookOpen, label: '英语听力' },
+  { to: '/english/annotated', icon: BookOpen, label: '英语听力', match: '/english' },
   { to: '/speech', icon: Mic, label: '语音识别' },
   { to: '/audio-clean', icon: Wand2, label: '音频清洗' },
   { to: '/cookie', icon: Cookie, label: 'Cookie 采集' },
   { to: '/net-policy', icon: ShieldCheck, label: '网络策略' },
   { to: '/codeloop', icon: GitCompareArrows, label: '复核循环' },
   { to: '/chat-summary', icon: MessageSquareText, label: '对话总结' },
+  { to: '/llmchat', icon: MessagesSquare, label: '大模型会话' },
   { to: '/music', icon: Music, label: '音乐' },
   { to: '/screenshot', icon: Crop, label: '截图' },
   { to: '/g10-deploy', icon: Rocket, label: 'G10 部署' },
@@ -306,6 +309,7 @@ function CustomerIdIndicator() {
 // ── Shell 主布局 ─────────────────────────────────────────────────────────────
 
 export default function ShellLayout() {
+  const location = useLocation()
   return (
     <div className="flex h-screen w-screen flex-col overflow-hidden bg-white text-gray-900 dark:bg-gray-950 dark:text-gray-100">
       <div className="flex min-h-0 flex-1">
@@ -315,23 +319,28 @@ export default function ShellLayout() {
           zero-desktop
         </div>
         <nav className="flex-1 space-y-1 px-2 py-2">
-          {navItems.map(({ to, icon: Icon, label }) => (
-            <NavLink
-              key={to}
-              to={to}
-              className={({ isActive }) =>
-                [
+          {navItems.map(({ to, icon: Icon, label, match }) => {
+            // 英语听力(match='/english')：to 取上次子标签，前缀命中即高亮；其余项走精确匹配。
+            const resolvedTo = match ? readLastEnglishRoute() : to
+            const active = match
+              ? location.pathname.startsWith(match)
+              : location.pathname === to
+            return (
+              <NavLink
+                key={label}
+                to={resolvedTo}
+                className={[
                   'flex items-center gap-2 rounded-md px-3 py-2 text-sm transition-colors',
-                  isActive
+                  active
                     ? 'bg-blue-100 text-blue-700 dark:bg-blue-900 dark:text-blue-300'
                     : 'text-gray-700 hover:bg-gray-200 dark:text-gray-300 dark:hover:bg-gray-800',
-                ].join(' ')
-              }
-            >
-              <Icon size={16} />
-              {label}
-            </NavLink>
-          ))}
+                ].join(' ')}
+              >
+                <Icon size={16} />
+                {label}
+              </NavLink>
+            )
+          })}
         </nav>
 
         {/* 侧栏底部：全局录音开关，任何页面都能启停 */}

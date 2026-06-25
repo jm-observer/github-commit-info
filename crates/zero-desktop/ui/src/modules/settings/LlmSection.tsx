@@ -10,8 +10,9 @@
  */
 
 import { useEffect, useState } from 'react'
+import { useNavigate } from 'react-router-dom'
 import { invoke } from '@tauri-apps/api/core'
-import { Save, CheckCircle, XCircle, Zap, RotateCcw, ChevronDown, ChevronRight } from 'lucide-react'
+import { Save, CheckCircle, XCircle, Zap, RotateCcw, ChevronDown, ChevronRight, MessagesSquare } from 'lucide-react'
 
 type Feedback = { kind: 'ok' | 'err'; msg: string } | null
 
@@ -297,9 +298,19 @@ function PromptsSubsection() {
 // ── 主区 ──────────────────────────────────────────────────────────────────
 
 export default function LlmSection() {
+  const navigate = useNavigate()
   return (
     <section className="flex flex-col gap-4">
-      <h2 className="text-sm font-medium text-gray-600 dark:text-gray-400">大模型</h2>
+      <div className="flex items-center justify-between">
+        <h2 className="text-sm font-medium text-gray-600 dark:text-gray-400">大模型</h2>
+        <button
+          type="button"
+          onClick={() => navigate('/llmchat')}
+          className="flex items-center gap-1.5 rounded-md border border-gray-300 px-3 py-1.5 text-xs hover:bg-gray-100 dark:border-gray-600 dark:hover:bg-gray-800"
+        >
+          <MessagesSquare size={13} />对话测试 / 会话记录
+        </button>
+      </div>
       <ConfigSubsection />
       <PromptsSubsection />
     </section>

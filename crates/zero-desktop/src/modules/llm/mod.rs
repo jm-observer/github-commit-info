@@ -16,6 +16,8 @@ const QUICK_TIMEOUT: Duration = Duration::from_secs(20);
 const PING_TIMEOUT: Duration = Duration::from_secs(60);
 /// 对话总结是一次完整生成，给足时间（与 server 端 LLM 超时对齐）。
 const SUMMARIZE_TIMEOUT: Duration = Duration::from_secs(180);
+/// 对话测试一轮也是完整生成，给足时间。
+const CHAT_TIMEOUT: Duration = Duration::from_secs(180);
 
 /// 把上游非 2xx 响应映射成可读中文错误：优先取 server 的 `{error}` 字段，否则截断原文。
 fn map_err(prefix: &str, status: reqwest::StatusCode, body: &str) -> String {
@@ -27,6 +29,12 @@ fn map_err(prefix: &str, status: reqwest::StatusCode, body: &str) -> String {
                 .map(|s| s.to_string())
         })
         .unwrap_or_else(|| body.chars().take(200).collect::<String>());
+    // 空 body（如老 server 没有该路由 → 404 空响应）给出可操作提示，避免「失败：」空尾巴。
+    let detail = if detail.trim().is_empty() {
+        format!("HTTP {}（响应为空，可能 G10 toolkit-server 版本过旧、缺少该接口，请重新部署）", status.as_u16())
+    } else {
+        detail
+    };
     match status.as_u16() {
         401 | 403 => format!("{prefix}：鉴权失败，请检查 G10 token"),
         404 => format!("{prefix}：{detail}"),
@@ -216,6 +224,101 @@ pub async fn llm_summarize(
         Some(body),
         SUMMARIZE_TIMEOUT,
         "对话总结失败",
+    )
+    .await
+}
+
+// ---------------- 会话记录 / 对话测试 ----------------
+
+/// 列会话记录（可选按 origin/kind 过滤，limit 限量）。
+#[tauri::command]
+pub async fn llm_list_sessions(
+    state: State<'_, AppState>,
+    origin: Option<String>,
+    limit: Option<i64>,
+) -> Result<serde_json::Value, String> {
+    let mut qs: Vec<String> = Vec::new();
+    // origin 取值是受控标识符（chat_test/douyin_refine/chat_summary），无需 URL 编码。
+    if let Some(o) = origin.filter(|s| !s.trim().is_empty()) {
+        qs.push(format!("origin={o}"));
+    }
+    if let Some(l) = limit {
+        qs.push(format!("limit={l}"));
+    }
+    let path = if qs.is_empty() {
+        "/sessions".to_string()
+    } else {
+        format!("/sessions?{}", qs.join("&"))
+    };
+    request_json(
+        &state,
+        reqwest::Method::GET,
+        &path,
+        None,
+        QUICK_TIMEOUT,
+        "读会话列表失败",
+    )
+    .await
+}
+
+/// 读单条会话（含全部消息，只读回看）。
+#[tauri::command]
+pub async fn llm_get_session(
+    state: State<'_, AppState>,
+    id: String,
+) -> Result<serde_json::Value, String> {
+    let path = format!("/sessions/{id}");
+    request_json(
+        &state,
+        reqwest::Method::GET,
+        &path,
+        None,
+        QUICK_TIMEOUT,
+        "读会话失败",
+    )
+    .await
+}
+
+/// 新建对话测试会话（可带首条消息直接对话）。
+#[tauri::command]
+pub async fn llm_create_chat(
+    state: State<'_, AppState>,
+    message: Option<String>,
+) -> Result<serde_json::Value, String> {
+    let mut body = serde_json::json!({});
+    if let Some(m) = message.filter(|s| !s.trim().is_empty()) {
+        body["message"] = serde_json::json!(m);
+    }
+    request_json(
+        &state,
+        reqwest::Method::POST,
+        "/sessions",
+        Some(body),
+        CHAT_TIMEOUT,
+        "新建对话失败",
+    )
+    .await
+}
+
+/// 在已有对话测试会话上追加一轮。
+#[tauri::command]
+pub async fn llm_chat_send(
+    state: State<'_, AppState>,
+    id: String,
+    message: String,
+) -> Result<serde_json::Value, String> {
+    if message.trim().is_empty() {
+        return Err("消息不能为空".to_string());
+    }
+    let path = format!("/sessions/{id}/messages");
+    let body = serde_json::json!({ "message": message });
+    request_json(
+        &state,
+        reqwest::Method::POST,
+        &path,
+        Some(body),
+        CHAT_TIMEOUT,
+        "发送消息失败",
     )
     .await
 }

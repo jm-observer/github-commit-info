@@ -32,6 +32,8 @@ export interface ServiceDef {
   /** 安装时动态注入 systemd unit 的环境变量；部署时拼成 `-Env KEY=VAL,...` 传给脚本。 */
   env: EnvVar[]
   deploy: DeployDef | null
+  /** 上次部署成功的时间（RFC3339 UTC）；仅部署成功后由后端写入，从未部署过则为 null。 */
+  last_deployed_at?: string | null
 }
 
 export interface ServiceList {

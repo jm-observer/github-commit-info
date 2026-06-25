@@ -161,6 +161,9 @@ export default function PackagePlayer({ autoStart = true }: { autoStart?: boolea
   const initAudioPlayer = async (sentencesList: Sentence[]) => {
     if (!sentencesList.length) throw new Error('没有可播放的句子')
 
+    // 「启动自动播放」只在本次会话首次进入英语听力时生效一次；切包属于"换歌单"，载入后保持暂停。
+    const hadInstance = AudioPlayerService.hasInstance()
+
     const envConfig = await EnvConfigService.getInstance().getConfig()
     const cacheManager = FileCacheManager.getInstance()
     const audioAdapter = new HtmlAudioAdapter()
@@ -174,7 +177,7 @@ export default function PackagePlayer({ autoStart = true }: { autoStart?: boolea
     audioService.setMaxPlayCount(4)
     audioService.resetPlayer()
 
-    if (autoStart && readAutoStartPref() && !autoPlayStartedRef.current) {
+    if (autoStart && readAutoStartPref() && !hadInstance && !autoPlayStartedRef.current) {
       autoPlayStartedRef.current = true
       setTimeout(() => {
         try { void audioService.playCurrentAudio() }

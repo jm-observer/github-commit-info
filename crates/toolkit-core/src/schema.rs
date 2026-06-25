@@ -124,6 +124,9 @@ CREATE TABLE IF NOT EXISTS llm_prompts (
 -- English 跟读判分明细：每次跟读尝试一行（可回看 / 调阈值后重算）。kind=sentence|word；
 -- word 模式 word_index 为句内词序号，sentence 模式为 NULL。纯加表、IF NOT EXISTS 幂等，
 -- 同 codeloop_io / llm_*，不 bump SCHEMA_VERSION。见 docs/english-shadow-design.md §7。
+-- detail_json：GOP 发音级评测的音素/词级明细（v1-ASR 内核为 NULL）。新库由下方 DDL 直接建出；
+-- 存量库由 migrations.rs 的幂等 ALTER 补列（CREATE TABLE IF NOT EXISTS 不会给已存在的表加列）。
+-- 见 docs/english-shadow-gop-design.md §5。
 CREATE TABLE IF NOT EXISTS shadow_attempt (
     id          TEXT PRIMARY KEY,
     customer_id INTEGER NOT NULL,
@@ -134,6 +137,7 @@ CREATE TABLE IF NOT EXISTS shadow_attempt (
     transcript  TEXT,
     score       REAL    NOT NULL,
     passed      INTEGER NOT NULL,
+    detail_json TEXT,
     created_at  TEXT    NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_shadow_attempt_unit
@@ -168,4 +172,37 @@ CREATE TABLE IF NOT EXISTS audio_blob (
     source       TEXT NOT NULL,
     created_at   TEXT NOT NULL
 );
+
+-- 大模型会话记录：把「对话测试」的交互式聊天与各业务的大模型调用（抖音整理 / 对话总结）
+-- 统一以 session 形式落库，供桌面端「大模型会话」模块只读回看（对话测试面板可续聊）。
+-- kind 标记来源（chat_test | douyin_refine | chat_summary），为后续接入 zero agent 预留
+-- kind="agent"；metadata / 每条消息 meta 均为 JSON blob，可承载 aweme_id / prompt 版本哈希 /
+-- 将来的工具调用信息，无需改表。纯加表、IF NOT EXISTS 幂等：同 codeloop_io / llm_* / shadow_* /
+-- audio_blob，migrate() 启动即建出，故不需要、也不应 bump SCHEMA_VERSION。
+CREATE TABLE IF NOT EXISTS llm_sessions (
+    id          TEXT PRIMARY KEY,
+    kind        TEXT NOT NULL,              -- chat_test | douyin_refine | chat_summary
+    title       TEXT NOT NULL DEFAULT '',
+    model       TEXT,
+    prompt_name TEXT,                       -- chat_test 为 NULL
+    status      TEXT NOT NULL DEFAULT 'ok', -- ok | error
+    metadata    TEXT NOT NULL DEFAULT '{}', -- JSON: aweme_id / unique_id / prompt_version / prompt_hash
+    created_at  TEXT NOT NULL,
+    updated_at  TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_llm_sessions_kind_created ON llm_sessions(kind, created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_llm_sessions_created      ON llm_sessions(created_at DESC);
+
+-- 会话内逐条消息（seq 为 session 内 0-based 顺序）。role = system|user|assistant；
+-- meta JSON 记 latency_ms 等逐条元信息。纯加表、IF NOT EXISTS 幂等，不 bump SCHEMA_VERSION。
+CREATE TABLE IF NOT EXISTS llm_messages (
+    id         TEXT PRIMARY KEY,
+    session_id TEXT NOT NULL,
+    seq        INTEGER NOT NULL,
+    role       TEXT NOT NULL,
+    content    TEXT NOT NULL,
+    meta       TEXT NOT NULL DEFAULT '{}',
+    created_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_llm_messages_session ON llm_messages(session_id, seq);
 "#;

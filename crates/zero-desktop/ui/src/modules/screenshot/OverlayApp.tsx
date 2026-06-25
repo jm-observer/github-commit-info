@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useRef, useState } from "react";
+import { Component, ReactNode, useCallback, useEffect, useRef, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import type { Dir, Rect, Shape, Tool } from "./types";
 import { composePng } from "./compose";
@@ -15,11 +15,22 @@ type Drag =
   | { kind: "draw" }
   | null;
 
+/** 错误层兜底关窗延时：用户看到原因后才自动 cancel；期间允许 Esc / 点关闭。 */
+const ERROR_AUTO_CLOSE_MS = 2500;
+
+/** 顶部 1px 描边：让「窗在但什么都没画」的状态不可能成立——一旦看到这条线，
+ *  就知道叠加窗正活着。透明设计本来就靠这种细节维持可感知性。 */
+const OVERLAY_VISIBILITY_BORDER = "1px solid rgba(255,255,255,0.18)";
+
 /**
  * 截图叠加窗根组件（设计文档 §3.2）：
  * 冻结帧铺底 → 拖框选区 → 选区内画椭圆/箭头/矩形 → 双击/Enter/完成 提交，Esc 取消。
+ *
+ * 卡死修复（docs/2026-06-24-screenshot-freeze-fix/design.md §3.1）：
+ * - frame 解析失败 / 图片加载失败 / 渲染异常都走 ErrorOverlay，不再返回 null。
+ * - 挂载完成后调用 `screenshot_overlay_ready`，告诉 Rust watchdog「前端活着」。
  */
-export default function OverlayApp() {
+function OverlayInner() {
   const frame = useFrozenFrame();
   const imgRef = useRef<HTMLImageElement>(null);
 
@@ -31,6 +42,8 @@ export default function OverlayApp() {
   const [tool, setTool] = useState<Tool>("ellipse");
   const [color, setColor] = useState("#FF3B30");
   const [width, setWidth] = useState(4);
+
+  const [imgError, setImgError] = useState<string | null>(null);
 
   // 拖拽状态与最新选区/草稿用 ref 读取，避免 window 事件闭包读到旧值。
   const dragRef = useRef<Drag>(null);
@@ -168,11 +181,28 @@ export default function OverlayApp() {
     dragRef.current = { kind: "resize", dir, start: s, ox: e.clientX, oy: e.clientY };
   };
 
-  if (!frame) return null;
+  // frame 解析未完成（首次 effect 前） → 显占位错误层，避免「窗在但空白」。
+  if (!frame) {
+    return <ErrorOverlay message="叠加窗加载中…" autoCloseMs={null} onClose={cancel} />;
+  }
+
+  // 解析失败：先显示错误层，让用户看到原因；用户按 Esc / 点关闭、或短延时后才 cancel。
+  if (frame.error) {
+    return <ErrorOverlay message={`截图叠加窗参数异常：${frame.error}`} autoCloseMs={ERROR_AUTO_CLOSE_MS} onClose={cancel} />;
+  }
+  if (imgError) {
+    return <ErrorOverlay message={`冻结帧加载失败：${imgError}`} autoCloseMs={ERROR_AUTO_CLOSE_MS} onClose={cancel} />;
+  }
 
   return (
     <div
-      style={{ position: "fixed", inset: 0, overflow: "hidden", cursor: "crosshair" }}
+      style={{
+        position: "fixed",
+        inset: 0,
+        overflow: "hidden",
+        cursor: "crosshair",
+        borderTop: OVERLAY_VISIBILITY_BORDER,
+      }}
       onMouseDown={onRootDown}
       onDoubleClick={(e) => {
         e.preventDefault();
@@ -185,6 +215,11 @@ export default function OverlayApp() {
         crossOrigin="anonymous"
         draggable={false}
         alt="frozen"
+        onLoad={() => {
+          // 首帧渲染完成 → 通知 Rust watchdog 别误关。失败静默（watchdog 超时自有兜底）。
+          void invoke("screenshot_overlay_ready", { sessionId: frame.sessionId }).catch(() => undefined);
+        }}
+        onError={() => setImgError("asset 协议无法加载冻结帧 PNG")}
         style={{
           position: "absolute",
           inset: 0,
@@ -220,6 +255,116 @@ export default function OverlayApp() {
         />
       )}
     </div>
+  );
+}
+
+/** 错误兜底层：可见底色 + 文案 + 关闭按钮；可选短延时后自动 cancel。
+ *  ⚠️ 不在挂载瞬间 cancel——窗会立刻关掉，用户根本看不到原因。 */
+function ErrorOverlay({
+  message,
+  autoCloseMs,
+  onClose,
+}: {
+  message: string;
+  autoCloseMs: number | null;
+  onClose: () => void;
+}) {
+  useEffect(() => {
+    if (autoCloseMs == null) return;
+    const t = window.setTimeout(onClose, autoCloseMs);
+    return () => window.clearTimeout(t);
+  }, [autoCloseMs, onClose]);
+
+  useEffect(() => {
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key === "Escape") {
+        e.preventDefault();
+        onClose();
+      }
+    };
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  }, [onClose]);
+
+  return (
+    <div
+      style={{
+        position: "fixed",
+        inset: 0,
+        background: "rgba(0,0,0,0.45)",
+        display: "flex",
+        alignItems: "center",
+        justifyContent: "center",
+        color: "#fff",
+        fontFamily: "system-ui, -apple-system, sans-serif",
+        zIndex: 99999,
+      }}
+    >
+      <div
+        style={{
+          maxWidth: 520,
+          padding: "20px 28px",
+          background: "rgba(20,20,20,0.85)",
+          border: "1px solid rgba(255,255,255,0.15)",
+          borderRadius: 8,
+          boxShadow: "0 8px 32px rgba(0,0,0,0.4)",
+          textAlign: "center",
+        }}
+      >
+        <div style={{ fontSize: 14, lineHeight: 1.6, marginBottom: 16 }}>{message}</div>
+        <button
+          type="button"
+          onClick={onClose}
+          style={{
+            padding: "6px 16px",
+            background: "#FF3B30",
+            color: "#fff",
+            border: "none",
+            borderRadius: 4,
+            cursor: "pointer",
+            fontSize: 13,
+          }}
+        >
+          关闭 (Esc)
+        </button>
+        {autoCloseMs != null && (
+          <div style={{ fontSize: 11, opacity: 0.6, marginTop: 10 }}>
+            {Math.round(autoCloseMs / 1000)} 秒后自动关闭
+          </div>
+        )}
+      </div>
+    </div>
+  );
+}
+
+/** React 渲染异常兜底：避免 throw 一路冒到根 → 整个窗白屏但仍 always-on-top。 */
+class OverlayErrorBoundary extends Component<{ children: ReactNode }, { err: Error | null }> {
+  state = { err: null as Error | null };
+  static getDerivedStateFromError(err: Error) {
+    return { err };
+  }
+  componentDidCatch(err: Error) {
+    console.error("[overlay] render crash", err);
+  }
+  render() {
+    if (this.state.err) {
+      return (
+        <ErrorOverlay
+          message={`截图叠加窗渲染异常：${this.state.err.message}`}
+          autoCloseMs={ERROR_AUTO_CLOSE_MS}
+          onClose={() => void invoke("screenshot_cancel").catch(() => undefined)}
+        />
+      );
+    }
+    return this.props.children;
+  }
+}
+
+export default function OverlayApp() {
+  return (
+    <OverlayErrorBoundary>
+      <OverlayInner />
+    </OverlayErrorBoundary>
   );
 }
 

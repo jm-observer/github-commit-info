@@ -9,6 +9,7 @@
 //! 各功能（douyin 整理、对话总结、codeloop 文案…）都经此层取配置/提示词，不再各自读 env /
 //! `include_str!`。
 
+pub mod record;
 pub mod routes;
 
 use anyhow::{anyhow, Context, Result};

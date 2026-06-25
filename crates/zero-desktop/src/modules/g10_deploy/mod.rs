@@ -327,7 +327,22 @@ pub async fn g10_deploy(
         // 无论成败，释放该服务的部署位。
         gs.deploying.lock().unwrap().remove(&name_for_task);
         let done = match result {
-            Ok(code) => DeployDone {
+            Ok(code) => {
+                // 部署成功（退出码 0）→ 盖上「上次部署时间」并落盘。失败不更新。
+                if code == Some(0) {
+                    let when = chrono::Utc::now().to_rfc3339();
+                    if let Err(e) = registry::mark_deployed(&gs.workspace, &name_for_task, when) {
+                        let _ = app_bg.emit(
+                            DEPLOY_LOG_EVENT,
+                            DeployLog {
+                                name: name_for_task.clone(),
+                                stream: "stderr".into(),
+                                line: format!("（部署成功，但记录部署时间失败：{e}）"),
+                            },
+                        );
+                    }
+                }
+                DeployDone {
                 name: name_for_task.clone(),
                 success: code == Some(0),
                 code,
@@ -336,7 +351,8 @@ pub async fn g10_deploy(
                 } else {
                     Some(format!("部署进程以退出码 {code:?} 结束"))
                 },
-            },
+                }
+            }
             Err(e) => DeployDone {
                 name: name_for_task.clone(),
                 success: false,
