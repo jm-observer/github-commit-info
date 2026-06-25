@@ -70,6 +70,10 @@ struct AssessPhone {
     t_start: Option<f64>,
     #[serde(default)]
     t_end: Option<f64>,
+    #[serde(default)]
+    peak_t: Option<f64>,
+    #[serde(default)]
+    gop_raw: Option<f64>,
 }
 
 /// 调 `:8098 /assess` 做发音评测，映射进 [`ScoreResult`]。
@@ -180,6 +184,8 @@ fn map_phone(p: AssessPhone) -> PhoneResult {
         reliable: p.reliable,
         t_start: p.t_start,
         t_end: p.t_end,
+        peak_t: p.peak_t,
+        gop_raw: p.gop_raw,
     }
 }
 

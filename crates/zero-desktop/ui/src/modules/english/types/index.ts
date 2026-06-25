@@ -44,6 +44,10 @@ export interface ShadowPhoneResult {
   /** 该音素对齐时间段(秒)。 */
   t_start?: number
   t_end?: number
+  /** 诊断：该音素全局峰时间(秒)。落在 [t_start,t_end] 外 = 对齐错位。 */
+  peak_t?: number
+  /** 诊断：对齐段内 canonical 峰值 log 后验(原始 GOP,≤0)。 */
+  gop_raw?: number
 }
 
 /**

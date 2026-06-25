@@ -111,6 +111,12 @@ pub struct PhoneResult {
     pub t_start: Option<f64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub t_end: Option<f64>,
+    /// 诊断:该音素全局峰时间(秒)。落在 [t_start,t_end] 外 = 对齐错位。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub peak_t: Option<f64>,
+    /// 诊断:对齐段内 canonical 峰值 log 后验(原始 GOP,≤0)。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub gop_raw: Option<f64>,
 }
 
 /// 单个参考词的判定结果（供前端逐词标色）。

@@ -512,37 +512,56 @@ export default function ShadowPanel() {
                 : <span className="text-gray-700 dark:text-gray-200">{refText || '—'}</span>}
           </div>
 
-          {/* 展开的词 → 逐音素明细表(评分细则可视化:看哪个音读得不够好 + 哪些是引擎没对齐) */}
+          {/* 展开的词 → 逐音素**诊断明细表**:对齐区间 / 真实峰(是否错位)/ 分 / 判定 / 说明 */}
           {score && expandedWord != null && (() => {
             const w = score.words[expandedWord]
             const phones = w?.phones ?? []
             if (phones.length === 0) return null
             return (
-              <div className="rounded-md border border-gray-200 bg-white text-xs dark:border-gray-700 dark:bg-gray-900">
+              <div className="overflow-x-auto rounded-md border border-gray-200 bg-white text-xs dark:border-gray-700 dark:bg-gray-900">
                 <div className="flex items-center justify-between border-b border-gray-100 px-2 py-1 text-gray-500 dark:border-gray-700">
-                  <span>「<b>{w.ref}</b>」音素明细</span>
+                  <span>「<b>{w.ref}</b>」音素诊断（点波形时间段定位;灰=引擎没对齐,不算你错）</span>
                   <span className="cursor-pointer hover:text-gray-700 dark:hover:text-gray-300" onClick={() => setExpandedWord(null)}>收起 ✕</span>
                 </div>
-                <table className="w-full">
+                <table className="w-full whitespace-nowrap">
                   <thead className="text-gray-400">
                     <tr>
                       <th className="px-2 py-1 text-left font-normal">音素</th>
+                      <th className="px-2 py-1 text-left font-normal">对齐区间</th>
+                      <th className="px-2 py-1 text-left font-normal">真实峰</th>
                       <th className="px-2 py-1 text-left font-normal">你的分</th>
-                      <th className="px-2 py-1 text-left font-normal">状态</th>
+                      <th className="px-2 py-1 text-left font-normal">判定</th>
                       <th className="px-2 py-1 text-left font-normal">说明</th>
                     </tr>
                   </thead>
                   <tbody>
                     {phones.map((p: ShadowPhoneResult, i) => {
                       const sty = pronStyle(p.pron_status)
+                      const span = (p.t_start != null && p.t_end != null) ? `${p.t_start.toFixed(2)}–${p.t_end.toFixed(2)}s` : '—'
+                      // 真实峰:落在区间内→「区间内」;在外→显示偏移(错位指标)
+                      let peakCell = '—'
+                      let misaligned = false
+                      if (p.peak_t != null && p.t_start != null && p.t_end != null) {
+                        if (p.peak_t >= p.t_start && p.peak_t <= p.t_end) {
+                          peakCell = '区间内'
+                        } else {
+                          const off = p.peak_t < p.t_start ? p.peak_t - p.t_start : p.peak_t - p.t_end
+                          peakCell = `@${p.peak_t.toFixed(2)}s (${off > 0 ? '+' : ''}${off.toFixed(2)}s)`
+                          misaligned = Math.abs(off) > 0.08 // >~80ms 视为明显错位
+                        }
+                      }
                       const note = p.pron_status === 'uncertain'
-                        ? '引擎没听准,不算你读错'
+                        ? '没对齐好/没听准,不算读错'
                         : (p.expected_ph && p.actual_ph
                           ? `读成了 ${p.actual_ph}`
-                          : (p.hint ?? (p.pron_status === 'ok' ? '' : '偏弱')))
+                          : (misaligned && p.pron_status !== 'ok'
+                            ? '对齐错位,引擎没对准'
+                            : (p.hint ?? (p.pron_status === 'ok' ? '清晰' : '后验偏弱'))))
                       return (
                         <tr key={i} className="border-t border-gray-50 dark:border-gray-800">
                           <td className="px-2 py-1 font-mono">{phoneLabel(p)}</td>
+                          <td className="px-2 py-1 text-gray-500 dark:text-gray-400">{span}</td>
+                          <td className={`px-2 py-1 ${misaligned ? 'text-amber-600 dark:text-amber-400' : 'text-gray-500 dark:text-gray-400'}`}>{peakCell}</td>
                           <td className="px-2 py-1">
                             <span className="inline-flex items-center gap-1">
                               <span className="inline-block h-1.5 w-10 rounded bg-gray-200 dark:bg-gray-700">
