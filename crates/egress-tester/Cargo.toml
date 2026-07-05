@@ -1,0 +1,18 @@
+[package]
+name = "egress-tester"
+version.workspace = true
+edition.workspace = true
+description = "Standalone functional self-check for egress worker pool: anonymous IP rotation + named session pinning + hybrid, via egress-client."
+
+[dependencies]
+egress-client = { path = "../egress-client" }
+# 只为 WorkerStatus/EgressResponse 类型标注(egress-client 已 re-export,直接用其 re-export 即可,
+# 这里额外声明依赖仅为显式表达「用到它的类型」,与 F3 需求描述保持一致)。
+egress-pool = { path = "../egress-pool" }
+tokio = { workspace = true, features = ["rt-multi-thread", "macros"] }
+clap = { workspace = true, features = ["env"] }
+anyhow = { workspace = true }
+
+[[bin]]
+name = "egress-tester"
+path = "src/main.rs"

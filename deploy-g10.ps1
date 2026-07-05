@@ -75,7 +75,10 @@ $Bins = @(
     @{ Crate = "github_commit_info"; Bin = "github-commit-info" },
     @{ Crate = "hf_watcher";         Bin = "hf-watcher" },
     @{ Crate = "douyin";             Bin = "douyin" },
-    @{ Crate = "toolkit-server";     Bin = "toolkit-server" }
+    @{ Crate = "toolkit-server";     Bin = "toolkit-server" },
+    # 出口代理节点(借出口执行端)。CLI 型:无 systemd unit,不进 $DaemonBins;
+    # 各出口机上手动/自更新拉起 `toolkit-worker --controller <公网> --token <...>`。
+    @{ Crate = "toolkit-worker";     Bin = "toolkit-worker" }
 )
 # 注:orchestrator 已并入 toolkit-server 同进程(ASR=/api/asr/stream),不再单独构建/部署。
 # 其 ASR 下游地址走环境变量(ASR_WS/ASR_EMBED/VLLM_BASE/VLLM_MODEL),缺省即本机回环,

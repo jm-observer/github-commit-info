@@ -1,0 +1,16 @@
+[package]
+name = "egress-client"
+version.workspace = true
+edition.workspace = true
+description = "Thin HTTP client for toolkit-server's /api/web/egress consumer surface — lets external processes rent egress workers without linking egress-pool's in-process Registry."
+
+[dependencies]
+reqwest = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+anyhow = { workspace = true }
+# 只为复用 EgressResponse/EgressError 这两个线类型,不重定义、不依赖其 Pool/Registry。
+egress-pool = { path = "../egress-pool" }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["rt-multi-thread", "macros"] }

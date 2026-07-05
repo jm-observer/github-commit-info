@@ -1,0 +1,12 @@
+[package]
+name = "egress-pool"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+serde = { workspace = true }
+serde_json = { workspace = true }
+tokio = { workspace = true, features = ["sync", "time", "rt"] }
+anyhow = { workspace = true }
+uuid = { workspace = true }
+log = { workspace = true }

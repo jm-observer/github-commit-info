@@ -14,6 +14,10 @@ members = [
     "crates/toolkit-server",
     "crates/zero-desktop",
     "crates/orchestrator",
+    "crates/egress-pool",
+    "crates/egress-client",
+    "crates/toolkit-worker",
+    "crates/egress-tester",
 ]
 resolver = "2"
 
@@ -47,4 +51,6 @@ toolkit-llm = { path = "crates/toolkit-llm" }
 
 [profile.release]
 strip = true
-lto = true
+#lto = true
+lto = "thin"
+codegen-units = 16   # 默认 release 是 1，配合并行加速

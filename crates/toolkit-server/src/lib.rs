@@ -6,6 +6,7 @@ pub mod codeloop;
 pub mod config;
 #[path = "douyin/mod.rs"]
 pub mod douyin_mod;
+pub mod egress_sessions;
 pub mod llm;
 pub mod routes;
 pub mod shadow;
@@ -72,6 +73,8 @@ pub fn bootstrap(cfg: &Config) -> Result<AppState> {
         db_path,
         workspace: cfg.workspace.clone(),
         session_store: Arc::new(session_store),
+        egress: Arc::new(egress_pool::Registry::new()),
+        egress_sessions: Arc::new(egress_sessions::SessionStore::new()),
     })
 }
 
@@ -93,6 +96,11 @@ pub async fn serve_with_web(
     // docs/llm-and-voice-enhancement-plan.md 节 A。
     let orch_ctx = orchestrator::init_ctx_with_toolkit_pool(&state.workspace, state.pool.clone())
         .context("orchestrator init_ctx (ASR 编排层)")?;
+
+    // 出口代理 session TTL reaper:兜底外部进程忘记 release 的 session handle。
+    // 只在真正 serve 时 spawn —— bootstrap() 是同步装配、测试也复用它，不应带副作用。
+    tokio::spawn(egress_sessions::run_reaper(state.egress_sessions.clone()));
+
     let app = build_router(state, web_dir).nest("/api/asr", orchestrator::router(orch_ctx));
     let listener = tokio::net::TcpListener::bind(bind)
         .await
@@ -128,7 +136,11 @@ pub fn build_router(state: AppState, web_dir: &std::path::Path) -> axum::Router 
         .nest("/api/agent", routes::agent::router())
         .nest("/api/browser", routes::browser::router())
         // english 后端反代:LAN 模式桌面端走 http://<host>:8788/api/english/* 绕开自签证书。
-        .nest("/api/english", routes::english::router());
+        .nest("/api/english", routes::english::router())
+        // 出口代理 worker 专用通道(pull 模型:worker 主动连,共享 token 鉴权)。
+        .nest("/api/internal", routes::internal::router())
+        // 出口代理消费/观测(P0 验证入口)。
+        .nest("/api/web/egress", routes::egress::router());
 
     if web_dir.exists() {
         log::info!("serving static web/ from {}", web_dir.display());
