@@ -76,7 +76,11 @@ fn base_rules_ps(settings: &NetPolicySettings, mihomo_bin: &Path) -> String {
 }
 
 fn validate_fw_inputs(settings: &NetPolicySettings) -> Result<()> {
-    valid::ip(&settings.wg.server)?;
+    // kill-switch 白名单不直接用 WG server IP（放行的是 mihomo.exe 整进程），故 WG 留空（纯黑洞、
+    // 不依赖 SBN）时不应卡防火墙——仅当填了 server 才校验其为合法 IP。
+    if !settings.wg.server.trim().is_empty() {
+        valid::ip(&settings.wg.server)?;
+    }
     for l in &settings.lan_ranges {
         valid::ip_or_cidr(l)?;
     }

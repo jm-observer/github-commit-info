@@ -14,6 +14,7 @@ import G10DeployPage from "./modules/g10-deploy/G10DeployPage";
 import SettingsPage from "./modules/settings/SettingsPage";
 import MusicPage from "./modules/music/MusicPage";
 import ScreenshotPage from "./modules/screenshot/ScreenshotPage";
+import EgressWorkersPage from "./modules/egress/EgressWorkersPage";
 import { MusicPlayerProvider } from "./modules/music/PlayerContext";
 import { NetPolicyProbeProvider } from "./modules/net-policy/ProbeContext";
 
@@ -38,6 +39,7 @@ export default function App() {
             <Route path="music" element={<MusicPage />} />
             <Route path="screenshot" element={<ScreenshotPage />} />
             <Route path="g10-deploy" element={<G10DeployPage />} />
+            <Route path="egress-workers" element={<EgressWorkersPage />} />
             <Route path="settings" element={<SettingsPage />} />
             <Route path="*" element={<Navigate to="/english/annotated" replace />} />
           </Route>

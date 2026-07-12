@@ -7,6 +7,7 @@
 use std::io::Write;
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
 use tauri::{AppHandle, Manager};
@@ -81,6 +82,17 @@ pub(crate) fn notify_capture_failed(app: &AppHandle, msg: &str) {
         .show();
 }
 
+/// 延迟截图倒计时开始时弹一条系统通知：给用户时间去摆好右键菜单/悬浮态等瞬时 UI。
+fn notify_capture_delay(app: &AppHandle, delay_secs: u32) {
+    use tauri_plugin_notification::NotificationExt;
+    let _ = app
+        .notification()
+        .builder()
+        .title("延迟截图")
+        .body(format!("{delay_secs} 秒后自动截图，请摆好菜单/悬浮内容"))
+        .show();
+}
+
 /// 截图设置（P1 仅落地存取，热键当前写死见 `mod::DEFAULT_HOTKEY`，可配为 P2）。
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ScreenshotSettings {
@@ -92,6 +104,12 @@ pub struct ScreenshotSettings {
     pub line_width: u32,
     /// 落盘目录（空表示用默认 `<workspace>/screenshots`）。
     pub save_dir: String,
+    /// 延迟截图秒数（0 = 立即，不等待）。用于抓取右键菜单/悬浮态等瞬时 UI——
+    /// 触发后先倒计时，倒计时期间去摆好目标状态，计时结束才真正抓屏，避免
+    /// 触发本身（尤其含 Alt 的热键会关闭右键菜单）把要拍的东西弄没了。
+    /// `#[serde(default)]`：兼容旧版 settings.json（无此字段时按 0 处理）。
+    #[serde(default)]
+    pub delay_secs: u32,
 }
 
 impl Default for ScreenshotSettings {
@@ -101,6 +119,7 @@ impl Default for ScreenshotSettings {
             color: "#FF3B30".to_string(),
             line_width: 4,
             save_dir: String::new(),
+            delay_secs: 0,
         }
     }
 }
@@ -109,24 +128,56 @@ impl Default for ScreenshotSettings {
 
 /// 触发截图：抓鼠标所在屏（含冻结帧落盘）→ 打开叠加窗。被命令与全局热键共用。
 ///
-/// **重入保护**：入口加 `CaptureGuard`，连按热键的第二次直接早返。
+/// **重入保护**：入口加 `CaptureGuard`，连按热键/延迟倒计时期间再触发直接早返。
+/// **延迟截图**：设置里 `delay_secs > 0` 时先弹通知倒计时，`sleep` 结束后再回主线程
+/// 真正抓屏——用于抓右键菜单/悬浮态等瞬时 UI（触发动作本身，尤其含 Alt 的热键，
+/// 会先把这些瞬时 UI 关掉，所以不能在触发的那一刻就抓）。倒计时期间持有重入锁，
+/// 防止用户等待中再次按热键叠加触发。
 /// **失败可见**：每个阶段写 `.capture-trace.log`（append + 体积旋转）；任一阶段失败
 /// 弹 notification，避免「按了没反应」。
 #[cfg(windows)]
 pub fn do_capture(app: &AppHandle) -> Result<(), String> {
-    use super::{capture, monitor, output, overlay};
+    use super::output;
 
     let workspace = app.state::<AppState>().workspace.clone();
     let trace_path = output::screenshots_dir(&workspace).join(".capture-trace.log");
-    let trace = |stage: &str, detail: &str| append_trace(&trace_path, stage, detail);
 
-    let _guard = match CaptureGuard::acquire() {
+    let guard = match CaptureGuard::acquire() {
         Some(g) => g,
         None => {
-            trace("skip-reentrant", "");
+            append_trace(&trace_path, "skip-reentrant", "");
             return Ok(());
         }
     };
+
+    let delay_secs = read_settings(&workspace).delay_secs;
+    if delay_secs == 0 {
+        return capture_now(app, &workspace, &trace_path);
+    }
+
+    append_trace(&trace_path, "delay-start", &delay_secs.to_string());
+    notify_capture_delay(app, delay_secs);
+    let app = app.clone();
+    tauri::async_runtime::spawn(async move {
+        tokio::time::sleep(Duration::from_secs(delay_secs as u64)).await;
+        let _ = app.clone().run_on_main_thread(move || {
+            let _guard = guard; // 延迟期间全程持锁，回调结束（成功/失败）才释放。
+            let workspace = app.state::<AppState>().workspace.clone();
+            let trace_path = output::screenshots_dir(&workspace).join(".capture-trace.log");
+            if let Err(e) = capture_now(&app, &workspace, &trace_path) {
+                log::warn!(target: "screenshot", "延迟截图失败: {e}");
+            }
+        });
+    });
+    Ok(())
+}
+
+/// 实际执行一次抓屏：定位显示器 → 抓屏 → 落冻结帧 → 打开叠加窗。
+#[cfg(windows)]
+fn capture_now(app: &AppHandle, workspace: &Path, trace_path: &Path) -> Result<(), String> {
+    use super::{capture, monitor, output, overlay};
+
+    let trace = |stage: &str, detail: &str| append_trace(trace_path, stage, detail);
 
     let session_id = overlay::next_session_id();
     trace("session", &session_id.to_string());
@@ -161,7 +212,7 @@ pub fn do_capture(app: &AppHandle) -> Result<(), String> {
         }
     };
 
-    let frame_path = output::frozen_frame_path(&workspace);
+    let frame_path = output::frozen_frame_path(workspace);
     if let Some(parent) = frame_path.parent() {
         if let Err(e) = std::fs::create_dir_all(parent) {
             let m = format!("创建截图目录失败: {e}");
@@ -411,6 +462,67 @@ pub fn screenshot_copy_to_clipboard(app: AppHandle, path: String) -> Result<(), 
     let target = ensure_in_screenshots(&workspace, &path)?;
     let bytes = std::fs::read(&target).map_err(|e| format!("读取图片失败: {e}"))?;
     write_clipboard_png(&app, &bytes)
+}
+
+/// 命令：在系统文件管理器中定位到这张截图（高亮选中文件，路径须在截图目录内）。
+/// Windows 走 `explorer /select,`；非 Windows 回退打开其所在目录。
+#[tauri::command]
+pub fn screenshot_reveal_in_folder(app: AppHandle, path: String) -> Result<(), String> {
+    let workspace = app.state::<AppState>().workspace.clone();
+    let target = ensure_in_screenshots(&workspace, &path)?;
+
+    #[cfg(windows)]
+    {
+        let _ = &app;
+        // explorer /select,"C:\...\xxx.png" → 打开父目录并高亮选中该文件。
+        std::process::Command::new("explorer")
+            .arg(format!("/select,{}", target.to_string_lossy()))
+            .spawn()
+            .map_err(|e| format!("定位文件失败: {e}"))?;
+        Ok(())
+    }
+    #[cfg(not(windows))]
+    {
+        use tauri_plugin_shell::ShellExt;
+        let dir = target.parent().unwrap_or(&target);
+        #[allow(deprecated)]
+        app.shell()
+            .open(dir.to_string_lossy().to_string(), None)
+            .map_err(|e| format!("打开文件夹失败: {e}"))
+    }
+}
+
+/// 命令：把一张历史截图另存到用户选择的位置（弹保存对话框，默认沿用原文件名）。
+/// 返回保存后的绝对路径；用户取消则返回 `None`。源路径须在截图目录内。
+#[tauri::command]
+pub async fn screenshot_save_as(app: AppHandle, path: String) -> Result<Option<String>, String> {
+    use tauri_plugin_dialog::DialogExt;
+
+    let workspace = app.state::<AppState>().workspace.clone();
+    let target = ensure_in_screenshots(&workspace, &path)?;
+    let default_name = target
+        .file_name()
+        .and_then(|s| s.to_str())
+        .unwrap_or("screenshot.png")
+        .to_string();
+
+    let (tx, rx) = tokio::sync::oneshot::channel();
+    app.dialog()
+        .file()
+        .set_file_name(&default_name)
+        .add_filter("PNG 图片", &["png"])
+        .save_file(move |f| {
+            let _ = tx.send(f);
+        });
+    let chosen = rx.await.map_err(|e| format!("保存对话框失败: {e}"))?;
+    let dest = match chosen {
+        Some(fp) => fp
+            .into_path()
+            .map_err(|e| format!("解析保存路径失败: {e}"))?,
+        None => return Ok(None), // 用户取消
+    };
+    std::fs::copy(&target, &dest).map_err(|e| format!("保存失败: {e}"))?;
+    Ok(Some(dest.to_string_lossy().into_owned()))
 }
 
 // ---- 内部辅助 ----

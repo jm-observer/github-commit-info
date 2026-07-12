@@ -17,6 +17,9 @@ use std::time::Duration;
 /// 单条活跃连接（取 UI 驱动全景图所需的最小集）。
 #[derive(Debug, Clone, Serialize)]
 pub struct Connection {
+    /// mihomo 连接 ID（uuid）。观察器按它对「命中次数」去重——同一持续连接在 3s 轮询里
+    /// 会反复出现，没有它每轮 +1，count 会虚高成"被观测到的轮数"。
+    pub id: String,
     /// 出口链（mihomo `chains`，如 `["wg-out"]` / `["DIRECT"]`）。第 0 个是最终出口。
     pub chains: Vec<String>,
     /// 命中的出口（`chains` 末项归一化：含 `wg-out` → `wg-out`，否则 `DIRECT`）。
@@ -83,6 +86,8 @@ struct RawConnections {
 
 #[derive(Debug, Deserialize)]
 struct RawConnection {
+    #[serde(default)]
+    id: String,
     #[serde(default)]
     chains: Vec<String>,
     #[serde(default)]
@@ -156,6 +161,7 @@ async fn fetch_inner(secret: &str) -> anyhow::Result<ConnectionsSnapshot> {
         *snap.by_process.entry(process.clone()).or_insert(0) += 1;
         if snap.connections.len() < MAX_DETAIL {
             snap.connections.push(Connection {
+                id: rc.id,
                 chains: rc.chains,
                 outbound: outbound.to_string(),
                 host: rc.metadata.host,

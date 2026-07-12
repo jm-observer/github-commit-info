@@ -360,6 +360,16 @@ fn now_rfc3339() -> String {
     Local::now().format("%Y-%m-%d %H:%M:%S").to_string()
 }
 
+/// 把 16k mono f32 帧转成上游要的 pcm_s16le 字节。
+fn pcm_to_bytes(pcm16k: &[f32]) -> Vec<u8> {
+    let mut bytes = Vec::with_capacity(pcm16k.len() * 2);
+    for &s in pcm16k {
+        let v = (s.clamp(-1.0, 1.0) * 32767.0) as i16;
+        bytes.extend_from_slice(&v.to_le_bytes());
+    }
+    bytes
+}
+
 #[derive(Default, Clone)]
 struct SegState {
     raw: String,
@@ -477,17 +487,25 @@ fn spawn_capture(
                         Some(ref mut r) => r.process(&frame),
                         None => frame,
                     };
-                    let mut bytes = Vec::with_capacity(pcm16k.len() * 2);
-                    for s in pcm16k {
-                        let v = (s.clamp(-1.0, 1.0) * 32767.0) as i16;
-                        bytes.extend_from_slice(&v.to_le_bytes());
-                    }
-                    if pcm_tx.send(bytes).is_err() {
-                        break;
+                    if pcm_tx.send(pcm_to_bytes(&pcm16k)).is_err() {
+                        drop(stream);
+                        info!(target: "speech", "[remote] capture stopped (downstream gone)");
+                        return;
                     }
                 }
                 Err(std_mpsc::RecvTimeoutError::Timeout) => continue,
                 Err(std_mpsc::RecvTimeoutError::Disconnected) => break,
+            }
+        }
+        // 停止时排空 cpal 刚推进来、主循环还没读走的尾帧,否则录音停止前最后
+        // ~100ms 的音频(最后一两个字)会随 drop(stream) 丢掉,导致尾字缺失。
+        while let Ok(frame) = rx.try_recv() {
+            let pcm16k: Vec<f32> = match resampler {
+                Some(ref mut r) => r.process(&frame),
+                None => frame,
+            };
+            if pcm_tx.send(pcm_to_bytes(&pcm16k)).is_err() {
+                break;
             }
         }
         drop(stream);
@@ -882,6 +900,21 @@ async fn run_one_connection(
 
     loop {
         if stop.load(Ordering::Relaxed) {
+            // 采集线程同样观察 `stop`:它会 flush 尾帧后 drop 掉发送端,关闭 pcm_rx。
+            // 发 stop(让服务端做最终切分)之前,把还在 pcm_rx 里排队的尾部 PCM 全部转发出去,
+            // 否则途中的最后 ~100-300ms 音频(最后一两个字)会被丢弃、从转写里缺失。
+            loop {
+                match tokio::time::timeout(Duration::from_millis(500), pcm_rx.recv()).await {
+                    Ok(Some(bytes)) => {
+                        if wr.send(Message::Binary(bytes)).await.is_err() {
+                            reader.abort();
+                            return Outcome::Stopped;
+                        }
+                    }
+                    // 通道关闭(采集线程已 flush 完并退出)或 500ms 内无新音频 → 收尾。
+                    _ => break,
+                }
+            }
             let _ = wr
                 .send(Message::Text(r#"{"type":"stop"}"#.to_string()))
                 .await;

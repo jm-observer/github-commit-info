@@ -523,6 +523,16 @@ async fn handle_client(mut sock: WebSocket, ctx: AppCtx, upgrade_remote: Option<
         },
     ));
 
+    // 尾部静音填充(16k mono s16le 的 0 采样)。停止/断线收尾时,先补这段静音
+    // 再 flush,让上游流式 ASR 的 VAD 观测到"语音结束"、对最后一个 VAD 段做完整的 2-pass
+    // 终解码。否则用户话音刚落就按停止时,最后一两个字仍在未闭合的 VAD 段里,会被流式解码
+    // 的 lookahead 边界截断丢弃(表现为偶发丢尾字/词)。仅发给 asr,**不入 pcm_buf**——
+    // 存档 WAV / 声纹样本不含这段静音,时间线不受影响。
+    // 时长必须 > 上游 VAD 的 end-silence 阈值(ASR_VAD_MAX_END_SIL,默认 1500ms),
+    // 否则 VAD 在 flush 前闭合不了最后一段,只能走 is_final 强制收尾,端点更差。
+    const TAIL_PAD_MS: usize = 1600;
+    let tail_pad = vec![0u8; 16000 * 2 * TAIL_PAD_MS / 1000];
+
     // 主循环:客户端音频/控制 -> ASR
     loop {
         match cli_rx.next().await {
@@ -542,13 +552,16 @@ async fn handle_client(mut sock: WebSocket, ctx: AppCtx, upgrade_remote: Option<
                     let _ = asr_tx.send(TMessage::text(r#"{"type":"reset"}"#)).await;
                 }
                 Ok(ClientControl::Stop) => {
+                    // 先补尾部静音让 VAD 闭合最后一段,再 flush 触发终解码,防止尾字被截断。
+                    let _ = asr_tx.send(TMessage::Binary(tail_pad.clone())).await;
                     let _ = asr_tx.send(TMessage::text(r#"{"type":"flush"}"#)).await;
                     break;
                 }
                 Err(_) => {}
             },
             _ => {
-                // 断线/关闭:让 ASR 收尾,asr_reader 会发 done
+                // 断线/关闭:同样补尾部静音再让 ASR 收尾(asr_reader 会发 done)。
+                let _ = asr_tx.send(TMessage::Binary(tail_pad.clone())).await;
                 let _ = asr_tx.send(TMessage::text(r#"{"type":"flush"}"#)).await;
                 break;
             }
@@ -1439,6 +1452,7 @@ textarea{width:100%;min-height:96px;line-height:1.5;font-family:ui-monospace,SFM
 .seg-fld .raw{background:#0d1626;border-color:#1e3a5f}
 .seg-fld .opt{color:#e6e6e6}
 .seg-fld .en{color:#94a3b8;font-style:italic}
+.seg-fld .sec{color:#cbb48a}
 .seg-acts{display:flex;gap:8px;flex-wrap:wrap;margin-top:6px}
 .seg-acts .right{margin-left:auto;display:flex;gap:8px}
 .hist-hd{display:flex;align-items:start;gap:16px;justify-content:space-between;margin-bottom:10px}
@@ -1592,6 +1606,7 @@ function renderSeg(r,opts){
    ${audioBtn}
   </div>
   <div class=seg-fld><div class=k>原文</div><textarea id="tx_${r.id}" class=raw rows=2>${esc(r.text||'')}</textarea></div>
+  ${r.secondary?`<div class=seg-fld><div class=k>次模型</div><div id="sec_${r.id}" class=sec>${esc(r.secondary)}</div></div>`:''}
   <div class=seg-fld><div class=k>优化</div><div id="opt_${r.id}" class=opt>${esc(r.optimized||'')||'<span class=note>(尚未优化)</span>'}</div></div>
   <div class=seg-fld><div class=k>英文</div><div id="en_${r.id}" class=en>${esc(r.english||'')||'<span class=note>(尚未翻译)</span>'}</div></div>
   <div class=seg-acts>

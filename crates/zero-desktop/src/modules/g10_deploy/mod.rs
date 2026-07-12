@@ -343,14 +343,14 @@ pub async fn g10_deploy(
                     }
                 }
                 DeployDone {
-                name: name_for_task.clone(),
-                success: code == Some(0),
-                code,
-                error: if code == Some(0) {
-                    None
-                } else {
-                    Some(format!("部署进程以退出码 {code:?} 结束"))
-                },
+                    name: name_for_task.clone(),
+                    success: code == Some(0),
+                    code,
+                    error: if code == Some(0) {
+                        None
+                    } else {
+                        Some(format!("部署进程以退出码 {code:?} 结束"))
+                    },
                 }
             }
             Err(e) => DeployDone {

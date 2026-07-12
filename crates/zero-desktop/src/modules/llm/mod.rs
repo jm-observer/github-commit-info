@@ -31,7 +31,10 @@ fn map_err(prefix: &str, status: reqwest::StatusCode, body: &str) -> String {
         .unwrap_or_else(|| body.chars().take(200).collect::<String>());
     // 空 body（如老 server 没有该路由 → 404 空响应）给出可操作提示，避免「失败：」空尾巴。
     let detail = if detail.trim().is_empty() {
-        format!("HTTP {}（响应为空，可能 G10 toolkit-server 版本过旧、缺少该接口，请重新部署）", status.as_u16())
+        format!(
+            "HTTP {}（响应为空，可能 G10 toolkit-server 版本过旧、缺少该接口，请重新部署）",
+            status.as_u16()
+        )
     } else {
         detail
     };

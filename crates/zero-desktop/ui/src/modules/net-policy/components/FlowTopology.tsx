@@ -173,6 +173,29 @@ export function FlowTopology({
           />
         </div>
 
+        {/* 默认出口（未命中任何规则的兜底 MATCH）——直连=灰/原样观察，海外=蓝/全走 SBN，黑洞=红/空出口。 */}
+        <div className="flex justify-center">
+          <div
+            className={`inline-flex items-center gap-2 rounded-md border px-3 py-1 text-[11px] ${
+              status.default_route === 'blackhole'
+                ? 'border-red-300 bg-red-50 text-red-700 dark:border-red-500/50 dark:bg-red-950/40 dark:text-red-300'
+                : status.default_route === 'wg'
+                  ? 'border-blue-300 bg-blue-50 text-blue-700 dark:border-blue-500/50 dark:bg-blue-950/40 dark:text-blue-300'
+                  : 'border-gray-300 bg-gray-50 text-gray-600 dark:border-gray-600 dark:bg-gray-800/40 dark:text-gray-300'
+            }`}
+            title="未命中任何分流规则时的兜底出口"
+          >
+            <span className="font-semibold">默认出口</span>
+            <span>
+              {status.default_route === 'blackhole'
+                ? '⛔ 阻断 · 空出口（未放行的一律上不去）'
+                : status.default_route === 'wg'
+                  ? '🌐 海外 · 全走 SBN'
+                  : '↪ 直连 · 原样观察（不改流量）'}
+            </span>
+          </div>
+        </div>
+
         <div className="flex justify-center"><VArrow /></div>
 
         {/* kill-switch 围栏 */}

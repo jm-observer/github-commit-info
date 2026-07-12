@@ -3,14 +3,14 @@
   "configurations": [
     {
       "name": "toolkit-server",
-      "runtimeExecutable": "D:\\git\\github-commit-info\\target\\debug\\toolkit-server.exe",
-      "runtimeArgs": ["serve", "--bind", "127.0.0.1:8788", "--web-dir", "D:\\git\\github-commit-info\\crates\\toolkit-server\\web"],
+      "runtimeExecutable": "D:\\git\\toolkit\\target\\debug\\toolkit-server.exe",
+      "runtimeArgs": ["serve", "--bind", "127.0.0.1:8788", "--web-dir", "D:\\git\\toolkit\\crates\\toolkit-server\\web"],
       "port": 8788
     },
     {
       "name": "zero-desktop-ui",
       "runtimeExecutable": "npm",
-      "runtimeArgs": ["run", "dev", "--prefix", "D:\\git\\github-commit-info\\crates\\zero-desktop\\ui"],
+      "runtimeArgs": ["run", "dev", "--prefix", "D:\\git\\toolkit\\crates\\zero-desktop\\ui"],
       "port": 1420
     }
   ]

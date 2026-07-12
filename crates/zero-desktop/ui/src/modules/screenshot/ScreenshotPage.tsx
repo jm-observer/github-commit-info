@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useState } from "react";
 import { invoke, convertFileSrc } from "@tauri-apps/api/core";
-import { Camera, FolderOpen, RefreshCw, Copy, Trash2, X, Settings as SettingsIcon } from "lucide-react";
+import { Camera, FolderOpen, RefreshCw, Copy, Trash2, X, Settings as SettingsIcon, FolderSearch, Download } from "lucide-react";
 
 interface HistoryItem {
   name: string;
@@ -16,10 +16,12 @@ interface ScreenshotSettings {
   color: string;
   line_width: number;
   save_dir: string;
+  delay_secs: number;
 }
 
 const COLORS = ["#FF3B30", "#FFCC00", "#34C759", "#0A84FF", "#FFFFFF", "#1C1C1E"];
 const WIDTHS = [2, 4, 6, 10];
+const DELAYS = [0, 3, 5, 10];
 
 /** 主窗口「截图」页：立即截图入口 + 历史截图画廊（来自 <workspace>/screenshots）。 */
 export default function ScreenshotPage() {
@@ -64,6 +66,9 @@ export default function ScreenshotPage() {
   const capture = async () => {
     try {
       await invoke("screenshot_capture");
+      if (settings && settings.delay_secs > 0) {
+        flash(`将在 ${settings.delay_secs} 秒后自动截图`);
+      }
     } catch (e) {
       flash(`截图失败：${String(e)}`);
     }
@@ -83,6 +88,23 @@ export default function ScreenshotPage() {
       flash("已复制到剪贴板");
     } catch (e) {
       flash(`复制失败：${String(e)}`);
+    }
+  };
+
+  const reveal = async (it: HistoryItem) => {
+    try {
+      await invoke("screenshot_reveal_in_folder", { path: it.path });
+    } catch (e) {
+      flash(`定位文件失败：${String(e)}`);
+    }
+  };
+
+  const saveAs = async (it: HistoryItem) => {
+    try {
+      const dest = await invoke<string | null>("screenshot_save_as", { path: it.path });
+      flash(dest ? `已另存到 ${dest}` : "已取消保存");
+    } catch (e) {
+      flash(`另存失败：${String(e)}`);
     }
   };
 
@@ -237,6 +259,30 @@ export default function ScreenshotPage() {
                 ))}
               </div>
             </div>
+
+            {/* 延迟截图 */}
+            <div>
+              <span className="mb-1 block text-sm font-medium">延迟截图</span>
+              <div className="flex items-center gap-2">
+                {DELAYS.map((d) => (
+                  <button
+                    key={d}
+                    onClick={() => setSettings({ ...settings, delay_secs: d })}
+                    className={[
+                      "flex h-8 min-w-10 items-center justify-center rounded-md border px-2 text-sm",
+                      settings.delay_secs === d
+                        ? "border-blue-500 bg-blue-50 text-blue-700 dark:bg-blue-950 dark:text-blue-300"
+                        : "border-gray-300 text-gray-600 dark:border-gray-600 dark:text-gray-300",
+                    ].join(" ")}
+                  >
+                    {d === 0 ? "立即" : `${d}s`}
+                  </button>
+                ))}
+              </div>
+              <span className="mt-1 block text-xs text-gray-400">
+                触发后倒计时再抓屏，用于抓右键菜单等瞬时内容（触发热键会先把菜单关掉）。
+              </span>
+            </div>
           </div>
 
           <div className="mt-4 flex justify-end gap-2">
@@ -305,6 +351,20 @@ export default function ScreenshotPage() {
                     <Copy size={15} />
                   </button>
                   <button
+                    onClick={() => void saveAs(it)}
+                    title="另存为…"
+                    className="rounded p-1 text-gray-500 hover:bg-gray-200 hover:text-blue-600 dark:hover:bg-gray-700"
+                  >
+                    <Download size={15} />
+                  </button>
+                  <button
+                    onClick={() => void reveal(it)}
+                    title="在文件夹中显示"
+                    className="rounded p-1 text-gray-500 hover:bg-gray-200 hover:text-blue-600 dark:hover:bg-gray-700"
+                  >
+                    <FolderSearch size={15} />
+                  </button>
+                  <button
                     onClick={() => void remove(it)}
                     title="删除"
                     className="rounded p-1 text-gray-500 hover:bg-gray-200 hover:text-red-600 dark:hover:bg-gray-700"
@@ -334,6 +394,18 @@ export default function ScreenshotPage() {
                 className="flex items-center gap-1 rounded bg-white/15 px-2 py-1 text-sm hover:bg-white/25"
               >
                 <Copy size={15} /> 复制
+              </button>
+              <button
+                onClick={() => void saveAs(preview)}
+                className="flex items-center gap-1 rounded bg-white/15 px-2 py-1 text-sm hover:bg-white/25"
+              >
+                <Download size={15} /> 另存为
+              </button>
+              <button
+                onClick={() => void reveal(preview)}
+                className="flex items-center gap-1 rounded bg-white/15 px-2 py-1 text-sm hover:bg-white/25"
+              >
+                <FolderSearch size={15} /> 在文件夹中显示
               </button>
               <button
                 onClick={() => void remove(preview)}

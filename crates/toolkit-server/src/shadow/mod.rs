@@ -57,9 +57,14 @@ pub fn select_backend() -> ScoreBackend {
 /// 见 docs/english-shadow-scoring-ui-design.md §2.4。前端 passThreshold 滑杆覆盖此默认。
 pub const DEFAULT_THRESHOLD: f64 = 0.6;
 
-/// GOP 通过判定允许的「严重错读音素」上限(uncertain 不计)。真人读一句几乎总有 1 个孤立难音素
-/// (尾塞音 / ʃ 等),要求「零 bad」基本无法通过 → 放宽到 ≤1。见 scoring-ui 设计 §2.4。
-pub const MAX_BAD_PHONES: u32 = 1;
+/// GOP 通过判定允许的「严重错读音素」配额(uncertain 不计):**每 10 个音素 1 个,短句(<10)
+/// 零容忍**。曾放宽到「≥1」因真人总有 1 个孤立难音素被冤(尾塞音/弱读元音,scoring-ui §2.4);
+/// 豁免规则(词尾辅音/弱读元音/峰偏移,见 gop.py)吸收冤案后,母语 TTS 回归 18/18 bad=0,
+/// 遂收紧——否则 `I sink so`(th→s)这类单错读短句会靠配额混过。
+/// 见 docs/english-shadow-todo.md「标定实测发现(2026-07-02)」。
+pub fn max_bad_phones(phone_total: usize) -> u32 {
+    (phone_total / 10) as u32
+}
 
 /// 跟读粒度。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -163,7 +168,7 @@ pub struct ScoreResult {
     pub ref_text: String,
     /// 总分 0~1。v1=内容命中率；GOP=句级发音分（sentence_score，已标定）。
     pub score: f64,
-    /// 通过判定。v1=`score>=threshold`；GOP=`score>=threshold && bad_phone_count==0`。
+    /// 通过判定。v1=`score>=threshold`；GOP=`score>=threshold && bad_phone_count<=max_bad_phones(音素总数)`。
     pub passed: bool,
     pub words: Vec<WordResult>,
     /// 严重错读音素总数（GOP 后端；v1 为 None）。供前端/落库追溯。

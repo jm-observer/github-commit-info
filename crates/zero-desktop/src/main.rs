@@ -198,13 +198,8 @@ fn main() -> Result<()> {
 }
 
 fn resolve_workspace(arg: &Option<String>) -> Result<PathBuf> {
-    let path = match arg {
-        Some(p) => PathBuf::from(p),
-        None => dirs::data_local_dir()
-            .context("cannot determine data_local_dir")?
-            .join("zero-desktop"),
-    };
-    Ok(path)
+    // 统一走 custom-utils 生态约定：$HOME/.config/<app>（-w / ZERO_DESKTOP_WORKSPACE 仍优先）。
+    custom_utils::args::workspace(arg, APP)
 }
 
 fn run_gui(workspace: PathBuf) -> Result<()> {
@@ -293,6 +288,11 @@ fn run_gui(workspace: PathBuf) -> Result<()> {
             modules::net_policy::net_policy_list_process_candidates,
             modules::net_policy::net_policy_apply,
             modules::net_policy::net_policy_emergency_stop,
+            modules::net_policy::net_policy_set_enabled,
+            modules::net_policy::net_policy_reload,
+            modules::net_policy::net_policy_blocked,
+            modules::net_policy::net_policy_clear_blocked,
+            modules::net_policy::net_policy_dns_map,
             modules::net_policy::net_policy_verify,
             // llm 模块（公共大模型层：配置 / 提示词 / 自测 / 对话总结）
             modules::llm::llm_get_config,
@@ -307,6 +307,8 @@ fn run_gui(workspace: PathBuf) -> Result<()> {
             modules::llm::llm_get_session,
             modules::llm::llm_create_chat,
             modules::llm::llm_chat_send,
+            // egress 模块（出口代理 worker 列表，只读观测面）
+            modules::egress::egress_list_workers,
             // codeloop 模块（Codex⇄Claude 复核循环）
             modules::codeloop::codeloop_list_sessions,
             modules::codeloop::codeloop_new_codex_session,
@@ -358,6 +360,8 @@ fn run_gui(workspace: PathBuf) -> Result<()> {
             modules::screenshot::screenshot_open_folder,
             modules::screenshot::screenshot_delete,
             modules::screenshot::screenshot_copy_to_clipboard,
+            modules::screenshot::screenshot_reveal_in_folder,
+            modules::screenshot::screenshot_save_as,
         ])
         .setup(move |app| {
             modules::english::setup(app.handle(), state.english.clone())

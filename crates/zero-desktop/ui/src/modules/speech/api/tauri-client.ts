@@ -48,7 +48,7 @@ export interface AppSettings {
   auto_start: boolean;
 }
 
-export const DEFAULT_REMOTE_URL = 'ws://192.168.0.68:8090/stream';
+export const DEFAULT_REMOTE_URL = 'ws://192.168.0.68:8788/api/asr/stream';
 
 export interface SegmentDiscardedEvent {
   revision: number;

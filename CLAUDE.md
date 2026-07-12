@@ -18,13 +18,15 @@ workspace，作为 zero/Agent 生态的统一工具底座。架构目标：
 | `toolkit-core` | 领域类型 + SQLite schema/迁移（`schema.rs` 的 `DDL_V1`）+ URL 模式识别。`open_pool` / `migrate` / `new_task_id` / `now_iso8601`。 |
 | `toolkit-tasks` | **通用长任务引擎**：`TaskKind` trait + `Registry` 注册、`submit` 即 spawn、`run_task` 状态机、`store` 持久化到 `tasks` 表。 |
 | `toolkit-llm` | **统一 OpenAI 兼容 LLM 客户端**：`LlmConfig`（含 `from_env`）+ `LlmClient`（`complete`/`chat` + 指数退避重试 + 响应解析）+ `prompt_hash`。任何需调大模型的内部 crate 都走它，不要自行拼 HTTP。**不持有提示词**（提示词由功能层/可配目录决定后传入）。 |
-| `toolkit-server` | axum daemon。`bootstrap` 装配 pool/migrate/registry/recovery；`/api/web`、`/api/web/audio`（TTS 代理）、`/api/web/douyin`、`/api/web/llm`（**公共大模型：连接配置/可配提示词/连通性自测/对话总结**）、`/api/agent`、`/api/browser` 路由 + web 控制台。systemd 安装 / 自更新（`custom-utils` updater）。 |
+| `toolkit-server` | axum daemon。`bootstrap` 装配 pool/migrate/registry/recovery；`/api/web`、`/api/web/audio`（TTS 代理）、`/api/web/douyin`、`/api/web/llm`（**公共大模型：连接配置/可配提示词/连通性自测/对话总结**）、`/api/agent`、`/api/browser`、`/api/internal`（**出口代理 worker 通道**：register/heartbeat/长轮询 egress/result,共享 token）、`/api/web/egress`（出口观测 + probe 自测）路由 + web 控制台。systemd 安装 / 自更新（`custom-utils` updater）。 |
 | `zero-desktop` | 统一 Tauri 桌面壳：cookie 采集（抖音/同花顺 headless_chrome/CDP + msToken + 上传 G10）、speech / english / codeloop / g10-deploy / 音乐 / 网络策略 等模块。**需 Tauri 工具链**，CI 式环境通常排除。 |
 | `asr-client` | 通用 FunASR `/transcribe` HTTP 客户端（multipart 上传 + 强类型响应 + 错误归类）。**任何需要离线 ASR 的内部 crate 都走它**，不要自行拼 multipart。端点契约权威源在 streaming-speech `docs/asr-transcribe-api.md`。 |
 | `douyin` | 抖音 web 工具：a-bogus 签名、creator/works/tags API、下载 + ASR 管线（**通过 `asr-client` 调 FunASR**）、LLM 整理（`refine`）、knowledge md 生成。既是库（被 server 调）也有独立 daemon/CLI。 |
 | `rag` | 抖音 knowledge md 的语义检索 → sqlite-vec。CLI `ingest`/`search`，HTTP `serve`。 |
 | `github-commit-info` | 独立 CLI：取 GitHub 仓库指定时间范围 commit。 |
 | `hf-watcher` | 独立 CLI：HuggingFace trending / model-card 监听。 |
+| `egress-pool` | **出口代理轻模型核心**（借出口,非分发算力）：`EgressRequest/Response` 线格式 + in-memory `Registry`（worker 通道/请求路由/session 绑定）+ `Pool`/`Session` 进程内句柄。两原语：`pool.fetch`（匿名短租轮换 IP）/ `pool.session(typ,account)`（钉死长租,同一出口 IP + 连续 cookie,按账号复用）。共用策略「同类型独占、类型间共用」。详见 [docs/distributed-worker-design.md](docs/distributed-worker-design.md) 的「轻模型」节。 |
+| `toolkit-worker` | **出口代理节点二进制**（pull 模型执行端）：register/心跳/长轮询 `/api/internal/egress/next` → 本机 reqwest 代发 → 回传;per-session cookie jar。各出口机手动/自更新拉起 `toolkit-worker --controller <公网> --token <...>`。 |
 
 ## 常用命令
 
@@ -217,7 +219,12 @@ pwsh ./deploy-g10.ps1 -SkipBuild # 仅复制已有产物
 - [docs/english-shadow-todo.md](docs/english-shadow-todo.md) — 跟读判分优化需求 TODO（全自动 / 实时录评 / 发音级评分）。
 - [docs/english-shadow-gop-design.md](docs/english-shadow-gop-design.md) — 跟读发音级评测（GOP 音素评分）设计。
 - [docs/english-shadow-realtime-design.md](docs/english-shadow-realtime-design.md) — 跟读实时发音评测（流式 GOP：流式声学 + 在线对齐 + WS，批量 GOP 作 finalizer）设计。
-- [docs/distributed-worker-design.md](docs/distributed-worker-design.md) — 分布式 worker 设计：多 IP 节点 + pull 调度 + 两段式自更新。
+- [docs/runbook-shadow-realtime-e2e.md](docs/runbook-shadow-realtime-e2e.md) — 跟读实时发音评测端到端验收 runbook（直连 :8098 → toolkit 中继 → 桌面 三层 + 落库/降级校验）。
+- [docs/english-shadow-scoring-ui-design.md](docs/english-shadow-scoring-ui-design.md) — 评分可解释 + 对齐明细 UI 设计：评分细则透明化 + 新增「对齐可靠性/uncertain」(把没对齐上的音素从 bad 改判存疑,不冤枉用户) + 音素明细表展示。
+- [docs/english-pron-evaluator-design.md](docs/english-pron-evaluator-design.md) — 发音评测单元(PronEvaluator)设计：词/短语/句通用的可复用组件(评分+朗读+听标准TTS+听自己+LLM 二次反馈),含失败词 drill-down 单练。
+- [docs/distributed-worker-design.md](docs/distributed-worker-design.md) — 分布式爬虫底座设计（公共库 · Worker · 出口 IP 池）：统一模型（一支 fleet 两个面 / 库的两档接入：请求级 egress 代理 + 任务级 worker 分发 / cookie·匿名 IP 策略分裂 / proxy_pool 提级）+ pull 调度 + 两段式自更新。
+- [docs/net-policy-observer-first-design.md](docs/net-policy-observer-first-design.md) — 网络出口策略「观察者优先」设计：默认出口三档姿态（直连观察/海外VPN/阻断收紧，默认直连）+ 与 SBN 解耦 + 关闭/停止语义（关窗=保持、仅手动停止拆除并清 enabled）+ 防火墙 kill-switch 跟随姿态（观察不挂、切姿态 reload 对齐）+ 逐项放行热加载 + 可观测（观察主表 / 被阻断 feed / 域名↔IP）。
+- [docs/zero-desktop-firewall-extraction-design.md](docs/zero-desktop-firewall-extraction-design.md) — 把 `net_policy` 独立为桌面 app `zero-desktop-firewall` **并进一步拆到单独 git 仓** 的方案：依据是 net_policy「零后端 + 零 toolkit 内部依赖」（已核实,唯一重外部依赖 custom-utils 是版本依赖）；含身份改名三件套（productName/identifier/数据目录）+ 8 非网络模块 `git mv` 移出到承接软件 + 旧 workspace 数据一次性迁移 + 依赖/UI/配置瘦身 + `filter-repo` 保历史拆仓（两阶段:先证可独立编译→再物理拆仓）。net_policy 行为/端口/命令名全不变;提权/托盘等留待后续。
 - [docs/toolkit-rfc/2026-06-04-initial-skeleton/data-model.md](docs/toolkit-rfc/2026-06-04-initial-skeleton/data-model.md) — SQLite 数据模型。
 - [docs/toolkit-rfc/2026-06-10-toolkit-elevation/plan.md](docs/toolkit-rfc/2026-06-10-toolkit-elevation/plan.md) — 提级为统一工具中台的分阶段规划。
 - [docs/retrospective.md](docs/retrospective.md) — 复盘记录。

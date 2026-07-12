@@ -225,7 +225,7 @@ function G10ConfigSection() {
         icon={<Wifi size={13} />}
         value={lanHost}
         onChange={setLanHost}
-        placeholder="192.168.1.100"
+        placeholder="192.168.0.68"
         hint="只填局域网 IP；端口/协议（http :8788、ASR ws）由各服务自动决定。需要时可写 IP:端口。"
       />
       <HostField

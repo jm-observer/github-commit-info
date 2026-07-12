@@ -8,3 +8,7 @@ target-aarch64
 /data/
 crates/zero-desktop/gen/
 target-smoke
+
+# 出口 worker 本机运行时标识 / WireGuard 客户端私钥（机器特定、含密钥，勿入库）
+egress-worker-id
+wg0-client-*.conf

@@ -1,6 +1,6 @@
 import { NavLink, Outlet, useLocation } from 'react-router-dom'
 import { useEffect, useState } from 'react'
-import { BookOpen, Mic, Wand2, Cookie, ShieldCheck, GitCompareArrows, MessageSquareText, MessagesSquare, Music, Rocket, Settings, Crop } from 'lucide-react'
+import { BookOpen, Mic, Wand2, Cookie, ShieldCheck, GitCompareArrows, MessageSquareText, MessagesSquare, Music, Rocket, Settings, Crop, Network } from 'lucide-react'
 import { invoke } from '@tauri-apps/api/core'
 import { listen } from '@tauri-apps/api/event'
 import EnvConfigService from '../modules/english/services/EnvConfigService'
@@ -20,6 +20,7 @@ const navItems = [
   { to: '/music', icon: Music, label: '音乐' },
   { to: '/screenshot', icon: Crop, label: '截图' },
   { to: '/g10-deploy', icon: Rocket, label: 'G10 部署' },
+  { to: '/egress-workers', icon: Network, label: '出口 Worker' },
   { to: '/settings', icon: Settings, label: '设置' },
 ]
 
@@ -186,87 +187,6 @@ function RecordingIndicator() {
   )
 }
 
-// ── 全局识别开关（侧栏常驻，不必切到语音识别页即可启停） ─────────────────────
-
-// 程序生命周期内只自动开启一次（避免组件重挂载时重复触发）。
-let autoStarted = false
-
-function RecordingToggle() {
-  const [recording, setRecording] = useState(false)
-  const [busy, setBusy] = useState(false)
-
-  useEffect(() => {
-    let unlisten: (() => void) | null = null
-
-    invoke<{ recording: boolean }>('speech_get_recording_state')
-      .then(r => setRecording(r.recording))
-      .catch(() => {/* 忽略初始拉取失败 */})
-
-    listen<{ recording: boolean }>('speech_recording_state_changed', event => {
-      setRecording(event.payload.recording)
-    }).then(fn => {
-      unlisten = fn
-    })
-
-    // 周期轮询后端真值，自愈漏接事件 / 启动竞态（与语音识别页同一真相源）。
-    const poll = setInterval(() => {
-      invoke<{ recording: boolean }>('speech_get_recording_state')
-        .then(r => setRecording(r.recording))
-        .catch(() => {/* 忽略抖动 */})
-    }, 2000)
-
-    // 启动自动开启识别：仅当设置里「启动时自动识别」打开时触发。
-    // best-effort：地址/设备未配置时静默失败，后端有重复启动保护。
-    if (!autoStarted) {
-      autoStarted = true
-      invoke<{ auto_start?: boolean }>('speech_get_settings')
-        .then(s => {
-          if (s?.auto_start) {
-            return invoke('speech_start_recording').catch(() => {/* 未配置则忽略 */})
-          }
-        })
-        .catch(() => {/* 读设置失败则不自动开启 */})
-    }
-
-    return () => {
-      unlisten?.()
-      clearInterval(poll)
-    }
-  }, [])
-
-  const toggle = async () => {
-    setBusy(true)
-    try {
-      // 启停命令无参，配置（远程地址/输入设备）由后端从已保存状态读取。
-      if (recording) await invoke('speech_stop_recording')
-      else await invoke('speech_start_recording')
-    } catch (e) {
-      // 例如远程识别地址未配置：到语音识别页设置后再试。
-      window.alert(`录音操作失败：${String(e)}`)
-    } finally {
-      setBusy(false)
-    }
-  }
-
-  return (
-    <button
-      type="button"
-      onClick={() => void toggle()}
-      disabled={busy}
-      title={recording ? '点击停止识别' : '点击开始识别（需先在语音识别页配置远程地址/设备）'}
-      className={[
-        'flex w-full items-center justify-center gap-2 rounded-md px-3 py-2 text-sm font-medium transition-colors disabled:opacity-60',
-        recording
-          ? 'bg-red-500 text-white hover:bg-red-600'
-          : 'bg-blue-500 text-white hover:bg-blue-600',
-      ].join(' ')}
-    >
-      <Mic size={16} />
-      {recording ? '停止识别' : '开始识别'}
-    </button>
-  )
-}
-
 // ── customer_id 指示灯（mount-once + 监听设置保存事件） ─────────────────────
 
 function CustomerIdIndicator() {
@@ -342,11 +262,6 @@ export default function ShellLayout() {
             )
           })}
         </nav>
-
-        {/* 侧栏底部：全局录音开关，任何页面都能启停 */}
-        <div className="border-t border-gray-200 p-2 dark:border-gray-800">
-          <RecordingToggle />
-        </div>
       </aside>
 
       {/* 右侧主区域 */}

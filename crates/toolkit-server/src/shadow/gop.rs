@@ -139,12 +139,18 @@ pub fn score_result_from_final(v: &serde_json::Value, threshold: f64) -> Option<
 
 /// 把 `/assess` 响应映射进 `ScoreResult`：
 /// - `score` = `sentence_score`；
-/// - `passed` = `sentence_score >= threshold && bad_phone_count == 0`（设计 §2 决策 6）；
+/// - `passed` = `sentence_score >= threshold && bad_phone_count <= max_bad_phones(音素总数)`
+///   （放宽,见 scoring-ui §2.4;配额按句长自适应,见 todo「标定实测发现」）；
 /// - 词级 `status`（内容维度，给老前端回退渲染）从 `pron_status` 派生：`bad → wrong`，否则 `ok`。
 fn map_response(r: AssessResponse, ref_text: &str, threshold: f64) -> ScoreResult {
     let bad_count = r
         .bad_phone_count
         .unwrap_or_else(|| count_bad_phones(&r.words));
+    let phone_total: usize = r
+        .words
+        .iter()
+        .map(|w| w.phones.as_ref().map_or(0, |p| p.len()))
+        .sum();
     let words = r
         .words
         .into_iter()
@@ -165,8 +171,8 @@ fn map_response(r: AssessResponse, ref_text: &str, threshold: f64) -> ScoreResul
         transcript: r.transcript.unwrap_or_default(),
         ref_text: ref_text.trim().to_string(),
         score: r.sentence_score,
-        // 放宽:句分达标 且 严重错读音素 ≤ 上限(uncertain 已不计入 bad_count)。设计 §2.4。
-        passed: r.sentence_score >= threshold && bad_count <= super::MAX_BAD_PHONES,
+        // 放宽:句分达标 且 严重错读音素 ≤ 配额(uncertain 已不计入 bad_count;配额按句长自适应)。
+        passed: r.sentence_score >= threshold && bad_count <= super::max_bad_phones(phone_total),
         words,
         bad_phone_count: Some(bad_count),
         model: r.model,
@@ -249,16 +255,33 @@ mod tests {
     }
 
     #[test]
-    fn passed_tolerates_one_bad_but_not_two() {
-        // 放宽规则(设计 §2.4):句分达标 + bad ≤ 1 → 通过;bad ≥ 2 → 不过。
+    fn short_sentence_zero_bad_tolerance() {
+        // 短句(<10 音素)零容忍:1 个 bad 即不通过(豁免规则已吸收冤案,单错读不得靠配额混过)。
         let r = map_response(sample(), "I think so", 0.6); // bad_phone_count=1, score 0.71
         assert_eq!(r.bad_phone_count, Some(1));
-        assert!(r.passed, "1 个 bad 应允许通过");
+        assert!(!r.passed, "短句 1 个 bad 应不通过(配额=0)");
 
-        let mut two = sample();
-        two.bad_phone_count = Some(2);
-        let r2 = map_response(two, "x", 0.6);
-        assert!(!r2.passed, "2 个 bad 应不通过");
+        let mut clean = sample();
+        clean.bad_phone_count = Some(0);
+        let r2 = map_response(clean, "x", 0.6);
+        assert!(r2.passed, "零 bad + 句分达标应通过");
+    }
+
+    #[test]
+    fn bad_quota_scales_with_sentence_length() {
+        // 配额按句长自适应(每 10 音素 1 个):25 音素句容 2 个 bad,3 个不行。
+        let mut long = sample();
+        long.bad_phone_count = Some(2);
+        let ph = long.words[0].phones.as_ref().unwrap()[0].clone();
+        long.words[0].phones = Some(vec![ph.clone(); 25]);
+        let r = map_response(long, "x", 0.6);
+        assert!(r.passed, "25 音素句 2 个 bad 应通过(配额=2)");
+
+        let mut over = sample();
+        over.bad_phone_count = Some(3);
+        over.words[0].phones = Some(vec![ph; 25]);
+        let r2 = map_response(over, "x", 0.6);
+        assert!(!r2.passed, "25 音素句 3 个 bad 应不通过");
     }
 
     #[test]

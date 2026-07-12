@@ -10,15 +10,19 @@ use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 
-/// 出口路由：默认走 WireGuard（海外），仅显式配置的走本地直连。
+/// 出口路由。作为**单条规则**的命中出口时取 `Direct`/`Wg`（把程序/域名/IP 白名单到直连，
+/// 或显式指向 SBN 海外）；作为**默认出口**（`NetPolicySettings::default_route`，未命中任何规则的
+/// 兜底）时取 `Direct`（默认，观察模式，原样直连）、`Wg`（全走海外）或 `Blackhole`（全阻断）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "lowercase")]
 pub enum Route {
     /// 本地直连（绕过隧道）。
     Direct,
-    /// 走 WireGuard 出口（默认）。
+    /// 走 WireGuard 海外出口（默认 per-rule 出口）。
     #[default]
     Wg,
+    /// 黑洞：静默丢弃（mihomo `REJECT-DROP`）。"空出口"——什么都上不去，不依赖任何 SBN。
+    Blackhole,
 }
 
 impl Route {
@@ -27,6 +31,8 @@ impl Route {
         match self {
             Route::Direct => "DIRECT",
             Route::Wg => "wg-out",
+            // REJECT-DROP：静默丢包（真"空出口"），比 REJECT（回 RST）更贴"网络什么都上不去"。
+            Route::Blackhole => "REJECT-DROP",
         }
     }
 }
@@ -61,6 +67,31 @@ impl Rule {
             Rule::IpCidr { value, route } => {
                 format!("  - IP-CIDR,{value},{},no-resolve", route.outbound())
             }
+        }
+    }
+
+    /// 取本规则命中后的出口（用于「规则指向海外但 WG 未配」的一致性校验）。
+    pub fn route(&self) -> Route {
+        match self {
+            Rule::ProcessPath { route, .. }
+            | Rule::ProcessName { route, .. }
+            | Rule::DomainSuffix { route, .. }
+            | Rule::IpCidr { route, .. } => *route,
+        }
+    }
+
+    /// 两条规则是否指向同一目标（kind + value 相同，忽略 route）。upsert / 按值删除用：
+    /// 规则没有稳定 ID，前端此前按数组下标删规则，多行并发操作会因下标前移删错——按
+    /// (kind, value) 定位没有这个竞态；同时保证同一目标只有一条规则（mihomo 首条命中，
+    /// 旧规则在前会遮蔽改路后的新规则）。
+    pub fn same_target(&self, other: &Rule) -> bool {
+        use Rule::*;
+        match (self, other) {
+            (ProcessPath { value: a, .. }, ProcessPath { value: b, .. })
+            | (ProcessName { value: a, .. }, ProcessName { value: b, .. })
+            | (DomainSuffix { value: a, .. }, DomainSuffix { value: b, .. })
+            | (IpCidr { value: a, .. }, IpCidr { value: b, .. }) => a.eq_ignore_ascii_case(b),
+            _ => false,
         }
     }
 
@@ -217,6 +248,13 @@ impl WgConfig {
         })
     }
 
+    /// WG 是否未配置（三关键字段皆空）——用于判断「默认黑洞、不依赖 SBN」时可跳过 WG 校验。
+    pub fn is_blank(&self) -> bool {
+        self.server.trim().is_empty()
+            && self.private_key.trim().is_empty()
+            && self.public_key.trim().is_empty()
+    }
+
     /// 校验 WG 配置（格式 + 防注入）。
     pub fn validate(&self) -> Result<()> {
         valid::ip(&self.server).context("WG server 必须是合法 IP（不能是域名）")?;
@@ -250,6 +288,19 @@ pub struct NetPolicySettings {
     /// 首版默认阻断 IPv6 公网（§0.8 / VP-12）。
     #[serde(default = "default_true")]
     pub block_ipv6: bool,
+    /// **默认出口**（未命中任何规则的兜底）：`Direct`（默认，观察模式，原样直连只看不管）、
+    /// `Wg`（全走海外）或 `Blackhole`（全阻断）。默认直连 → "observer-first，进页即可观察，不改流量"。
+    #[serde(default = "default_default_route")]
+    pub default_route: Route,
+    /// 主开关：是否在 `setup` 时**自动应用**策略（启动即生效）。默认 false——首次安装不擅自改全局
+    /// 防火墙；用户在 UI 显式启用后持久化为 true，此后每次启动自动恢复上次策略。
+    #[serde(default)]
+    pub enabled: bool,
+}
+
+/// 默认出口缺省值 = 直连·观察（observer-first：进页即可观察流量，不改路由，不依赖 SBN）。
+fn default_default_route() -> Route {
+    Route::Direct
 }
 
 fn default_dns_bootstrap() -> Vec<String> {
@@ -277,14 +328,34 @@ impl Default for NetPolicySettings {
             lan_ranges: default_lan_ranges(),
             killswitch_enabled: true,
             block_ipv6: true,
+            default_route: Route::Direct,
+            enabled: false,
         }
     }
 }
 
 impl NetPolicySettings {
     /// 校验设置（WG + DNS bootstrap + LAN 段，防注入 P1-3）。
+    ///
+    /// WG 与 SBN **解耦**：仅在「默认出口=海外」或「WG 已填」时强校验 WG；默认黑洞且 WG 留空时
+    /// 允许通过（纯黑洞，不依赖 SBN）。「某条规则指向海外但 WG 缺失」的跨表一致性在 apply/reload
+    /// 时由 `validate_combined` 再查（此处拿不到 rules）。
     pub fn validate(&self) -> Result<()> {
-        self.wg.validate()?;
+        if self.default_route == Route::Wg {
+            self.wg
+                .validate()
+                .context("默认出口=海外(SBN)，需有效的 WireGuard 配置")?;
+        } else if !self.wg.is_blank() {
+            self.wg.validate()?;
+        }
+        // IPv6 旁路防护：mihomo 配置 `ipv6:false` 时 TUN 不接管 v6 路由，v6 的封锁完全靠
+        // 防火墙 KS-IPv6Block（仅 block_ipv6=true 时创建）。若姿态是黑洞/海外却关掉 block_ipv6，
+        // IPv6 公网流量会绕过策略直接出物理网卡——黑洞/全VPN 对 v6 静默失效。禁止该组合。
+        if self.default_route != Route::Direct && !self.block_ipv6 {
+            anyhow::bail!(
+                "「阻断/海外」姿态必须开启「阻断 IPv6 公网」：引擎当前不接管 IPv6 流量，关闭后 IPv6 会绕过黑洞/隧道直接出物理网卡"
+            );
+        }
         if self.dns_bootstrap.is_empty() {
             anyhow::bail!("DNS bootstrap 不能为空（mihomo 上游解析需要）");
         }
@@ -308,8 +379,9 @@ pub struct RuleSet {
 }
 
 impl RuleSet {
-    /// 展开为 mihomo rules（程序组先展开成 PROCESS-* 规则，再追加普通规则，最后 MATCH,wg-out）。
-    pub fn to_mihomo_rules(&self) -> Vec<String> {
+    /// 展开为 mihomo rules（程序组先展开成 PROCESS-* 规则，再追加普通规则，最后
+    /// `MATCH,<default_route>`——默认出口由 `NetPolicySettings::default_route` 决定，黑洞或海外）。
+    pub fn to_mihomo_rules(&self, default_route: Route) -> Vec<String> {
         let mut lines = Vec::new();
         // 内网/保留地址直连——用显式 IP-CIDR 而非 GEOIP,private，避免依赖 geoip 数据库
         // （0.228 实测：fresh 机器若无 geoip.metadb，mihomo 会去 GitHub 下载，国内慢/失败）。
@@ -343,8 +415,8 @@ impl RuleSet {
         for r in &self.rules {
             lines.push(r.to_mihomo_line());
         }
-        // fail-closed 核心：未知流量走 WG
-        lines.push("  - MATCH,wg-out".to_string());
+        // fail-closed 核心：未命中任何规则的兜底 = 默认出口（默认黑洞，或全走海外）。
+        lines.push(format!("  - MATCH,{}", default_route.outbound()));
         lines
     }
 
@@ -413,11 +485,18 @@ pub fn read_generated_secret(workspace: &Path) -> Option<String> {
 }
 
 pub fn load_settings(workspace: &Path) -> NetPolicySettings {
+    try_load_settings(workspace).unwrap_or_default()
+}
+
+/// 严格加载设置：仅“文件尚不存在”视为首次使用并返回默认值；已有文件读取或解析失败必须上抛，
+/// 防止安全策略静默退化为默认直连。
+pub fn try_load_settings(workspace: &Path) -> Result<NetPolicySettings> {
     let p = settings_path(workspace);
-    std::fs::read_to_string(&p)
-        .ok()
-        .and_then(|s| serde_json::from_str(&s).ok())
-        .unwrap_or_default()
+    match std::fs::read_to_string(&p) {
+        Ok(s) => serde_json::from_str(&s).with_context(|| format!("parse {}", p.display())),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(NetPolicySettings::default()),
+        Err(e) => Err(e).with_context(|| format!("read {}", p.display())),
+    }
 }
 
 pub fn save_settings(workspace: &Path, s: &NetPolicySettings) -> Result<()> {
@@ -429,12 +508,14 @@ pub fn save_settings(workspace: &Path, s: &NetPolicySettings) -> Result<()> {
     std::fs::write(&p, json).with_context(|| format!("write {}", p.display()))
 }
 
-pub fn load_rules(workspace: &Path) -> RuleSet {
+/// 严格加载规则：仅“文件尚不存在”返回空规则；已有文件损坏时拒绝继续应用。
+pub fn try_load_rules(workspace: &Path) -> Result<RuleSet> {
     let p = rules_path(workspace);
-    std::fs::read_to_string(&p)
-        .ok()
-        .and_then(|s| serde_json::from_str(&s).ok())
-        .unwrap_or_default()
+    match std::fs::read_to_string(&p) {
+        Ok(s) => serde_json::from_str(&s).with_context(|| format!("parse {}", p.display())),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(RuleSet::default()),
+        Err(e) => Err(e).with_context(|| format!("read {}", p.display())),
+    }
 }
 
 pub fn save_rules(workspace: &Path, r: &RuleSet) -> Result<()> {
@@ -498,5 +579,66 @@ Endpoint = 1.2.3.4:51820
     fn parse_wg_quick_missing_required_fails() {
         let conf = "[Interface]\nAddress = 10.0.0.2\n";
         assert!(WgConfig::from_wg_quick(conf).is_err());
+    }
+
+    #[test]
+    fn same_target_matches_kind_and_value_ignores_route() {
+        let a = Rule::DomainSuffix {
+            value: "Example.com".into(),
+            route: Route::Direct,
+        };
+        let b = Rule::DomainSuffix {
+            value: "example.com".into(),
+            route: Route::Blackhole,
+        };
+        let c = Rule::IpCidr {
+            value: "example.com".into(),
+            route: Route::Direct,
+        };
+        assert!(a.same_target(&b)); // 同 kind+value（大小写不敏感），route 不同也算同目标
+        assert!(!a.same_target(&c)); // kind 不同即不同目标
+    }
+
+    #[test]
+    fn non_direct_route_requires_block_ipv6() {
+        let mut s = NetPolicySettings {
+            default_route: Route::Blackhole,
+            block_ipv6: false,
+            ..Default::default()
+        };
+        assert!(
+            s.validate().is_err(),
+            "黑洞姿态关 block_ipv6 应被拒绝（IPv6 旁路）"
+        );
+        s.block_ipv6 = true;
+        s.validate().expect("黑洞 + 阻断 IPv6 应通过");
+        s.default_route = Route::Direct;
+        s.block_ipv6 = false;
+        s.validate().expect("直连观察姿态允许关 block_ipv6");
+    }
+
+    #[test]
+    fn strict_load_rejects_corrupt_existing_files() {
+        let workspace =
+            std::env::temp_dir().join(format!("zero-net-policy-corrupt-{}", std::process::id()));
+        let dir = net_policy_dir(&workspace);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(settings_path(&workspace), "{").unwrap();
+        std::fs::write(rules_path(&workspace), "{").unwrap();
+
+        assert!(try_load_settings(&workspace).is_err());
+        assert!(try_load_rules(&workspace).is_err());
+
+        std::fs::remove_dir_all(workspace).unwrap();
+    }
+
+    #[test]
+    fn strict_load_defaults_only_when_files_are_absent() {
+        let workspace =
+            std::env::temp_dir().join(format!("zero-net-policy-absent-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&workspace);
+
+        assert!(!try_load_settings(&workspace).unwrap().enabled);
+        assert!(try_load_rules(&workspace).unwrap().rules.is_empty());
     }
 }

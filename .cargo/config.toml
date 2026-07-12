@@ -1,0 +1,19 @@
+[target.x86_64-pc-windows-msvc]
+rustflags = ["-C", "target-feature=+crt-static"]
+
+[target.aarch64-pc-windows-msvc]
+rustflags = ["-C", "target-feature=+crt-static"]
+
+# crates.io 走 rsproxy.cn 国内镜像（sparse 协议）：直连 crates.io 的 TLS 握手常被重置
+# （SSL routines::unexpected eof while reading），交叉编译容器与 Windows dev 构建共用此配置。
+[source.crates-io]
+replace-with = "rsproxy-sparse"
+
+[source.rsproxy-sparse]
+registry = "sparse+https://rsproxy.cn/index/"
+
+[registries.rsproxy]
+index = "https://rsproxy.cn/crates.io-index"
+
+[net]
+git-fetch-with-cli = true

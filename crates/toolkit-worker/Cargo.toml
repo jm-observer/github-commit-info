@@ -7,7 +7,7 @@ edition.workspace = true
 egress-pool = { path = "../egress-pool" }
 # 代发出站请求;cookies 特性用于 per-session 自动 cookie jar(连续登录态)。
 reqwest = { workspace = true, features = ["cookies"] }
-tokio = { workspace = true, features = ["rt-multi-thread", "macros", "time", "signal"] }
+tokio = { workspace = true, features = ["rt-multi-thread", "macros", "time", "signal", "net", "io-util"] }
 serde = { workspace = true }
 serde_json = { workspace = true }
 anyhow = { workspace = true }
@@ -20,6 +20,9 @@ custom-utils = { workspace = true, features = ["updater", "trace"] }
 if-addrs = "0.13"
 # 自动 id 派生(interface/local_address → MAC)与 scan 子命令的建议 id。
 mac_address = "1"
+# proxy 子命令:出站 TcpSocket 上应用 SO_BINDTODEVICE(仅 Linux,见 main.rs 的 cfg 处理)。
+# bind_device 只在 `all` feature 下暴露。
+socket2 = { version = "0.5", features = ["all"] }
 
 [[bin]]
 name = "toolkit-worker"

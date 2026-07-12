@@ -221,6 +221,11 @@ impl ResolvedEndpoint {
         self.join(&format!("/api/web/llm{path}"))
     }
 
+    /// 出口代理 worker 列表端点 `{g10_base}/api/web/egress/workers`。
+    pub fn egress_workers_endpoint(&self) -> Option<String> {
+        self.join("/api/web/egress/workers")
+    }
+
     /// english 后端的可达 base。english 与 toolkit-server **不在一个进程**：
     /// - LAN：english 自签 HTTPS 直连会被 Tauri plugin-http 拒，须经 toolkit-server 的
     ///   `/api/english` 反代（明文 http :8788）。

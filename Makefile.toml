@@ -32,3 +32,7 @@ args = ["tauri", "dev"]
 cwd = "crates/zero-desktop"
 command = "cargo"
 args = ["tauri", "dev", "--no-watch"]
+
+[tasks.worker]
+command = "cargo"
+args = ["build", "-p", "toolkit-worker", "--features", "custom-utils/prod"]

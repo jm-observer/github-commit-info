@@ -205,6 +205,24 @@ export interface StreamHandlers {
   /** 整句权威分(批量 finalizer)。 */
   onFinal?: (score: ShadowScore) => void
   onError?: (message: string) => void
+  /** 本次录音(16k WAV blob),供「听我的录音」回放。 */
+  onRecorded?: (wav: Blob) => void
+}
+
+/** 把流式采集的 16k s16le PCM 块拼成可播放的 WAV blob(给回放用)。 */
+export function pcmChunksToWav(chunks: ArrayBuffer[], sampleRate = 16000): Blob {
+  let total = 0
+  for (const c of chunks) total += c.byteLength
+  const buf = new ArrayBuffer(44 + total)
+  const dv = new DataView(buf)
+  const writeStr = (off: number, s: string) => { for (let i = 0; i < s.length; i++) dv.setUint8(off + i, s.charCodeAt(i)) }
+  writeStr(0, 'RIFF'); dv.setUint32(4, 36 + total, true); writeStr(8, 'WAVE')
+  writeStr(12, 'fmt '); dv.setUint32(16, 16, true); dv.setUint16(20, 1, true); dv.setUint16(22, 1, true)
+  dv.setUint32(24, sampleRate, true); dv.setUint32(28, sampleRate * 2, true); dv.setUint16(32, 2, true); dv.setUint16(34, 16, true)
+  writeStr(36, 'data'); dv.setUint32(40, total, true)
+  let off = 44
+  for (const c of chunks) { new Uint8Array(buf, off, c.byteLength).set(new Uint8Array(c)); off += c.byteLength }
+  return new Blob([buf], { type: 'audio/wav' })
 }
 
 export interface StreamHandle {
@@ -231,6 +249,7 @@ export async function streamScore(unit: ScoreUnit, handlers: StreamHandlers, max
 
   let capture: StreamCaptureHandle | null = null
   let ended = false
+  const recorded: ArrayBuffer[] = [] // 累积本次录音 PCM,供回放
   let resolveDone!: () => void
   const done = new Promise<void>((res) => { resolveDone = res })
   const ws = new WebSocket(url)
@@ -241,6 +260,7 @@ export async function streamScore(unit: ScoreUnit, handlers: StreamHandlers, max
     ended = true
     try { capture?.stop() } catch { /* ignore */ }
     try { if (ws.readyState === WebSocket.OPEN) ws.close() } catch { /* ignore */ }
+    if (recorded.length > 0) { try { handlers.onRecorded?.(pcmChunksToWav(recorded)) } catch { /* ignore */ } }
     resolveDone()
   }
 
@@ -253,7 +273,10 @@ export async function streamScore(unit: ScoreUnit, handlers: StreamHandlers, max
     capture = startStreamingCapture({
       mode: 'auto',
       maxMs,
-      onChunk: (pcm) => { try { if (ws.readyState === WebSocket.OPEN) ws.send(pcm) } catch { /* ignore */ } }
+      onChunk: (pcm) => {
+        recorded.push(pcm.slice(0)) // 留一份副本用于回放(ws.send 不消费 buffer,但 slice 防意外复用)
+        try { if (ws.readyState === WebSocket.OPEN) ws.send(pcm) } catch { /* ignore */ }
+      }
     })
     // 采集自然结束(VAD/超时)→ 发 end 让服务端 finalize。
     void capture.done.then(({ spoke }) => {

@@ -30,7 +30,8 @@
           "$APPDATA/**",
           "$APPLOCALDATA/**",
           "$LOCALDATA/zero-desktop/**",
-          "$DATA/zero-desktop/**"
+          "$DATA/zero-desktop/**",
+          "$HOME/.config/zero-desktop/**"
         ]
       }
     }

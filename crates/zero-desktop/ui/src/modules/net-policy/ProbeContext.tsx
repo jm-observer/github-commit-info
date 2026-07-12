@@ -4,6 +4,8 @@ import {
   type Status,
   type VerifyReport,
   type ConnectionsSnapshot,
+  type BlockedEntry,
+  type DomainAssoc,
 } from './api/tauri-client'
 
 /**
@@ -32,6 +34,10 @@ const EMPTY_CONNS: ConnectionsSnapshot = {
 interface ProbeContextValue {
   status: Status | null
   conns: ConnectionsSnapshot
+  /** Phase 4：被阻断尝试 feed（3s 轮询）。 */
+  blocked: BlockedEntry[]
+  /** Phase 4：域名↔IP/进程 关联（3s 轮询）。 */
+  dnsMap: DomainAssoc[]
   verify: VerifyReport | null
   exitIp: string | null
   exitIpAt: string | null
@@ -53,6 +59,8 @@ const NetPolicyProbeContext = createContext<ProbeContextValue | null>(null)
 export function NetPolicyProbeProvider({ children }: { children: React.ReactNode }) {
   const [status, setStatus] = useState<Status | null>(null)
   const [conns, setConns] = useState<ConnectionsSnapshot>(EMPTY_CONNS)
+  const [blocked, setBlocked] = useState<BlockedEntry[]>([])
+  const [dnsMap, setDnsMap] = useState<DomainAssoc[]>([])
   const [verify, setVerifyState] = useState<VerifyReport | null>(null)
   const [exitIp, setExitIpState] = useState<string | null>(null)
   const [exitIpAt, setExitIpAt] = useState<string | null>(null)
@@ -82,10 +90,16 @@ export function NetPolicyProbeProvider({ children }: { children: React.ReactNode
       .catch(() => {})
   }, [])
 
+  const loadObserve = useCallback(() => {
+    void NetPolicyAPI.blocked().then(setBlocked).catch(() => {})
+    void NetPolicyAPI.dnsMap().then(setDnsMap).catch(() => {})
+  }, [])
+
   const refreshFast = useCallback(() => {
     void loadStatus()
     void loadConns()
-  }, [loadStatus, loadConns])
+    loadObserve()
+  }, [loadStatus, loadConns, loadObserve])
 
   const handleVerifyResult = useCallback((rep: VerifyReport) => {
     setVerifyState(rep)
@@ -141,6 +155,8 @@ export function NetPolicyProbeProvider({ children }: { children: React.ReactNode
   const value: ProbeContextValue = {
     status,
     conns,
+    blocked,
+    dnsMap,
     verify,
     exitIp,
     exitIpAt,

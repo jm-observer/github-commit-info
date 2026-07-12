@@ -13,12 +13,19 @@ use anyhow::{bail, Context, Result};
 const FIREWALL_POLICY_KEY: &str =
     r"SYSTEM\CurrentControlSet\Services\SharedAccess\Parameters\FirewallPolicy";
 
-/// 在 Windows 上执行一段 PowerShell 脚本，返回 stdout（UTF-8）。
+/// run_ps 兜底超时：脚本自身最长的是 graceful_stop 的 14×500ms 轮询（~7s+），留足余量。
+/// 防火墙 cmdlet 偶发挂死时，无超时会让 `cmd.output()` 无限阻塞——spawn_blocking 线程
+/// 泄漏、UI 永久转圈。
+#[cfg(windows)]
+const RUN_PS_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(120);
+
+/// 在 Windows 上执行一段 PowerShell 脚本，返回 stdout（UTF-8）。超时（120s）杀进程并报错。
 /// 非 Windows 平台返回错误（net-policy 仅承诺 Windows，见设计 §14.0）。
 #[cfg(windows)]
 pub fn run_ps(script: &str) -> Result<String> {
     use base64::Engine;
     use std::process::{Command, Stdio};
+    use std::time::Instant;
 
     let wrapped = format!(
         "[Console]::OutputEncoding=[Text.Encoding]::UTF8\n$ErrorActionPreference='Stop'\n{script}"
@@ -43,7 +50,26 @@ pub fn run_ps(script: &str) -> Result<String> {
     .stdout(Stdio::piped())
     .stderr(Stdio::piped());
     crate::shared::proc::hide_console(&mut cmd); // 不弹控制台窗口
-    let out = cmd.output().context("run powershell")?;
+    let mut child = cmd.spawn().context("spawn powershell")?;
+    // 轮询等待 + 超时杀。脚本输出都很小（<64KB 管道缓冲），不读管道不会把子进程堵死。
+    let deadline = Instant::now() + RUN_PS_TIMEOUT;
+    loop {
+        match child.try_wait().context("wait powershell")? {
+            Some(_) => break,
+            None if Instant::now() >= deadline => {
+                let _ = child.kill();
+                let _ = child.wait();
+                bail!(
+                    "powershell 执行超时（{}s），已强制结束",
+                    RUN_PS_TIMEOUT.as_secs()
+                );
+            }
+            None => std::thread::sleep(std::time::Duration::from_millis(50)),
+        }
+    }
+    let out = child
+        .wait_with_output()
+        .context("collect powershell output")?;
     if !out.status.success() {
         let stderr = String::from_utf8_lossy(&out.stderr);
         bail!("powershell failed ({}): {}", out.status, stderr.trim());
@@ -59,6 +85,29 @@ pub fn run_ps(_script: &str) -> Result<String> {
 /// 当前是否为 Windows（命令层用来给出明确错误而非静默失败）。
 pub fn is_windows() -> bool {
     cfg!(windows)
+}
+
+/// 当前进程是否以管理员（提权）身份运行。net-policy 改全局防火墙 + 建 TUN 网卡都需要管理员，
+/// 据此在 apply 前给出可读前置错误（而非中途撞 `New-NetFirewallRule: Access is denied` 的 CLIXML）。
+/// 失败/非 Windows 视为未提权（保守）。
+///
+/// **进程生命周期内提权状态不变** → `OnceLock` 缓存首次探测结果。原实现每次冷启动一个
+/// PowerShell（~0.3–1s），且在 `compute_status` 的 5s 轮询热路径上——纯浪费。
+#[cfg(windows)]
+pub fn is_elevated() -> bool {
+    static ELEVATED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ELEVATED.get_or_init(|| {
+        run_ps(
+            "if(([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltinRole]::Administrator)){'yes'}else{'no'}",
+        )
+        .map(|s| s.trim() == "yes")
+        .unwrap_or(false)
+    })
+}
+
+#[cfg(not(windows))]
+pub fn is_elevated() -> bool {
+    false
 }
 
 /// 原生读取网卡友好名是否处于 Up；用于状态轮询热路径，避免 `Get-NetAdapter` 冷启动 PowerShell。

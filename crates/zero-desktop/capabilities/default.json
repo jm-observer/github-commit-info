@@ -20,7 +20,8 @@
         { "path": "$APPLOCALDATA/**" },
         { "path": "$APPDATA/**" },
         { "path": "$LOCALDATA/zero-desktop/**" },
-        { "path": "$DATA/zero-desktop/**" }
+        { "path": "$DATA/zero-desktop/**" },
+        { "path": "$HOME/.config/zero-desktop/**" }
       ]
     },
     "http:default",

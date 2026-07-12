@@ -130,6 +130,20 @@ enum Command {
         #[arg(long)]
         token: Option<String>,
     },
+    /// 启动 HTTP 转发代理:浏览器/App 把代理指向它,流量就从本 worker 的出口发出
+    /// (整体换 IP 场景,如 THS headless Chrome、手机 App)。支持 `CONNECT`(HTTPS 隧道)
+    /// 与明文 HTTP(absolute-form)两种请求。
+    Proxy {
+        /// 监听地址
+        #[arg(long, env = "EGRESS_PROXY_LISTEN", default_value = "127.0.0.1:8899")]
+        listen: String,
+        /// 出站连接绑定的网卡名(`SO_BINDTODEVICE`,仅 Linux)。非 Linux 传了此项会打印警告并忽略。
+        #[arg(long, env = "EGRESS_INTERFACE")]
+        interface: Option<String>,
+        /// 出站连接绑定的本地源 IP(跨平台;与 --interface 可并存,--interface 优先级更高)。
+        #[arg(long, env = "EGRESS_LOCAL_ADDRESS")]
+        local_address: Option<IpAddr>,
+    },
 }
 
 /// 启用 trace-hub 全链路追踪——仅当设置了环境变量 `TRACE_HUB_ENDPOINT` 时生效;
@@ -722,6 +736,241 @@ async fn run_scan(controllers: Vec<String>, token: Option<String>) -> Result<()>
     Ok(())
 }
 
+/// 在出站 `TcpSocket` 上按平台绑定网卡(`SO_BINDTODEVICE`,仅 Linux)。非 Linux 分支静默跳过
+/// (调用前应已在别处打印过一次性警告,见 `run_proxy`)。
+#[cfg(target_os = "linux")]
+fn bind_device(socket: &tokio::net::TcpSocket, interface: Option<&str>) -> Result<()> {
+    if let Some(name) = interface {
+        let sref = socket2::SockRef::from(socket);
+        sref.bind_device(Some(name.as_bytes()))
+            .with_context(|| format!("bind_device({name}) 失败"))?;
+    }
+    Ok(())
+}
+
+#[cfg(not(target_os = "linux"))]
+fn bind_device(_socket: &tokio::net::TcpSocket, _interface: Option<&str>) -> Result<()> {
+    Ok(())
+}
+
+/// 建一条出口绑定的出站 TCP 连接:解析 `host:port` → 按目标地址族建 socket → 按平台绑
+/// 网卡(仅 Linux)/绑源 IP(与目标地址族一致时)→ connect。
+async fn dial_upstream(
+    host: &str,
+    port: u16,
+    interface: Option<&str>,
+    local_address: Option<IpAddr>,
+) -> Result<tokio::net::TcpStream> {
+    let target_addr = tokio::net::lookup_host((host, port))
+        .await
+        .with_context(|| format!("解析目标地址失败: {host}:{port}"))?
+        .next()
+        .with_context(|| format!("目标地址无解析结果: {host}:{port}"))?;
+
+    let socket = if target_addr.is_ipv6() {
+        tokio::net::TcpSocket::new_v6()
+    } else {
+        tokio::net::TcpSocket::new_v4()
+    }
+    .context("建出站 socket 失败")?;
+
+    bind_device(&socket, interface)?;
+
+    // 仅当与目标地址族一致时才绑本地源 IP(v4 绑 v4 / v6 绑 v6),否则跳过避免报错。
+    if let Some(ip) = local_address {
+        let same_family = ip.is_ipv4() == target_addr.is_ipv4();
+        if same_family {
+            socket
+                .bind(std::net::SocketAddr::new(ip, 0))
+                .with_context(|| format!("绑定本地源 IP {ip} 失败"))?;
+        }
+    }
+
+    socket
+        .connect(target_addr)
+        .await
+        .with_context(|| format!("连接目标失败: {target_addr}"))
+}
+
+/// 从累积的字节缓冲里找出 `\r\n\r\n`(请求行 + headers 结束标记)。
+fn find_header_end(buf: &[u8]) -> Option<usize> {
+    buf.windows(4).position(|w| w == b"\r\n\r\n").map(|i| i + 4)
+}
+
+/// 从请求行 + headers 文本里解析 `Host:` 头(明文 HTTP 分支,absolute-form 缺 host 时兜底用)。
+fn parse_host_header(head: &str) -> Option<(String, u16)> {
+    for line in head.lines().skip(1) {
+        if let Some(rest) = line
+            .strip_prefix("Host:")
+            .or_else(|| line.strip_prefix("host:"))
+        {
+            let hostport = rest.trim();
+            return split_host_port(hostport, 80);
+        }
+    }
+    None
+}
+
+/// 拆分 `host:port` / `[v6]:port` / 纯 `host`(用 `default_port`)为 `(host, port)`。
+fn split_host_port(s: &str, default_port: u16) -> Option<(String, u16)> {
+    let s = s.trim();
+    if let Some(rest) = s.strip_prefix('[') {
+        // [ipv6]:port 或 [ipv6]
+        let end = rest.find(']')?;
+        let host = rest[..end].to_string();
+        let after = &rest[end + 1..];
+        let port = after
+            .strip_prefix(':')
+            .and_then(|p| p.parse::<u16>().ok())
+            .unwrap_or(default_port);
+        return Some((host, port));
+    }
+    match s.rsplit_once(':') {
+        Some((host, port_str)) => match port_str.parse::<u16>() {
+            Ok(port) => Some((host.to_string(), port)),
+            Err(_) => Some((s.to_string(), default_port)), // 冒号可能是 ipv6 裸地址的一部分,当无端口处理
+        },
+        None => Some((s.to_string(), default_port)),
+    }
+}
+
+/// 处理单条客户端连接:读首段请求头,按 `CONNECT`(HTTPS 隧道)或明文 HTTP(absolute-form)
+/// 分流,建出口绑定的出站连接后双向转发。任何错误都干净返回,不 panic。
+async fn handle_conn(
+    mut client: tokio::net::TcpStream,
+    interface: Option<String>,
+    local_address: Option<IpAddr>,
+) -> Result<()> {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    // 读到 \r\n\r\n 为止(请求行 + headers),留意可能一次 read 读到多个字节块。
+    let mut buf: Vec<u8> = Vec::with_capacity(4096);
+    let header_end = loop {
+        let mut chunk = [0u8; 4096];
+        let n = client.read(&mut chunk).await.context("读客户端请求失败")?;
+        if n == 0 {
+            anyhow::bail!("客户端连接提前关闭");
+        }
+        buf.extend_from_slice(&chunk[..n]);
+        if let Some(end) = find_header_end(&buf) {
+            break end;
+        }
+        if buf.len() > 64 * 1024 {
+            anyhow::bail!("请求头过大,拒绝处理");
+        }
+    };
+
+    let head = String::from_utf8_lossy(&buf[..header_end]).to_string();
+    let mut lines = head.split("\r\n");
+    let request_line = lines.next().unwrap_or_default().to_string();
+    let mut parts = request_line.split_whitespace();
+    let method = parts.next().unwrap_or_default().to_string();
+    let target = parts.next().unwrap_or_default().to_string();
+
+    if method.eq_ignore_ascii_case("CONNECT") {
+        // --- HTTPS 隧道:target 形如 host:port ---
+        let (host, port) = split_host_port(&target, 443)
+            .with_context(|| format!("CONNECT 目标解析失败: {target}"))?;
+        let mut upstream = dial_upstream(&host, port, interface.as_deref(), local_address)
+            .await
+            .with_context(|| format!("CONNECT 建连失败: {host}:{port}"))?;
+        client
+            .write_all(b"HTTP/1.1 200 Connection Established\r\n\r\n")
+            .await
+            .context("回写 200 失败")?;
+        tokio::io::copy_bidirectional(&mut client, &mut upstream)
+            .await
+            .context("隧道双向转发失败")?;
+        Ok(())
+    } else {
+        // --- 明文 HTTP(absolute-form,尽力而为):从绝对 URI 或 Host 头取 host ---
+        let (host, port, origin_path) = if let Some(rest) = target
+            .strip_prefix("http://")
+            .or_else(|| target.strip_prefix("HTTP://"))
+        {
+            let (authority, path) = match rest.find('/') {
+                Some(i) => (&rest[..i], &rest[i..]),
+                None => (rest, "/"),
+            };
+            let (host, port) = split_host_port(authority, 80)
+                .with_context(|| format!("absolute-form host 解析失败: {authority}"))?;
+            (host, port, path.to_string())
+        } else {
+            let (host, port) = parse_host_header(&head)
+                .context("明文 HTTP 请求缺少可解析的 host(既无绝对 URI 也无 Host 头)")?;
+            (host, port, target.clone())
+        };
+
+        let mut upstream = dial_upstream(&host, port, interface.as_deref(), local_address)
+            .await
+            .with_context(|| format!("明文 HTTP 建连失败: {host}:{port}"))?;
+
+        // 把请求行改写成 origin-form,其余 headers 原样透传;已读到的 body 残余(header_end 之后)
+        // 一并转发。
+        let http_version = request_line
+            .split_whitespace()
+            .next_back()
+            .unwrap_or("HTTP/1.1");
+        let rewritten_line = format!("{method} {origin_path} {http_version}\r\n");
+        let headers_rest = head.splitn(2, "\r\n").nth(1).unwrap_or("").to_string();
+
+        upstream
+            .write_all(rewritten_line.as_bytes())
+            .await
+            .context("写改写后的请求行失败")?;
+        upstream
+            .write_all(headers_rest.as_bytes())
+            .await
+            .context("写 headers 失败")?;
+        if buf.len() > header_end {
+            upstream
+                .write_all(&buf[header_end..])
+                .await
+                .context("写 body 残余失败")?;
+        }
+
+        tokio::io::copy_bidirectional(&mut client, &mut upstream)
+            .await
+            .context("明文转发失败")?;
+        Ok(())
+    }
+}
+
+/// `proxy` 子命令:监听 TCP,逐连接 spawn task 处理(CONNECT 隧道 / 明文 HTTP 尽力而为),
+/// 出站流量按 `--interface`(仅 Linux)/`--local-address` 绑定出口。
+async fn run_proxy(
+    listen: String,
+    interface: Option<String>,
+    local_address: Option<IpAddr>,
+) -> Result<()> {
+    if interface.is_some() && cfg!(not(target_os = "linux")) {
+        log::warn!("接口绑定仅 Linux 支持,已忽略 --interface");
+    }
+
+    let listener = tokio::net::TcpListener::bind(&listen)
+        .await
+        .with_context(|| format!("监听 {listen} 失败"))?;
+    log::info!(
+        "proxy listening on {listen} interface={interface:?} local_address={local_address:?}"
+    );
+
+    loop {
+        let (client, peer) = match listener.accept().await {
+            Ok(v) => v,
+            Err(e) => {
+                log::warn!("accept failed: {e}");
+                continue;
+            }
+        };
+        let interface = interface.clone();
+        tokio::spawn(async move {
+            if let Err(e) = handle_conn(client, interface, local_address).await {
+                log::warn!("connection {peer} error: {e:#}");
+            }
+        });
+    }
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     let _ =
@@ -797,5 +1046,10 @@ async fn main() -> Result<()> {
         }
         Command::List => list_egress(),
         Command::Scan { controller, token } => run_scan(controller, token).await,
+        Command::Proxy {
+            listen,
+            interface,
+            local_address,
+        } => run_proxy(listen, interface, local_address).await,
     }
 }
