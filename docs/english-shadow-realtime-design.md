@@ -220,8 +220,10 @@ zero-desktop(webview)        toolkit-server                 GB10 流式评测(:8
     `ScoreResult`(stream.rs `finalize_or_passthrough`),桌面端零分叉。
   - **待**:真机验证(桌面 mic + 已配 GOP_BASE_URL 的 toolkit-server,即 2b/3 一起 redeploy 后端到端跑)。
 - **Phase 4 — 混合 finalize + 验收**
-  7. 整句结束触发批量 `/assess` 出权威分覆盖 + 落库;补 `docs/runbook-shadow-realtime-e2e.md`
-     (真录音边读边点亮 → 故意错读实时高亮 → 整句权威分落定)。
+  7. 整句结束触发批量 finalize 出权威分覆盖 + 落库(已在 2a/2b 实现:`streaming.py finish` + 中继
+     `finalize_or_passthrough`)。**验收 runbook 已出** → [runbook-shadow-realtime-e2e.md](runbook-shadow-realtime-e2e.md)
+     (三层:直连 :8098 → toolkit 中继 + 落库/降级校验 → 桌面边读边评;含真人音频/标定/live 抖动收口项)。
+     **待**:按 runbook 真机执行(redeploy 后)。
 
 ## 11. 与批量 GOP / v1 的关系(一句话)
 

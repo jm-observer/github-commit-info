@@ -225,6 +225,9 @@ hybrid:
   (先过 FunASR `:9101 /embed` 比对注册声纹,不匹配则拒评/标记),与发音评测解耦、按需开启。
   本期(v2)**不做**,列为开放项;真要做时按 §2 决策 7 落地。
 - **范围蔓延**:本期只做分段音准;语调/重音/流利度(超音段)明确留 v3,避免一次吃太多。
+- **评分可解释 + 对齐明细 UI**:把评分细则透明化 + 新增「对齐可靠性/uncertain」(真机发现长词
+  中段会被强制对齐误杀,需把"没对齐上"的音素从 bad 改判 uncertain,不冤枉用户)→ 单列设计
+  [english-shadow-scoring-ui-design.md](english-shadow-scoring-ui-design.md)。
 - **实时化(流式)**:本稿是**批量**评测(读完整句出分)。「边读边评」的流式版单列设计 →
   [english-shadow-realtime-design.md](english-shadow-realtime-design.md);本批量稿是其**地基 + finalizer +
   校准 oracle**(流式途中出临时分,整句结束仍调本批量 `/assess` 出权威分落库)。
@@ -239,10 +242,18 @@ hybrid:
   2. ✅ `:8098 /assess` 微服务部署在 GB10(`compose.assess.yaml` + 离线 `compose.override.yaml`),
      `restart:unless-stopped`;契约文档 `streaming-speech/docs/pronunciation-assess-api.md`。
      单测 `test_gop.py` 10 + `test_app.py` 7 全绿。
-  - **部署中踩平 3 个真实集成坑**:① 默认模型 vocab 是 **IPA 非 ARPAbet** → gop.py 多候选 vocab 桥;
-    ② nltk≥3.9 把 tagger 改名 `_eng` → Dockerfile 双名下载 + 宿主补挂;③ torchaudio 2.11 弃用
-    `load`(依赖 torchcodec)→ 改 **ffmpeg 子进程**解码。④ CTC 后验尖峰 → GOP 由「整段均值」改「峰值帧」
-    (否则每音素全判 0)。GB10 容器无外网 → 模型/语料宿主预下离线挂载。
+  - **部署中踩平的集成坑**:① 模型 vocab 形态各异 → gop.py 多候选 vocab 桥(`_resolve_token_ids`,
+    同音素多写法取后验最大,含 `AH→ax` schwa);② nltk≥3.9 tagger 改名 `_eng` → Dockerfile 双名下载;
+    ③ torchaudio 2.11 弃用 `load` → 改 **ffmpeg 子进程**解码;④ CTC 尖峰 → GOP 取**峰值帧**。
+    GB10 容器无外网 → 模型/语料宿主预下离线挂载;**文件 bind mount 换 inode 需 `docker restart`**。
+  - **真机调优(2026-06-26)**:
+    - 🔄 **换 L2 模型**:`vitouphy/...timit-phoneme`(连读长词中段被对齐整段误杀)→
+      **`slplab/wav2vec2-large-robust-L2-english-phoneme-recognition`**(专训非母语英语,带 `*_err` 误读
+      标记)。delicious 的 L 0.04→0.86、schwa "a" 0.01→0.92,th→s 真错读仍抓。
+    - 🔄 **重标定** `a=1.2,b=−2.0`(L2 raw 分布);**放宽通过** `threshold 0.6 + bad≤1`;
+      **始终返回 phones**(整句模式也带音素明细,供 UI 表);**对齐可靠性 uncertain** + **`_err` 细分**
+      (发音不准 vs 替换)。详见 [english-shadow-scoring-ui-design.md](english-shadow-scoring-ui-design.md)。
+    - ⏳ 仍待:speechocean762 正式标定。
 - **Phase B — toolkit-server 对接(本仓)**
   3. shadow 内核抽象 `ShadowScorer`;新增 `SHADOW_SCORER` + `GOP_BASE_URL`;
      先接 mock `/assess` 打通协议测试,再接真实 GOP 服务。

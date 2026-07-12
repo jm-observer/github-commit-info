@@ -67,7 +67,8 @@
   - **数值全链路 `0~1`**(对齐 v1),仅 UI `×100` 展示(GOP §2 决策 5)。
   - **发音三档另起新字段 `pron_status`(ok/warn/bad),不动既有 `status`(ok/wrong/missing)**——
     后者是严格联合类型,重载会破前端(GOP §5)。
-  - `passed = sentence_score >= threshold && bad_phone_count == 0`(GOP §2 决策 6)。
+  - `passed = sentence_score >= threshold && bad_phone_count <= MAX_BAD_PHONES`(放宽,默认阈值 0.6 + bad≤1;
+    早期为"零 bad"已放宽,见 scoring-ui §2.4)。
   - **`GOP_BASE_URL` 未配 → 一定回退 v1;配了不可达 → 502**(GOP §4)。
   - **`shadow_attempt` 加 `detail_json` 走幂等 `ALTER TABLE ADD COLUMN`,不 bump `SCHEMA_VERSION`**
     (遵循 schema.rs 惯例,GOP §5)。
@@ -96,6 +97,67 @@
 - **验收**:能给出音素/单词/句子三级发音分,并指出具体错读音素(如「th 发成 s」),而不仅是词对错。
 
 ---
+
+## 标定实测发现(2026-07-02,GB10 真机,实验:标准 TTS 音频直送 `:8098 /assess`)
+
+**背景**:用户反馈「简单短语总过不去,怀疑是没用耳麦还是发音问题」。用"标准音频送评"实验定位
+(短语 `My shoes hurt`,通过线 = 句分 ≥0.6 且 bad ≤1):
+
+| 音频 | 句分 | bad | 通过 |
+|---|---|---|---|
+| 母语男声 en_m_3752 | 0.644 | 1(句尾 T=0.07) | 擦线过 |
+| 母语女声 en_f_5895 | 0.631 | 1(句尾 T=0.04) | 擦线过 |
+| 中文音色 edge_yunxi | 0.535 | 2(ER、T) | 不过 |
+
+**结论:短语过不去的主因是评分体系偏严,不是用户发音、也不主要是麦克风**。
+
+**✅ 已修(2026-07-02,规则层四条豁免 + 回归护栏;真标定仍欠,见下)**——修正全在
+streaming-speech `server/pronunciation-assess/gop.py`(GB10 已部署生效),豁免只降为
+`uncertain`(存疑不给分),清擦音(TH/S/F)与实义词重读元音**不豁免**,`I sink so` 探针
+确认 th→s 真错读仍判 bad:
+
+- [x] **词尾塞音/浊阻音容忍**(`final_stop_leniency`):词尾 P/B/T/D/K/G 不除阻、
+  Z/V/DH/ZH/JH 清化同化("is this" 的 /z/)都是标准语流 → bad 降 uncertain。
+- [x] **弱读元音容忍**(`reduced_vowel_leniency`):非重读元音(ARPAbet 重音 0)+ 闭类虚词
+  (what/it/is/a/the…,CMUdict 给虚词标 IH1/AH1 故不能只看重音标记)的元音弱化为 ə 是标准
+  语流 → bad 降 uncertain。实测母语声的 What/AH、it/IH、is/IH 全是这类冤案。
+- [x] **峰偏移进 uncertain**(`peak_elsewhere`):bad 音素的 canonical 在录音别处有清晰峰
+  (≥-1.5)且偏出对齐段 >0.25s(慢读/停顿挤错对齐窗,实测 shoes 的 UW/Z 形态)→ 降 uncertain。
+- [x] **bad 配额按句长自适应**(toolkit `shadow::max_bad_phones`):固定 ≤1 → `max(1, 音素数/10)`
+  (短语仍 1,30 音素长句 3)。**注:toolkit-server 尚未 redeploy,此条待下次部署生效**;
+  服务侧三条豁免已生效(它们是主修)。
+- **回归护栏**:`regression_standard.py`(GB10 `~/server/pronunciation-assess/` 直跑)——
+  母语男女声 × 6 短语必须过线且余量 ≥0.10(带 TTS 坏音频重试:CosyVoice 偶发同句从 0.9 掉 0.05)
+  + `I sink so` 错读探针必须仍抓到 TH。**修判分规则/换标定后必跑**。
+  修后母语分:`My shoes hurt` 0.63→0.88~0.92,全部短语 0.73~0.92。
+
+**✅ 第二轮:防"过松"收紧(2026-07-02 同日,用户反馈"通过率高得发慌"→ 加反向探针实测)**:
+
+- **反向探针入回归**:5 个单错读(th→s / shoes→shows / ship→sheep / pen→pan / rock→lock,全在
+  实义词重读音节)必须「目标音素判 bad **且整句不通过**」+ 2 个多错读整句必须不通过。
+- [x] **竞争惩罚打分**(标准 GOP 后验比思想):段内最强竞争 token(排除 blank/canonical/相邻音素)
+  强过 canonical 时按差距扣分;canonical 自己最强则零惩罚(正确发音打分不变,母语零影响)。
+  修 ship/sheep 这类近邻音替换只看 canonical 绝对后验漏判的问题。
+- [x] **峰偏移豁免加"同音素认领"护栏**(`_twin_claims_peak`):全局峰落在同一音素其他对齐段内
+  (±50ms)不得豁免——否则 "It is a sheep" 的 ship/IH 借 It/is 的 IH 峰混过(实测漏判案例,
+  第一轮豁免规则注释里预言的风险真实发生)。
+- [x] **bad 配额收紧**:`max(1, n/10)` → `n/10`(**短句 <10 音素零容忍**)。第一轮放 ≥1 是因真人
+  总有 1 个被冤的音素;豁免规则吸收冤案后母语回归 18/18 bad=0,配额留 1 只会放走单错读短句。
+- [x] 指示代词 this/that/these/those 入虚词表(母语男声 "What is this" 的 this/IH 连读吞音被冤)。
+- **修后判别力画像**:母语 12/12 过(0.81~0.92);单错读短句 5/5 不过;多错读 2/2 不过;
+  中文口音声开始被抓真口音信号(this 的 ð、so 的 oʊ)。
+- **顺手修的部署坑**:pronunciation-assess 的 Dockerfile 此前没 COPY `streaming.py`/
+  `test_stream_client.py`(Phase 2 流式代码其实从没进过镜像);GB10 重建必须
+  `docker compose -f compose.assess.yaml -f compose.override.yaml`(override 挂离线模型
+  `/model` + 源码直挂,漏了会退回在线拉模型并丢流式模块)。
+
+仍欠(转入真标定项):
+- **speechocean762 真标定**:上述是规则层豁免;分数映射 a/b 与 ok/warn 分档线仍是拍脑袋默认,
+  需真 L2 语料重拟(标定后把 `regression_standard.py` 升级为正式验证门槛)。
+- **麦克风的定位**:内置麦(远场混响/底噪)对 GOP 有真实影响,但规则修后母语余量已 ≥0.13,
+  不再是压垮稻草;用户实录复测后再评估耳麦提示/检测(TODO-2 已有戴耳机检测建议)。
+- **用户真实发音信号**(与系统问题区分开):卷舌元音 ER(/ɝ/)偏弱(45)是可信的、值得单练的点
+  (中式口音经典难点);其余"错读"多为上述系统问题所致。修后请用户实录复测同一批短语对照。
 
 ## 优先级建议
 

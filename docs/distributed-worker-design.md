@@ -1,6 +1,241 @@
-# 分布式 Worker 设计
+# 分布式爬虫底座设计（公共库 · Worker · 出口 IP 池）
 
 > 把爬虫类长任务（抖音 list_works / detail / download / ASR 上传等）从单机 `toolkit-server` 中卸载到 N 台**独立出口 IP** 的 worker 节点，规避 IP 维度的 shadow-throttle，并提升整体吞吐。本文档定义节点角色、通信协议、调度模型、自更新通道与运维边界。
+
+> **统一框架（本轮合并）**：worker 与「出口 IP 池」不是两套系统，是**同一支 fleet 的两个面**；
+> 最终对外形态是一个**公共爬虫底座库**，爬虫依赖它即同时得到「出口托管 + 任务分发」。下面《统一模型》
+> 先讲库的对外形状与调度统一语义，§1 起的协议 / schema / 分阶段为其背后的实现契约，全部沿用。
+> 本轮**不含 zero-desktop**（桌面驾驶舱角色搁置；本文档只描述库 + fleet 本体）。
+
+---
+
+## ⚑ 轻模型（借出口）= 当前落地路线（P0 已实现）
+
+> **本文档 §0–§14 描述的是「分发算力」的重模型**（jobs 表 / aggregator / frontier / RunOutcome
+> 状态机）。经复盘,真实痛点只是 **IP 维度反风控**,不是算力吞吐——所以实际落地收敛到一个更轻的
+> **「借出口」模型**:中心进程里的爬取程序照常跑,只把**出站 HTTP 请求**交给远程 worker 从其 IP 发出。
+> **重模型整块暂缓**,仅当真出现算力瓶颈(重解析 / 跨节点搬大文件 / 需数千路真并行)时才启用。
+
+**对外只有两个原语**(`egress_pool::Pool`,进程内句柄):
+
+- `pool.fetch(method,url,headers,body)` —— **匿名短租**:随手挑一个在线 worker/IP 代发,IP 轮换白送。
+- `pool.session(typ, account)` → `Session` —— **钉死长租**:句柄内所有 `fetch` 走同一台 worker(同一
+  出口 IP + 连续 cookie)。`account=Some` 为具名身份,跨作用域按 `(typ,account)` **复用同一 worker +
+  cookie**;`account=None` 为临时钉定,作用域结束即释放。三者可**混用**(同一程序既 `pool.fetch` 又用
+  `session`),因为匿名池与 session 句柄并存、逐请求选择。
+
+**已锁定语义**:
+- **共用策略:同类型独占、类型间共用**。一台 worker 上同一 `typ`(=同站点/账号类)至多一个活跃
+  session(避免同站多账号共 IP 被关联),不同 `typ` 可同住;匿名 `fetch` 不占用、随便共用。
+- **cookie 复用 = 必须回到同一 IP**(cookie↔IP 绑定对)。程序只报 `account key`,由中心维护
+  `(typ,account) → worker/IP` 绑定并复用其 cookie jar;程序不记 worker id。绑定的 worker 掉线 → 解绑,
+  换新 IP 重登(老 cookie 从新 IP 也用不了)。
+- **数据面走长轮询拉取**(NAT 友好):worker 主动连中心,请求经内存队列交给它,发完回传;**请求不落库**
+  (dumb pipe),不建 jobs 表。
+
+### 两张出口面:代发执行器 vs 转发代理(按爬虫是否用浏览器分)
+
+「借出口」不是只有一种形态。取决于**消费方怎么发请求**,worker 要暴露两张不同的出口面:
+
+| 出口面 | 适配的爬虫 | worker 干什么 | 消费方怎么接 |
+|---|---|---|---|
+| **代发执行器**(P0 已实现) | **reqwest 类**(自己拼 HTTP 请求,如抖音) | 收「method/url/headers/body」→ 本机 reqwest 代发 → 回传 | `pool.fetch` / `pool.session`(交接单个请求) |
+| **转发代理**(待做) | **浏览器类**(headless Chrome/CDP,如**同花顺 THS**) | 跑一个 CONNECT + HTTP 转发代理(出站 socket 绑 `--local-address`),整条浏览器流量从它 IP 出 | 给浏览器挂 `--proxy-server=<worker>`(不交接单请求) |
+
+**为什么必须分两面**:浏览器爬虫的请求是浏览器内部发的、翻页常是 **JS 驱动**(THS 点 `a.changePage`)、
+且依赖**真实浏览器指纹**过反爬。把它改写成「逐请求交给 fetch-executor」= 把浏览器爬虫重写成裸 HTTP 爬虫,
+JS 翻页没了、指纹变了,大概率被风控挡——**是错的路**。浏览器爬虫换出口的正道就是**代理**:Chrome 挂
+`--proxy-server`,worker 当 forward proxy 从其 IP 出。这也回答了最初「这像不像代理」的直觉——**对浏览器
+类就是代理,对 reqwest 类是请求代发**,同一支 fleet 的两张面。
+
+> **THS 定性(为何不作第一个消费者)**:THS 全程 headless_chrome/CDP、cookie 由 JSON 文件经 CDP 注入、
+> JS 翻页。它要的是**代理面**,不是 P0 的 fetch-pool。且 JSON cookie 绑在「铸造它的那个 IP」上,若从别的
+> worker IP 发会失效——本机 worker 绑**直连出口**(cookie 铸造处同 IP)可先跑通,不必改登录。故 THS 推迟到
+> 代理面 + 桌面可视就绪之后再接。
+
+**P0 实现落点**(in-memory,单 controller 存活期内有效):
+- `crates/egress-pool` —— 核心:`EgressRequest/Response/Error` 线格式 + `Registry`(worker 通道/请求路由/
+  session 绑定)+ `Pool`/`Session` 消费句柄。
+- `crates/toolkit-server` —— `routes/internal.rs` 挂 `/api/internal/*`(worker 通道:`workers/register`、
+  `workers/{id}/heartbeat`、长轮询 `egress/next`、`egress/result`;共享 token 中间件比对 env
+  `EGRESS_WORKER_TOKEN`);`routes/egress.rs` 挂 `/api/web/egress/{workers,probe}`(观测 + 端到端自测);
+  `AppState.egress: Arc<egress_pool::Registry>`。
+- `crates/toolkit-worker` —— 出口执行端二进制:register/心跳/长轮询/代发/回传 + per-session cookie jar +
+  出口 IP 探测 + 断线重连。
+
+### 功能路线(P0 之后,按此顺序,THS 之前先把通用能力做齐)
+
+- **F1 · worker 选择出口**:toolkit-worker 加 `--local-address <本机源IP>`,把代发的 anon/session
+  client 出站 socket 绑到该源 IP(多网卡机上强制走指定网关)。与上报的对外 `--egress-ip` 分开
+  (一个「绑哪个本地源 IP」,一个「对外看到的公网 IP」)。Windows 走**源 IP 绑定**(按网卡名不稳)。
+  代理面的 `--local-address` 同理复用。
+- **F2 · 桌面端 worker 列表**:zero-desktop 加一页,拉 `GET /api/web/egress/workers` 展示每台的
+  id / 出口 IP / 在线 / **最近心跳时间** / 占用的 type。为此 `workers_snapshot` 增补绝对心跳时间戳。
+- **F3 · 出口测试程序**:一个独立小程序,针对各 worker 跑自检——取自己的**外网 IP**(打 ipify)+
+  简单跑「匿名短租 / 混合(短租 + 具名 session 复用)」功能测试,输出每台 worker 的出口 IP 与钉死/复用是否正确。
+  作为 F4 公共 crate 的第一个真实消费者与冒烟用例(现有 `/api/web/egress/probe` 是其进程内雏形)。
+- **F4 · 抽出公共「租用」crate**:把「消费侧用法」抽成可被**其他项目依赖**的公共 client crate
+  (工作名 `egress-client`),对外仍是 `fetch` / `session` 两原语,但**经 HTTP 消费面**连 controller(外部
+  进程用不了进程内 `Pool`)。为此 controller 需新增**消费 HTTP API**:`POST /api/web/egress/fetch`(匿名)
+  + `POST /api/web/egress/session`(领 session)/`.../{sid}/fetch`/`.../{sid}/release`(server 侧持 `Session`
+  guard,带 TTL 兜底)。这就是《统一模型》里「薄客户端库 + 常驻后端」的薄客户端库落地。
+
+**再后续(与本轮功能正交,原 P1/P2 保留)**:抖音接入(`EgressTransport` + douyin 纯函数化 + DB 持久化跨重启
+复用);安全/运维(bootstrap-token + TLS + IP allowlist、出口健康冷却、一行 install + 自更新);**THS 代理面
+接入**(worker 代理模式 + Chrome `--proxy-server`,见上「两张出口面」)。
+
+**P0 验证**:起 controller(设 `EGRESS_WORKER_TOKEN`)+ 本地 `toolkit-worker --controller …` →
+`POST /api/web/egress/probe`,断言:匿名 fetch 返回 worker 出口 IP、session 内两请求同 IP、具名身份重进
+命中同一 worker;关掉 worker 时 fetch 得 `NoWorker` 优雅降级。
+
+## 统一模型：公共爬虫库 = 一支 fleet 的两个面
+
+### 一句话定位
+
+最终要交付的不是一个孤立的「调度服务」，而是一个**公共爬虫底座库**（工作名 `crawl-pool`，命名待定）。
+一个爬虫程序依赖它，就同时得到两件能力，且**走同一套 API 边界**：
+
+1. **出口（egress）**：爬虫的出站请求交给库托管，库从池里挑一个可用出口（= 一台远程节点的 IP）发出去、
+   回传响应。爬虫自己不碰 IP / 代理 / 节点。
+2. **任务分发（dispatch）**：爬虫把「要爬什么」交给库，库拆成 job 派到合适的远程节点执行，结果回传。
+
+§1–§14 是这套库**背后的实现契约**（controller / agent / worker / jobs 协议）；本节先把「库对外长什么样、
+为什么 worker 和 IP 池是一回事」讲清楚——实现细节服从这个统一模型。
+
+### 库 ≠ 系统：两件套（薄客户端 + 常驻后端）
+
+「公共库」不可能只是一个库。库是被链接进进程的、被动的代码，但「派任务、收结果、重试、记 IP 健康」
+是**有状态、常驻、要网络端点**的——那是一个服务。所以它必然是两件套：
+
+- **薄客户端库**（爬虫真正 `依赖` 的，提供 `pool.fetch` / `pool.session` 等友好 API）；
+- **常驻后端**（controller + worker fleet，库在背后跟它通信）。
+
+库是「友好的脸」，扛不住分布式状态——你始终需要一台公网 controller 在那儿。别把预期建成「只要一个库」。
+
+### worker 和 IP 池是同一支 fleet 的两个面
+
+基线模型一句话：**「一台节点 = 一个出口 IP = 一个 worker」**（§13 baseline，非下文「出口 IP 池抽象」的
+多 IP 变体）。所以 `workers` 表既是算力清单也是 IP 池清单，两个面是同一份数据：
+
+| 面 | 看到的是 | 关心的字段 / KPI |
+|---|---|---|
+| 算力面（worker） | 能接 job 的执行单元 | `max_slots`、in-flight、lease |
+| 出口面（IP 池） | 一个出口 IP | `egress_ip`、限流事件、存活率、冷却 |
+
+**「出口经过库」和「库做分发」其实是同一个决策**：爬虫调 `pool.fetch(url)`，库要回答「用哪个出口发」——
+这个选择恰恰就是「把这次 fetch 当成一个 job 派给哪台节点」。**选出口 = 选节点 = 派 job**。所以 egress 路由
+和 task dispatch 在库内部是同一个调度器的两种叫法，这就是「自然而然进行任务分发」的由来——不需要把它们
+当两套机制。
+
+### 库提供两档接入姿态
+
+对应 §0.3 已分好的「绑定式 / 独立式 kind」与下面的 cookie/匿名分裂，库给爬虫两档 API：
+
+| 姿态 | 爬虫怎么用 | 逻辑跑在哪 | 适合 |
+|---|---|---|---|
+| **请求级**（egress 代理） | `pool.fetch(req)`，几乎像换了个 proxy | 爬虫逻辑在本地/中心，只外包出站请求 | 单页、简单接口、想要 IP 轮换但逻辑不重 |
+| **任务级**（worker 分发） | `pool.submit(job)`，提交整段工作 | 完整爬取逻辑跑在远程节点 | 重逻辑/多步骤、跨节点搬文件贵、要 sticky 固定 IP |
+
+请求级是任务级的退化特例（一个 job 只含「发一个请求」），所以两档共用同一套 jobs / lease / 结果回传协议
+（§4/§5），不是两套实现。
+
+### 「分发」分发什么：三种模型（A = B 带 `http_fetch`）
+
+「自然而然分发」有三种成本差一个数量级的读法，区别在**分发的是请求、逻辑还是代码**：
+
+| | 分发的是 | 爬虫代码跑在哪 | 解决的瓶颈 | 爬虫独立性 | 成本 |
+|---|---|---|---|---|---|
+| **A. 出口代理库** | 出站**请求** | 本地/中心（不动） | IP 维度反风控 | 完全独立，只链库 | 低 |
+| **B. job-kind 库** | 整段**爬取逻辑** | 远程节点 | 算力吞吐 + IP | 是库的一个注册 kind，需编进 worker | 中 |
+| **C. 动态代码下发** | **代码**本身（脚本/wasm） | 远程节点 | 三者全占 | 独立 + 热部署 | 高（沙箱/运行时） |
+
+- **A** 最贴「出口经过库」的字面读法，最便宜，直击最初痛点（抖音 IP shadow-throttle），爬虫零耦合；但它
+  **只分发请求、不分发算力**，中心进程照跑解析/编排。
+- **B** 就是现有 ths / douyin kind 形态：整段抓取在节点跑完。代价：加爬虫 = 改代码 + 重部署 fleet（两段式
+  自更新负责）。
+- **C** 唯一同时给「独立 + 算力分发 + 热部署」，但要造脚本运行时 + 沙箱，平台级投入，**明确搁置**（记入 §13/§14）。
+
+**关键洞见：A = B 退化成「只有一个通用 kind `http_fetch`」。** 库的 `pool.fetch(method,url,headers,body)` 在
+后端就是提交一个 `http_fetch` job、sticky/轮换到某出口、await `(status,headers,body)`，与 ths kind 走**同一套
+jobs/lease/回传协议**，只是 input/output 是「裸 HTTP 请求/响应」这个通用形状。**结论：先把后端 jobs/lease 建好
+（阶段 0）+ 内置 `http_fetch` kind → 立刻得到 A 的出口代理库；哪个爬虫重到值得整段下放，再写专用 kind →
+自然升到 B。同一后端，不重做。**
+
+库对外因此收敛成（其余留待真需求）：
+- `pool.fetch(req) -> resp` —— 请求级，内部 = 一个 `http_fetch` job。
+- `pool.session(key) -> Session` —— 拿一个**钉死出口**的会话句柄（cookie / TLS 指纹 / session 连续性），
+  内部 = `affinity_key`（§6 sticky）。
+- `pool.submit(kind, input) -> handle` —— 任务级，等真有重爬虫再开。
+
+### cookie 绑定 vs 匿名：IP 池策略必须分裂
+
+融合时最容易错的一点：
+
+| 爬取类型 | IP 策略 | 怎么扩 | 库内对应 |
+|---|---|---|---|
+| **匿名**（THS 前几页、cookie-free） | 真·IP 轮换，被封标冷却 | 加 IP / 加节点，横向铺 | 请求级 + 出口 IP 池 |
+| **cookie 绑定**（账号态抖音） | **(cookie, 固定出口IP) 锁定配对**，绝不轮换 | 加「账号+IP」配对，而非给一个账号轮 IP | 任务级 + cap 路由 `cookie:acc_X` + sticky affinity（§6） |
+
+把这两类混进一个随机轮换池会把账号洗死（多 IP 共用一 cookie 触发风控，§1 已据此选 THS 优先）。库必须把
+「可轮换的匿名出口池」和「钉死的 (cookie↔出口IP) 配对」当**两类资源**分开管。
+
+### 出口 IP 池抽象（从 §14.11 提级为正文）
+
+- **基线（默认，已够）**：一节点一 IP，即 `workers.egress_ip`。库的「选出口」就是「选节点」，无需独立 IP 池表。
+- **进阶（一节点多 IP）**：当核心瓶颈变成**出口 IP 本身**（纯反风控、量大）时，一台节点可持多个出口
+  （多拨 / 住宅代理 / 机房代理）。此时在 controller 侧引入 `proxy_pool` 表，与 `workers` 表**正交**：
+
+  ```sql
+  CREATE TABLE IF NOT EXISTS proxy_pool (
+    id             TEXT PRIMARY KEY,
+    node_id        TEXT,            -- 该代理由哪台 worker 节点持有/可用(可空=中心直连代理)
+    scheme         TEXT NOT NULL,   -- http/https/socks5
+    host           TEXT NOT NULL,
+    port           INTEGER NOT NULL,
+    kind           TEXT,            -- residential/datacenter/mobile
+    last_used_at   INTEGER,
+    cooldown_until INTEGER,         -- 限流后退避;lease 出口时过滤 cooldown_until<=now
+    banned_at      INTEGER,         -- 被封剔除
+    success_count  INTEGER NOT NULL DEFAULT 0,
+    fail_count     INTEGER NOT NULL DEFAULT 0
+  );
+  ```
+  - lease job 时透传一个 proxy 给节点；节点的业务 HTTP 走该 proxy。
+  - 结果的 `error_kind`（`rate_limited`/`auth`）反馈回 controller 更新 `cooldown_until` / `banned_at` /
+    计数——复用 §4.4 已有的 error_kind 退避机制，不新造。
+  - **KPI**：IP 存活率 + 冷却队列深度（不是 slot 数）。
+- **何时引入**：抖音/THS 爬取量真碰到 IP 封禁瓶颈、一节点一 IP 不够时。在此之前**不建表**，基线模型足够。
+
+### 控制面 / 数据面分层（pull / NAT 约束下怎么落）
+
+直觉是「控制面走 controller，数据面别让每个字节都过 controller（每请求一次 DB 写 + 租约扛不住高频）」。
+但 **pull 模型的硬约束：节点只对外拨号连 controller，不要求任何入站可达**（§8 NAT 友好）——所以
+NAT 后的节点**谁也 dial 不进去，不存在 library→节点的物理直连**。分层只能这样落：
+
+- **控制面（过 controller，低频，DB-backed）**：register / lease / heartbeat / job 状态 / IP 健康 /
+  「给我一个出口或会话」。
+- **数据面（请求/响应字节）**：两种合法形态，**都不是 dial 进节点**——
+  1. **默认 · 拉式回传 / relay 中继**：粗粒度 job 的数据面其实**已经 NAT-friendly**——现有 §5 的
+     `complete` / artifact PUT 本就是节点**主动 POST 出去**的拉式回传，无需新机制。只有请求级高频 fetch
+     想要**低延迟流式**时，才让节点 dial-out 一条持久多路复用连接（HTTP/2 / WebSocket / yamux），relay 把
+     数据面请求**塞进这条节点已拨出的连接**，节点 fetch 完原路返回——**逻辑直达、物理过 relay**
+     （ngrok / frp / Cloudflare Tunnel 同款）。「数据面分离」= 不把每请求建成 `jobs` 行、relay 是 dumb 管道
+     不落盘，**不是**网络上绕开 controller。relay 可与 controller 同进程，也可拆成独立瘦进程将来分开扩。
+  2. **可选 · mesh VPN 直连**：把所有节点 + 库宿主拉进 Tailscale / Nebula / WireGuard mesh，每节点拿到
+     可路由虚拟 IP，mesh 自己（DERP / 打洞）解决 NAT 穿透 → library→节点**真物理直连**，controller 只管
+     控制面。代价：多一层 mesh 运维，全员入网。**纯增量**，上 mesh 不动控制面协议一行。
+
+**一句话铁律**：pull 模型下唯一可达的点永远是 controller / relay；「直连」要么是顺节点拨出连接的反向中继，
+要么是给节点 mesh 虚拟 IP，**没有第三种**。默认走拉式回传 / 中继，碰到吞吐 / 延迟瓶颈再上 mesh。
+
+### 「后续怎么用」仍开放，但这些已锁定
+
+本节定了**库的对外形状**和**调度的统一语义**，但不锁死爬虫种类和部署规模。已经确定不变的：
+
+- 中心永远是 **controller（toolkit-server，公网 IP）**，节点 **pull**（§2/§3），NAT 后可接——库的 client 端
+  就是对 controller `/api/internal/*` 的封装。
+- 现有 §0–§14 的协议 / schema / 分阶段**全部沿用**，库只是它们之上的一层 SDK + 调度语义命名，不推翻任何
+  已定契约。
 
 ## 1. 背景与目标
 
@@ -722,6 +957,7 @@ curl -fsSL https://controller.example.com/install.sh \
 - **同一账号 cookie 多 worker 共享**:目前模型是"一个 cookie 绑一台 worker"(cap 路由)。若后续要让多 worker 共享同一账号(更高吞吐),需要 controller 侧的 token bucket + cookie refresh 协调,留待数据驱动决策。
 - **Artifact 大小**:单文件超过几百 MB 时直传 controller 不经济。届时引入对象存储(MinIO / S3),worker PUT presigned URL,controller 只记元数据。
 - **跨地域**:首阶段所有 worker 在同一时区 / 同一 controller,跨地域延迟未评估。
+- **动态代码下发(Model C)**:让 worker 当通用执行器、爬虫逻辑以脚本 / wasm 当数据下发,是唯一能同时给「爬虫独立 + 算力分发 + 不重编热部署」的形态(见《统一模型》三模型对照)。**明确搁置**:要造脚本运行时 + 沙箱 + 能力限制 + 跨线调试,是平台级投入。当前走 A(出口代理库,内置 `http_fetch` kind)/ B(专用 job-kind 编进 worker)已覆盖需求;待出现「爬虫种类爆炸、改一个就要重部署全 fleet 难以忍受」时再评估。
 
 ## 14. 实操未决 / 风险登记(实现期再决)
 
@@ -739,3 +975,5 @@ curl -fsSL https://controller.example.com/install.sh \
 | 8 | **trace_id 在 jobs 表的持久化**:`traceparent` 当前只塞进 lease 响应,jobs 表里没有列。controller 重启后无法重建 parent span。 | 阶段 1 | 在 `jobs` 表加一列 `traceparent TEXT`,派发时和 input 一起写;lease 时透传。Schema 调整不大,可顺手加进 `DDL_V2`。**这条可能升级为 P2 修订**——等阶段 0 开工时确认。 |
 | 9 | **worker 端日志回收的体积上限**:`tail_log` 命令把日志 POST 回 controller 时,日志可能很大。 | 阶段 3 | 命令参数指定行数上限(默认 200),controller 端单 worker 日志包大小硬上限(如 1 MB),超出截断并标注。 |
 | 10 | **签名公钥的轮换**:agent 内嵌的 minisign 公钥若泄漏,需要 OTA 替换,但 agent 自更新自身又依赖该公钥。 | 阶段 4 | 首阶段不做密钥轮换(公钥不会主动泄漏);需要时走「agent 内嵌多公钥 + 任一签名通过即可」的过渡方案,或手动重装 agent。 |
+| 11 | **IP 池抽象**:已提级为正文《统一模型》的「出口 IP 池抽象」小节（含 `proxy_pool` 表设计、cookie/匿名分裂、与 `workers` 表正交关系、请求级 vs 任务级两档接入）。基线仍是「一节点 = 一 IP」(`workers.egress_ip`),多 IP（proxy pool）变体待爬取量真正碰到 IP 封禁瓶颈时再建表。 | 待评估 | 见《统一模型》;现阶段不建 `proxy_pool` 表,沿用 `workers.egress_ip` 基线。 |
+| 12 | **数据面低延迟通道:relay 多路复用隧道 vs mesh VPN**:粗粒度 job 的数据面已 NAT-friendly(§5 `complete`/artifact 拉式回传);仅请求级高频 fetch 要低延迟流式时才需要更重的通道。两选项:① 节点 dial-out 持久多路复用连接(HTTP/2 / WS / yamux),relay 顺连接反向中继;② 全员入 mesh VPN(Tailscale / Nebula / WG)走真直连。见《统一模型·控制面/数据面分层》。 | 阶段 3+ / 吞吐瓶颈时 | **默认不造**:先用现有拉式回传。碰到请求级高频 + 低延迟需求才裁决——倾向先上 ① relay 中继(零额外运维、不动控制面协议),延迟仍不够再上 ② mesh(纯增量)。**铁律:pull 模型下无 library→节点物理直连,唯一可达点永远是 controller/relay。** |
