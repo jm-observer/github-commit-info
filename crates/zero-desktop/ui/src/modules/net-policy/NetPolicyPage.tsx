@@ -26,6 +26,9 @@ import { ObservatorySection } from './components/ObservatorySection'
 import { ObserverTable } from './components/ObserverTable'
 import { ApplyStepper } from './components/ApplyStepper'
 import { ProtectionBanner } from './components/ProtectionBanner'
+import { TempDirectControl } from './components/TempDirectControl'
+import { RoutesSection } from './components/RoutesSection'
+import { RecordsSection } from './components/RecordsSection'
 import { useNetPolicyProbe } from './ProbeContext'
 
 const KIND_LABELS: Record<RuleKind, string> = {
@@ -451,6 +454,15 @@ export default function NetPolicyPage() {
           />
         </div>
       </details>
+
+      {/* 5b2. 临时直连（限时应急） */}
+      <TempDirectControl />
+
+      {/* 5b3. 生效路由（优先级 + 删除） */}
+      <RoutesSection busy={busy} />
+
+      {/* 5b4. 记录（请求 / 事件 / 进程树） */}
+      <RecordsSection />
 
       {/* 5c. 高级 / 排障 */}
       <details className="group rounded-xl border border-gray-200 dark:border-gray-800">

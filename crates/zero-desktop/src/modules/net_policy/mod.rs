@@ -241,3 +241,13 @@ pub async fn net_policy_temp_direct_on(
 pub async fn net_policy_temp_direct_off() -> Result<TempDirectStatus, String> {
     connect().await?.clear_temp_direct().await.map_err(estr)
 }
+
+#[tauri::command]
+pub async fn net_policy_clear_requests() -> Result<(), String> {
+    connect().await?.clear_requests().await.map_err(estr)
+}
+
+#[tauri::command]
+pub async fn net_policy_clear_events() -> Result<(), String> {
+    connect().await?.clear_events().await.map_err(estr)
+}

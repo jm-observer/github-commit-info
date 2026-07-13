@@ -265,4 +265,8 @@ export const NetPolicyAPI = {
     invoke<TempDirectStatus>('net_policy_temp_direct_on', { durationSecs, except }),
   /** 提前解除临时直连。 */
   tempDirectOff: () => invoke<TempDirectStatus>('net_policy_temp_direct_off'),
+  /** 清空请求记录（隐私）。 */
+  clearRequests: () => invoke('net_policy_clear_requests'),
+  /** 清空生命周期事件。 */
+  clearEvents: () => invoke('net_policy_clear_events'),
 }

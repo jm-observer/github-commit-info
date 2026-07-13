@@ -301,6 +301,8 @@ fn run_gui(workspace: PathBuf) -> Result<()> {
             modules::net_policy::net_policy_temp_status,
             modules::net_policy::net_policy_temp_direct_on,
             modules::net_policy::net_policy_temp_direct_off,
+            modules::net_policy::net_policy_clear_requests,
+            modules::net_policy::net_policy_clear_events,
             // llm 模块（公共大模型层：配置 / 提示词 / 自测 / 对话总结）
             modules::llm::llm_get_config,
             modules::llm::llm_put_config,
