@@ -22,6 +22,7 @@ members = [
     "crates/egress-client",
     "crates/toolkit-worker",
     "crates/egress-tester",
+    "crates/net-policy-gui",
 ]
 resolver = "2"
 

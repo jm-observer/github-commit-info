@@ -1,0 +1,31 @@
+[package]
+name = "net-policy-gui"
+version.workspace = true
+edition.workspace = true
+
+# 独立桌面 app：只有网络策略界面（从 zero-desktop 内嵌的 net_policy 模块剥出）。
+# 瘦客户端——不持有任何提权副作用，经命名管道调 net-policy-agent（唯一副作用所有者）。
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+tauri = { version = "2", features = ["protocol-asset"] }
+serde = { workspace = true }
+serde_json = { workspace = true }
+tokio = { workspace = true, features = ["rt-multi-thread", "macros", "time", "sync"] }
+anyhow = { workspace = true }
+log = { workspace = true }
+clap = { workspace = true, features = ["env"] }
+custom-utils = { workspace = true, features = ["updater", "trace"] }
+# net-policy：GUI 现为**瘦客户端**，经命名管道调 net-policy-agent（提权副作用全在 agent）。
+net-policy-core = { path = "../net-policy-core" }
+net-policy-client = { path = "../net-policy-client" }
+
+[features]
+default = ["custom-protocol"]
+custom-protocol = ["tauri/custom-protocol"]
+prod = ["custom-utils/prod"]
+
+[[bin]]
+name = "net-policy-gui"
+path = "src/main.rs"
