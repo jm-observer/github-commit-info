@@ -344,3 +344,31 @@ typed 协议就够；HTTP 应急面会重新引入 token/CORS/端口发现/浏�
 | 7 [P2] | 安装原子性不足 | install **先验证所有源资产再动 %ProgramFiles%**（mihomo 源/已存在缺一即 bail，不留半装 agent）。完整"temp 目录 + 原子替换"列后续 |
 
 协议 minor 仍为 2（本轮加的 `ClearRequests/ClearEvents` 是兼容追加）。
+
+## 13. 提权真机验收 + 修复（2026-07-14）
+
+在 Windows 11 真机（内网测试机 192.168.0.228）完成提权 e2e——此前 §7 / §11.3 列为待做的「提权真机验收」全部走通。
+
+**验收路径**：`net-policy-agent install --mihomo <src> --wintun <src>`（提权把 agent/mihomo/wintun 原子复制到 `%ProgramFiles%\net-policy\` + 装登录最高权限计划任务）→ 计划任务起 production agent → zero-desktop 内嵌网络策略页连 agent → apply 三姿态。
+
+| 姿态 | 结果 |
+|---|---|
+| **观察·直连** | apply 起 mihomo TUN + `MATCH,DIRECT`，**不挂 kill-switch**（observer-first），6 步 ApplyStepper 全绿；LAN 排除（`192.168.0.0/16`）保 RDP/SSH 全程不断。✅ |
+| **海外·全VPN** | apply 装 kill-switch（`DefaultOutboundAction=Block` + 5 条 KS 白名单）**fail-closed** + mihomo 全局走 **AmneziaWG 混淆隧道**（curl trace 出口 IP=服务端美国，翻墙 IP 直通）+ LAN 排除保连接。✅ |
+
+GUI↔agent 桥接（命名管道连接、三姿态切换、ApplyStepper 事件流、`parseWgConf` 导入 AmneziaWG 的 `amnezia` 参数全链路）真机通过。
+
+### 13.1 修复的 3 个真 bug
+
+| # | bug | 修复 |
+|---|---|---|
+| 1 | `store.rs::recent_requests` 的 SQL 用 `\` 续行符，Rust 吃掉换行+前导空格，`outbound,rule` 与 `FROM` 粘成 `ruleFROM` → `requests` 查询 SQL 语法错 | 续行符前补空格（`rule \` + `FROM`） |
+| 2 | 单实例残留进程占着命名管道，新 agent 建同名管道被拒 → 启动即「拒绝访问」崩溃；单实例预检只查 9090 controller，没兜住管道名冲突 | 诊断确认根因（预检覆盖管道名 + 友好报错列后续） |
+| 3 | **`firewall.rs::base_rules_ps` 的 KS-mihomo `-Program` 用了 `resolve_mihomo_bin` production 分支 `canonicalize` 出的 `\\?\C:\...` extended-length 路径 → `New-NetFirewallRule` 报 HRESULT 0x80070057「应用程序包含无效的字符」→ 海外/阻断姿态首次 apply 装 KS-mihomo 必失败**（观察姿态不装此规则，故一直没暴露；这是提权 production 才踩的真实生产坑） | 传 `-Program` 前剥掉 `\\?\` 前缀（本地盘 `\\?\C:\...` → `C:\...`） |
+
+### 13.2 遗留优化点
+
+- **海外姿态 DNS**：`engine::generate_config`（`mihomo.rs`）生成的 DNS 段用国内 bootstrap nameserver + `remote-dns-resolve:false`，TUN 模式下被墙**域名**在本地解析被污染（纯 IP 如 `1.1.1.1` 秒通、`google.com` 解析失败）。应让被墙域名走隧道内 DNS（如 nameserver `https://1.1.1.1/dns-query#wg-out` DoH-over-tunnel，代理模式已验证有效）。
+- **`status.firewall.active` 读取不一致**：`win.rs::native_status`（读注册表）与 `Get-NetFirewallProfile`（CIM）不一致——实际 `DefaultOutboundAction=Block` 时 native 误报 `active:false`（`rule_count` 正确）。
+
+> 真机测试机连接方式见记忆 `net-policy-228-test-machine`；AmneziaWG 混淆隧道穿透验证见 `amneziawg-obfuscation-verified` + `D:\git\toolkit\awg-clients\`（已 gitignore）。

@@ -12,3 +12,6 @@ target-smoke
 # 出口 worker 本机运行时标识 / WireGuard 客户端私钥（机器特定、含密钥，勿入库）
 egress-worker-id
 wg0-client-*.conf
+# AmneziaWG 客户端配置（含私钥/PSK，勿入库）
+awg-clients/
+wg0-autostart.conf

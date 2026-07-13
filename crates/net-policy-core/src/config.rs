@@ -627,20 +627,30 @@ pub fn killswitch_state_path(workspace: &Path) -> PathBuf {
 /// 从已生成的 mihomo `config.yaml` 解析 external-controller secret（P1：应用重启后恢复鉴权口令，
 /// 以便管理/急停仍在运行的旧 mihomo 实例）。secret 本就随配置写盘（`secret: "..."`），解析它
 /// **不增加新的磁盘暴露面**——这也是 review 建议的"从生成的 config 解析恢复"路径。
-/// 返回 `None` 表示无配置 / 未含非空 secret。
+/// 返回 `None` 表示无配置 / 未含合法 secret。
+///
+/// **安全**：config.yaml 在用户可写的 workspace 下，恢复的 secret 会经 auth_header 内插进提权
+/// PowerShell 字符串（reload/graceful_stop 等）。故此处**只接受自己 `gen_secret` 写出的 48 位
+/// 小写 hex**；任何含引号/空白/非 hex 字符的篡改值一律拒收（视为无 secret），杜绝经此文件注入
+/// 提权命令。
 pub fn read_generated_secret(workspace: &Path) -> Option<String> {
     let cfg = std::fs::read_to_string(mihomo_config_path(workspace)).ok()?;
     for line in cfg.lines() {
         let t = line.trim();
         if let Some(rest) = t.strip_prefix("secret:") {
             let v = rest.trim().trim_matches('"').trim().to_string();
-            if !v.is_empty() {
+            if is_valid_secret(&v) {
                 return Some(v);
             }
             return None;
         }
     }
     None
+}
+
+/// secret 合法性：恰好 48 个小写 hex 字符（= `gen_secret` 的 24 字节）。
+fn is_valid_secret(s: &str) -> bool {
+    s.len() == 48 && s.bytes().all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
 }
 
 pub fn load_settings(workspace: &Path) -> NetPolicySettings {
@@ -689,6 +699,41 @@ pub fn save_rules(workspace: &Path, r: &RuleSet) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn secret_validation_accepts_only_hex48() {
+        // gen_secret 产物：48 位小写 hex。
+        assert!(is_valid_secret(&"a".repeat(48)));
+        assert!(is_valid_secret("0123456789abcdef0123456789abcdef0123456789abcdef"));
+        // 长度不符。
+        assert!(!is_valid_secret(&"a".repeat(47)));
+        assert!(!is_valid_secret(&"a".repeat(49)));
+        assert!(!is_valid_secret(""));
+        // 大写 hex 也拒（gen_secret 只产小写；从严）。
+        assert!(!is_valid_secret(&"A".repeat(48)));
+        // 注入尝试：含引号/分号/空白——长度可能凑到 48 但非 hex，必须拒收。
+        let inject = "'; Start-Process calc; '".to_string() + &"a".repeat(24);
+        assert_eq!(inject.len(), 48);
+        assert!(!is_valid_secret(&inject));
+    }
+
+    #[test]
+    fn read_generated_secret_rejects_tampered() {
+        let dir = std::env::temp_dir().join(format!("np-secret-test-{}", std::process::id()));
+        let cfg = mihomo_config_path(&dir);
+        std::fs::create_dir_all(cfg.parent().unwrap()).unwrap();
+
+        // 合法 hex secret 能读回。
+        let good = "0123456789abcdef0123456789abcdef0123456789abcdef";
+        std::fs::write(&cfg, format!("secret: \"{good}\"\n")).unwrap();
+        assert_eq!(read_generated_secret(&dir).as_deref(), Some(good));
+
+        // 被篡改成注入串——拒收（视为无 secret）。
+        std::fs::write(&cfg, "secret: \"'; calc; '\"\n").unwrap();
+        assert_eq!(read_generated_secret(&dir), None);
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
 
     #[test]
     fn parse_wg_quick_full() {

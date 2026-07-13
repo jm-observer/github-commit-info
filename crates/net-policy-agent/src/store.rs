@@ -104,7 +104,7 @@ impl Store {
     pub fn record_request(&self, e: &RequestLogEntry) {
         let c = self.conn.lock().unwrap();
         if let Err(err) = c.execute(
-            "INSERT OR IGNORE INTO requests(conn_id,ts_ms,process,process_path,host,dest_ip,dest_port,network,outbound,rule)\
+            "INSERT OR IGNORE INTO requests(conn_id,ts_ms,process,process_path,host,dest_ip,dest_port,network,outbound,rule) \
              VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10)",
             params![e.conn_id, e.ts_ms as i64, e.process, e.process_path, e.host, e.dest_ip, e.dest_port, e.network, e.outbound, e.rule],
         ) {
@@ -117,7 +117,7 @@ impl Store {
     pub fn recent_requests(&self, limit: u32) -> Result<Vec<RequestLogEntry>> {
         let c = self.conn.lock().unwrap();
         let mut stmt = c.prepare(
-            "SELECT conn_id,ts_ms,process,process_path,host,dest_ip,dest_port,network,outbound,rule\
+            "SELECT conn_id,ts_ms,process,process_path,host,dest_ip,dest_port,network,outbound,rule \
              FROM requests ORDER BY id DESC LIMIT ?1",
         )?;
         let rows = stmt

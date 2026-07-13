@@ -97,6 +97,15 @@ fn e<T: std::fmt::Display>(x: T) -> String {
     format!("{x:#}")
 }
 
+/// 合并「主错误」与「回滚结果」：回滚成功只返回主错误；回滚失败把两者拼接返回，
+/// **不让回滚错误掩盖真正的病因**（评审：`rollback(..)?` 会用回滚错替换原始 err）。
+fn with_rollback(primary: String, rollback: Result<(), String>) -> String {
+    match rollback {
+        Ok(()) => primary,
+        Err(rb) => format!("{primary}；回滚亦失败：{rb}"),
+    }
+}
+
 /// 开启临时直连（限时应急）——**事务化**（评审点 1）：置 temp 态 → reload 使配置生效；
 /// **reload 失败即回滚 temp 态并返回错误**（不制造「状态说开、配置没变」的分裂）。成功才记事件 +
 /// 起过期定时器。
@@ -269,8 +278,10 @@ async fn do_apply(state: Arc<AgentState>) -> Result<(), String> {
         if killswitch {
             if let Err(err) = firewall::apply_base(&ws, &settings, &mihomo_bin) {
                 state.emit_progress(1, "fail", Some(format!("{}{rollback_note}", e(&err))));
-                rollback(None)?;
-                return Err(format!("apply kill-switch（阶段A）：{}{rollback_note}", e(err)));
+                return Err(with_rollback(
+                    format!("apply kill-switch（阶段A）：{}{rollback_note}", e(err)),
+                    rollback(None),
+                ));
             }
         } else if firewall::status()
             .map(|f| f.rule_count > 0 || f.active)
@@ -281,8 +292,10 @@ async fn do_apply(state: Arc<AgentState>) -> Result<(), String> {
         }
         if let Err(err) = engine::write_config(&ws, &settings, &rules, &secret, &temp) {
             state.emit_progress(1, "fail", Some(format!("{}{rollback_note}", e(&err))));
-            rollback(None)?;
-            return Err(format!("write mihomo config：{}{rollback_note}", e(err)));
+            return Err(with_rollback(
+                format!("write mihomo config：{}{rollback_note}", e(err)),
+                rollback(None),
+            ));
         }
         state.emit_progress(
             1,
@@ -301,8 +314,10 @@ async fn do_apply(state: Arc<AgentState>) -> Result<(), String> {
             Ok(p) => p,
             Err(err) => {
                 state.emit_progress(2, "fail", Some(format!("{}{rollback_note}", e(&err))));
-                rollback(None)?;
-                return Err(format!("start mihomo：{}{rollback_note}", e(err)));
+                return Err(with_rollback(
+                    format!("start mihomo：{}{rollback_note}", e(err)),
+                    rollback(None),
+                ));
             }
         };
         {
@@ -331,8 +346,10 @@ async fn do_apply(state: Arc<AgentState>) -> Result<(), String> {
                 "mihomo 外部控制器不可达"
             };
             state.emit_progress(3, "fail", Some(format!("{detail}{rollback_note}")));
-            rollback(Some(pid))?;
-            return Err(format!("等待 TUN 起栈超时（{detail}），已回滚{rollback_note}"));
+            return Err(with_rollback(
+                format!("等待 TUN 起栈超时（{detail}），已回滚{rollback_note}"),
+                rollback(Some(pid)),
+            ));
         }
         state.emit_progress(3, "ok", None);
 
@@ -341,8 +358,10 @@ async fn do_apply(state: Arc<AgentState>) -> Result<(), String> {
         if killswitch {
             if let Err(err) = firewall::apply_tun(&ws) {
                 state.emit_progress(4, "fail", Some(format!("{}{rollback_note}", e(&err))));
-                rollback(Some(pid))?;
-                return Err(format!("apply kill-switch（阶段B KS-TUN）：{}{rollback_note}", e(err)));
+                return Err(with_rollback(
+                    format!("apply kill-switch（阶段B KS-TUN）：{}{rollback_note}", e(err)),
+                    rollback(Some(pid)),
+                ));
             }
         }
         state.emit_progress(4, "ok", None);

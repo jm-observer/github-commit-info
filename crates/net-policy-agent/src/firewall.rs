@@ -34,7 +34,13 @@ pub fn apply_tun(_workspace: &Path) -> Result<()> {
 
 fn base_rules_ps(settings: &NetPolicySettings, mihomo_bin: &Path) -> String {
     let lan = settings.lan_ranges.join(",");
-    let mihomo = ps_squote(&mihomo_bin.to_string_lossy());
+    // Windows `canonicalize`（paths::resolve_mihomo_bin 的 production 分支）返回 `\\?\C:\...`
+    // extended-length 前缀；`New-NetFirewallRule -Program` **不认该前缀** → 报 HRESULT 0x80070057
+    // 「应用程序包含无效的字符」→ apply_base 在海外/阻断姿态首次装 KS-mihomo 时失败（观察姿态不装此规则
+    // 故不受影响）。剥掉前缀再传（本地盘 `\\?\C:\...` → `C:\...`）。
+    let mihomo_raw = mihomo_bin.to_string_lossy();
+    let mihomo_clean = mihomo_raw.strip_prefix(r"\\?\").unwrap_or(&mihomo_raw);
+    let mihomo = ps_squote(mihomo_clean);
     let mut s = String::new();
     s.push_str(&format!(
         "New-NetFirewallRule -Group $G -Name 'KS-mihomo' -DisplayName 'KS mihomo egress' -Direction Outbound -Action Allow -Program '{mihomo}' -InterfaceAlias $eth -Enabled True | Out-Null\n"

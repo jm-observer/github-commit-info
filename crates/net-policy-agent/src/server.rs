@@ -362,13 +362,30 @@ pub async fn serve(state: Arc<AgentState>) -> Result<()> {
     }?;
     log::info!("net-policy-agent 管道 server 就绪：{PIPE_NAME}");
 
+    // 退避：accept/重建管道的瞬态失败**不得打死守护**（评审点 3）——否则一次抖动就让 agent 退出，
+    // 计划任务重启 3 次耗尽后彻底躺平，而 kill-switch 可能仍挂着（网络阻断却无人管理）。
+    let backoff = std::time::Duration::from_millis(500);
     loop {
-        server.connect().await?;
+        if let Err(err) = server.connect().await {
+            log::warn!("管道 connect 失败，退避 {}ms 重试：{err}", backoff.as_millis());
+            tokio::time::sleep(backoff).await;
+            continue; // connect 失败不消耗 server，直接重试
+        }
         let connected = server;
-        // 立刻建下一个实例，避免连接空窗被他人抢建同名管道。
-        // SAFETY: 同上。
-        server =
-            unsafe { ServerOptions::new().create_with_security_attributes_raw(PIPE_NAME, attrs) }?;
+        // 立刻建下一个实例，避免连接空窗被他人抢建同名管道；建失败则退避重试直到成功
+        // （否则无 server 可 accept）。
+        server = loop {
+            // SAFETY: 同上。
+            match unsafe {
+                ServerOptions::new().create_with_security_attributes_raw(PIPE_NAME, attrs)
+            } {
+                Ok(s) => break s,
+                Err(err) => {
+                    log::warn!("重建管道实例失败，退避 {}ms 重试：{err}", backoff.as_millis());
+                    tokio::time::sleep(backoff).await;
+                }
+            }
+        };
         let st = state.clone();
         tokio::spawn(async move {
             if let Err(e) = handle_connection(st, connected).await {

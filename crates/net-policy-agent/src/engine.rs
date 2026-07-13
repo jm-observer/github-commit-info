@@ -25,7 +25,10 @@ fn auth_header(secret: &str) -> String {
     if secret.is_empty() {
         "@{}".to_string()
     } else {
-        format!("@{{ Authorization = 'Bearer {secret}' }}")
+        // secret 内插进单引号 PS 字符串——转义 `'` 作纵深防御（恢复路径已在 core
+        // read_generated_secret 校验为 hex，此处再兜一层，不依赖上游净化）。
+        let s = secret.replace('\'', "''");
+        format!("@{{ Authorization = 'Bearer {s}' }}")
     }
 }
 
