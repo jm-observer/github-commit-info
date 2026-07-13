@@ -25,6 +25,15 @@
       <sourceFolder url="file://$MODULE_DIR$/crates/agent-session/tests" isTestSource="true" />
       <sourceFolder url="file://$MODULE_DIR$/crates/codeloop-core/src" isTestSource="false" />
       <sourceFolder url="file://$MODULE_DIR$/crates/toolkit-llm/src" isTestSource="false" />
+      <sourceFolder url="file://$MODULE_DIR$/crates/orchestrator/src" isTestSource="false" />
+      <sourceFolder url="file://$MODULE_DIR$/crates/egress-client/src" isTestSource="false" />
+      <sourceFolder url="file://$MODULE_DIR$/crates/egress-pool/src" isTestSource="false" />
+      <sourceFolder url="file://$MODULE_DIR$/crates/egress-tester/src" isTestSource="false" />
+      <sourceFolder url="file://$MODULE_DIR$/crates/toolkit-worker/src" isTestSource="false" />
+      <sourceFolder url="file://$MODULE_DIR$/crates/net-policy-agent/src" isTestSource="false" />
+      <sourceFolder url="file://$MODULE_DIR$/crates/net-policy-cli/src" isTestSource="false" />
+      <sourceFolder url="file://$MODULE_DIR$/crates/net-policy-client/src" isTestSource="false" />
+      <sourceFolder url="file://$MODULE_DIR$/crates/net-policy-core/src" isTestSource="false" />
       <excludeFolder url="file://$MODULE_DIR$/target" />
     </content>
     <orderEntry type="inheritedJdk" />

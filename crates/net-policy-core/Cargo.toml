@@ -1,0 +1,12 @@
+[package]
+name = "net-policy-core"
+version.workspace = true
+edition.workspace = true
+
+# 纯业务库：settings/rules 类型、校验（= 安全边界）、mihomo 配置生成、状态模型、
+# operation 状态机、规则计算、线协议类型。**不依赖** Tauri / axum / 管道 / 服务 / GUI /
+# tokio / windows-sys —— 保证可在任意平台单元测试（设计文档 §3）。
+[dependencies]
+serde = { workspace = true }
+serde_json = { workspace = true }
+anyhow = { workspace = true }

@@ -1,11 +1,7 @@
-//! Windows PowerShell 调用助手。
+//! Windows PowerShell 调用助手 + 原生防火墙/网卡状态读取。
 //!
-//! 通过 `-EncodedCommand`（base64 of UTF-16LE）把脚本整体传给 powershell，避开两类坑：
-//! ① SSH→cmd→PS 多层转义（验证阶段的血泪教训，见 docs/net-policy-validation-report.md §0.2.1）；
-//! ② 早期用 `-Command -` 经重定向 stdin 读**多行脚本块**时被增量解析吞掉输出——实测
-//!    `... | ForEach-Object { 多行 }` 整块零输出，导致进程枚举永远空（"未发现近期有公网连接的进程"）。
-//! `-EncodedCommand` 把同一段脚本一次性交给解析器，多行块不再被拆。
-//! 脚本顶部强制 UTF-8 输出编码，stdout 以 UTF-8 读回。
+//! 通过 `-EncodedCommand`（base64 of UTF-16LE）把脚本整体传给 powershell，避开多层转义与多行块被
+//! stdin 增量解析吞掉输出的坑（见 docs/net-policy-validation-report.md §0.2.1）。
 
 use anyhow::{bail, Context, Result};
 
@@ -13,14 +9,10 @@ use anyhow::{bail, Context, Result};
 const FIREWALL_POLICY_KEY: &str =
     r"SYSTEM\CurrentControlSet\Services\SharedAccess\Parameters\FirewallPolicy";
 
-/// run_ps 兜底超时：脚本自身最长的是 graceful_stop 的 14×500ms 轮询（~7s+），留足余量。
-/// 防火墙 cmdlet 偶发挂死时，无超时会让 `cmd.output()` 无限阻塞——spawn_blocking 线程
-/// 泄漏、UI 永久转圈。
 #[cfg(windows)]
 const RUN_PS_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(120);
 
 /// 在 Windows 上执行一段 PowerShell 脚本，返回 stdout（UTF-8）。超时（120s）杀进程并报错。
-/// 非 Windows 平台返回错误（net-policy 仅承诺 Windows，见设计 §14.0）。
 #[cfg(windows)]
 pub fn run_ps(script: &str) -> Result<String> {
     use base64::Engine;
@@ -30,7 +22,6 @@ pub fn run_ps(script: &str) -> Result<String> {
     let wrapped = format!(
         "[Console]::OutputEncoding=[Text.Encoding]::UTF8\n$ErrorActionPreference='Stop'\n{script}"
     );
-    // -EncodedCommand 要 base64(UTF-16LE)。一次性交给解析器，多行脚本块不再被 stdin 增量解析吞掉。
     let utf16: Vec<u8> = wrapped
         .encode_utf16()
         .flat_map(|u| u.to_le_bytes())
@@ -49,9 +40,8 @@ pub fn run_ps(script: &str) -> Result<String> {
     .stdin(Stdio::null())
     .stdout(Stdio::piped())
     .stderr(Stdio::piped());
-    crate::shared::proc::hide_console(&mut cmd); // 不弹控制台窗口
+    crate::proc::hide_console(&mut cmd);
     let mut child = cmd.spawn().context("spawn powershell")?;
-    // 轮询等待 + 超时杀。脚本输出都很小（<64KB 管道缓冲），不读管道不会把子进程堵死。
     let deadline = Instant::now() + RUN_PS_TIMEOUT;
     loop {
         match child.try_wait().context("wait powershell")? {
@@ -82,17 +72,12 @@ pub fn run_ps(_script: &str) -> Result<String> {
     bail!("net-policy 仅支持 Windows（当前非 Windows 平台）")
 }
 
-/// 当前是否为 Windows（命令层用来给出明确错误而非静默失败）。
+/// 当前是否为 Windows。
 pub fn is_windows() -> bool {
     cfg!(windows)
 }
 
-/// 当前进程是否以管理员（提权）身份运行。net-policy 改全局防火墙 + 建 TUN 网卡都需要管理员，
-/// 据此在 apply 前给出可读前置错误（而非中途撞 `New-NetFirewallRule: Access is denied` 的 CLIXML）。
-/// 失败/非 Windows 视为未提权（保守）。
-///
-/// **进程生命周期内提权状态不变** → `OnceLock` 缓存首次探测结果。原实现每次冷启动一个
-/// PowerShell（~0.3–1s），且在 `compute_status` 的 5s 轮询热路径上——纯浪费。
+/// 当前进程是否以管理员（提权）身份运行。进程生命周期内不变 → `OnceLock` 缓存。
 #[cfg(windows)]
 pub fn is_elevated() -> bool {
     static ELEVATED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
@@ -145,7 +130,7 @@ pub fn adapter_up(alias: &str) -> Result<bool> {
     let mut size = 15_000u32;
     let mut buf = vec![0u8; size as usize];
 
-    // SAFETY: Buffer is sized according to GetAdaptersAddresses contract and cast to the documented struct.
+    // SAFETY: Buffer is sized according to GetAdaptersAddresses contract.
     let mut ret = unsafe {
         GetAdaptersAddresses(
             0,
@@ -157,7 +142,7 @@ pub fn adapter_up(alias: &str) -> Result<bool> {
     };
     if ret == ERROR_BUFFER_OVERFLOW {
         buf.resize(size as usize, 0);
-        // SAFETY: Buffer was resized to the requested byte length.
+        // SAFETY: Buffer resized to requested length.
         ret = unsafe {
             GetAdaptersAddresses(
                 0,
@@ -174,7 +159,7 @@ pub fn adapter_up(alias: &str) -> Result<bool> {
 
     let mut cur = buf.as_mut_ptr().cast::<IP_ADAPTER_ADDRESSES_LH>();
     while !cur.is_null() {
-        // SAFETY: `cur` walks the linked list returned inside `buf` by GetAdaptersAddresses.
+        // SAFETY: `cur` walks the linked list returned inside `buf`.
         let adapter = unsafe { &*cur };
         let name = wide_ptr_to_string(adapter.FriendlyName);
         if name.eq_ignore_ascii_case(alias) {
@@ -208,7 +193,7 @@ pub fn firewall_default_outbound_domain() -> Result<String> {
     let mut ty = 0u32;
     let mut data = 0u32;
     let mut size = std::mem::size_of::<u32>() as u32;
-    // SAFETY: All pointers are valid for the duration of the call; `data` and `size` match REG_DWORD.
+    // SAFETY: All pointers valid for the call; data/size match REG_DWORD.
     let ret = unsafe {
         RegGetValueW(
             HKEY_LOCAL_MACHINE,
@@ -250,7 +235,7 @@ pub fn firewall_rule_group_count(group: &str) -> Result<u32> {
 
     let subkey = to_wide(&format!("{FIREWALL_POLICY_KEY}\\FirewallRules"));
     let mut key: HKEY = std::ptr::null_mut();
-    // SAFETY: `subkey` is a NUL-terminated UTF-16 string, `key` is an out parameter.
+    // SAFETY: `subkey` is NUL-terminated UTF-16; `key` is an out param.
     let ret = unsafe { RegOpenKeyExW(HKEY_LOCAL_MACHINE, subkey.as_ptr(), 0, KEY_READ, &mut key) };
     if ret != ERROR_SUCCESS {
         return Ok(0);
@@ -264,7 +249,7 @@ pub fn firewall_rule_group_count(group: &str) -> Result<u32> {
         let mut ty = 0u32;
         let mut data = vec![0u8; 16 * 1024];
         let mut data_len = data.len() as u32;
-        // SAFETY: Buffers are valid and lengths describe their capacities.
+        // SAFETY: Buffers valid, lengths describe capacities.
         let ret = unsafe {
             RegEnumValueW(
                 key,
@@ -282,7 +267,7 @@ pub fn firewall_rule_group_count(group: &str) -> Result<u32> {
                 if ty == REG_SZ || ty == REG_EXPAND_SZ {
                     let words = data_len as usize / 2;
                     let raw = data.as_ptr().cast::<u16>();
-                    // SAFETY: REG_SZ/REG_EXPAND_SZ data is UTF-16; `data_len` is byte length from Windows.
+                    // SAFETY: REG_SZ data is UTF-16; data_len is byte length from Windows.
                     let value = unsafe {
                         let slice = std::slice::from_raw_parts(raw, words);
                         let end = slice.iter().position(|c| *c == 0).unwrap_or(slice.len());

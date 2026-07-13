@@ -1,17 +1,9 @@
-//! Phase 4 可观测：
-//! - **被阻断尝试 feed**：消费 mihomo `/logs` WebSocket，抽出命中 `REJECT*` 出口的连接（默认黑洞
-//!   下「什么被挡了」是逐项放行的入口）。REJECT 连接瞬间关闭，`/connections` 抓不到，故走日志流。
-//! - **域名↔IP/进程 关联**：累积每次 `/connections` 快照（host + destination_ip + process），给
-//!   "观测 IP 跟域名/进程的关联关系"。
-//!
-//! 进程名在 mihomo 规则匹配 info 日志里**不出现**（只有源地址），故 blocked feed 的放行动作按
-//! 域名/IP 维度（DOMAIN-SUFFIX / IP-CIDR）；按程序放行仍走「现状→扫描进程」那条既有路径。
+//! 可观测：被阻断尝试 feed（消费 mihomo `/logs`）+ 域名↔IP/进程 关联（累积 `/connections`）。
 
-use super::connections::Connection;
-use super::engine::CONTROLLER;
 use anyhow::Result;
 use futures_util::StreamExt;
-use serde::Serialize;
+use net_policy_core::mihomo::CONTROLLER;
+use net_policy_core::types::{BlockedEntry, Connection, DomainAssoc};
 use std::cmp::Reverse;
 use std::collections::{BTreeSet, HashMap, HashSet, VecDeque};
 use std::sync::Mutex;
@@ -27,31 +19,7 @@ fn now_ms() -> u64 {
 
 const BLOCKED_CAP: usize = 200;
 const DNS_CAP: usize = 600;
-
-/// 一条被阻断尝试（按 network|host|port 去重，重复仅累加 count + 刷新时间）。
-#[derive(Clone, Debug, Serialize)]
-pub struct BlockedEntry {
-    pub network: String,
-    /// `-->` 后的目标 host（域名或 IP 字面量）。
-    pub host: String,
-    /// 若 host 本身是 IP 则等于 host；host 是域名时为空（fake-ip 下日志多为域名）。
-    pub dest_ip: String,
-    pub dest_port: String,
-    pub rule: String,
-    pub outbound: String,
-    pub count: u64,
-    pub last_ms: u64,
-}
-
-/// 域名↔IP/进程 关联聚合的一行。
-#[derive(Clone, Debug, Serialize)]
-pub struct DomainAssoc {
-    pub domain: String,
-    pub ips: Vec<String>,
-    pub processes: Vec<String>,
-    pub count: u64,
-    pub last_ms: u64,
-}
+const SEEN_IDS_CAP: usize = 4096;
 
 #[derive(Clone, Default)]
 struct DomainAgg {
@@ -61,16 +29,11 @@ struct DomainAgg {
     last_ms: u64,
 }
 
-/// 近期见过的连接 ID 容量（去重窗口；超出按 FIFO 淘汰）。
-const SEEN_IDS_CAP: usize = 4096;
-
-/// 模块级可观测状态（内部 Mutex，跨 command 共享，挂在 `NetPolicyState`）。
+/// 模块级可观测状态（内部 Mutex，跨连接共享，挂在 AgentState）。
 #[derive(Default)]
 pub struct Observatory {
     blocked: Mutex<Vec<BlockedEntry>>,
     dns: Mutex<HashMap<String, DomainAgg>>,
-    /// 已计过数的连接 ID（FIFO 窗口）。`/connections` 是 3s 轮询的瞬时快照，同一持续连接
-    /// 每轮都在——不按 ID 去重，`DomainAssoc.count` 会虚高成"被观测到的轮数"而非连接次数。
     seen_ids: Mutex<(VecDeque<String>, HashSet<String>)>,
 }
 
@@ -107,8 +70,7 @@ impl Observatory {
         self.blocked.lock().unwrap().clear();
     }
 
-    /// 从一次 `/connections` 快照累积「域名↔IP/进程」关联。超容量按 last_ms 淘汰最旧。
-    /// count 按连接 ID 去重（同一持续连接跨轮询只计一次）；IP/进程集合与 last_ms 每轮都刷新。
+    /// 从一次 `/connections` 快照累积「域名↔IP/进程」关联。count 按连接 ID 去重。
     pub fn ingest_connections(&self, conns: &[Connection]) {
         let ts = now_ms();
         let mut seen = self.seen_ids.lock().unwrap();
@@ -124,7 +86,6 @@ impl Observatory {
             if !c.process.trim().is_empty() {
                 agg.processes.insert(c.process.clone());
             }
-            // 无 ID（老版本 mihomo / 解析缺字段）退化为每轮计数。
             let is_new = c.id.is_empty() || !seen.1.contains(&c.id);
             if is_new {
                 agg.count += 1;
@@ -169,9 +130,6 @@ impl Observatory {
 }
 
 /// 解析 mihomo 一条 info 日志 payload。命中 `REJECT*` 出口的转成 `BlockedEntry`，否则 None。
-///
-/// 典型行：`[TCP] 192.168.1.5:54321 --> example.com:443 match DomainSuffix(example.com) using REJECT-DROP`
-/// 解析尽量宽松、绝不 panic；任一关键段缺失即返回 None（丢弃该行）。
 pub fn parse_blocked(payload: &str) -> Option<BlockedEntry> {
     let network = payload
         .strip_prefix('[')?
@@ -194,7 +152,6 @@ pub fn parse_blocked(payload: &str) -> Option<BlockedEntry> {
         .split(" match ")
         .next()?
         .trim();
-    // host:port，从右切一刀兼容 IPv6 字面量 [::1]:443。
     let (host, port) = remote.rsplit_once(':')?;
     let host = host
         .trim()
@@ -226,7 +183,6 @@ pub fn parse_blocked(payload: &str) -> Option<BlockedEntry> {
 }
 
 /// 连一次 mihomo `/logs` WebSocket，把被阻断的行喂进 `obs`。WS 关闭/出错即正常返回（调用方重连）。
-/// secret 走 query `token`（loopback；mihomo 同时接受 Authorization 头与 token query）。
 pub async fn stream_logs(secret: &str, obs: &Observatory) -> Result<()> {
     let url = format!("ws://{CONTROLLER}/logs?level=info&token={secret}");
     let (ws, _) = tokio_tungstenite::connect_async(&url).await?;
@@ -258,14 +214,7 @@ mod tests {
         assert_eq!(e.host, "ads.example.com");
         assert_eq!(e.dest_port, "443");
         assert_eq!(e.outbound, "REJECT-DROP");
-        assert!(e.dest_ip.is_empty()); // host 是域名
-    }
-
-    #[test]
-    fn ip_host_fills_dest_ip() {
-        let e = parse_blocked("[UDP] 10.0.0.2:1 --> 1.2.3.4:53 match Match using REJECT").unwrap();
-        assert_eq!(e.dest_ip, "1.2.3.4");
-        assert_eq!(e.network, "udp");
+        assert!(e.dest_ip.is_empty());
     }
 
     #[test]

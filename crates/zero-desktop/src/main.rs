@@ -294,6 +294,13 @@ fn run_gui(workspace: PathBuf) -> Result<()> {
             modules::net_policy::net_policy_clear_blocked,
             modules::net_policy::net_policy_dns_map,
             modules::net_policy::net_policy_verify,
+            modules::net_policy::net_policy_requests,
+            modules::net_policy::net_policy_events,
+            modules::net_policy::net_policy_routes,
+            modules::net_policy::net_policy_process_tree,
+            modules::net_policy::net_policy_temp_status,
+            modules::net_policy::net_policy_temp_direct_on,
+            modules::net_policy::net_policy_temp_direct_off,
             // llm 模块（公共大模型层：配置 / 提示词 / 自测 / 对话总结）
             modules::llm::llm_get_config,
             modules::llm::llm_put_config,

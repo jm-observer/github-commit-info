@@ -3,9 +3,9 @@
 //! 落盘布局（见 docs/net-policy-validation-report.md §14.8）：
 //! `{workspace}/net-policy/{settings.json, rules.json}`。
 //! 安全约定：WireGuard 私钥不入 `rules.json`；存在 `settings.json` 的 `wg`
-//! 段，后续可迁到 Windows Credential Manager（首版直存，已在文档标注）。
+//! 段，后续可迁到 Windows Credential Manager / DPAPI（首版直存，已在文档标注）。
 
-use super::valid;
+use crate::valid;
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
@@ -138,10 +138,93 @@ pub struct WgConfig {
     pub pre_shared_key: String,
     #[serde(default = "default_mtu")]
     pub mtu: u32,
+    /// AmneziaWG 混淆参数（可选）。填了即让 mihomo 以 AmneziaWG 方式握手，破坏原生 WireGuard
+    /// 的固定包特征（148/92 字节 + 固定 magic header），规避对 WG 流量的 DPI 识别丢包。
+    /// **客户端与服务端必须用完全相同的一组参数**，否则握手失败。留空 = 标准 WireGuard。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub amnezia: Option<AmneziaConfig>,
 }
 
 fn default_mtu() -> u32 {
     1420
+}
+
+/// 解析无符号整数，兼容十进制与 `0x` 十六进制（AmneziaWG 的 H* 常写成大十进制，个别工具用 hex）。
+fn parse_uint(s: &str) -> Option<u64> {
+    let s = s.trim();
+    if let Some(hex) = s.strip_prefix("0x").or_else(|| s.strip_prefix("0X")) {
+        u64::from_str_radix(hex, 16).ok()
+    } else {
+        s.parse::<u64>().ok()
+    }
+}
+
+/// AmneziaWG 混淆参数（对应 mihomo 的 `amnezia-wg-option`）。全部为数字：序列化成纯数字 YAML，
+/// **无字符串注入面**（满足 §3.1 跨完整性输入边界——这些值最终进 agent 提权生成的 mihomo 配置）。
+///
+/// 语义（AmneziaWG 官方）：`jc` 握手前发送的垃圾包数量；`jmin`/`jmax` 垃圾包大小上下界（字节）；
+/// `s1`/`s2`（及 1.5+ 的 `s3`/`s4`）init/response 握手包前置的随机字节数；`h1`~`h4` 四种消息类型
+/// （init/response/transport/underload）的自定义 magic header——**必须互不相同**才能区分包类型。
+/// `jc`=`s1`=`s2`=0 即不加任何垃圾（退化为仅改 magic header）。
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct AmneziaConfig {
+    pub jc: u16,
+    pub jmin: u16,
+    pub jmax: u16,
+    pub s1: u16,
+    pub s2: u16,
+    /// AmneziaWG 1.5+ 扩展握手垃圾（旧版无此参数则留 0）。
+    #[serde(default)]
+    pub s3: u16,
+    #[serde(default)]
+    pub s4: u16,
+    pub h1: u32,
+    pub h2: u32,
+    pub h3: u32,
+    pub h4: u32,
+}
+
+impl AmneziaConfig {
+    /// 校验混淆参数——这些值虽是纯数字（无注入面），但错配会让 mihomo 起栈失败或握手不上，
+    /// 且必须满足 AmneziaWG 的硬约束，故当安全/正确性边界一并校验。
+    pub fn validate(&self) -> Result<()> {
+        // H1~H4 必须互不相同：AmneziaWG 靠它们区分 init/response/transport/underload 四类包，
+        // 任意两个相等则无法分辨包类型，隧道必然不通。
+        let h = [self.h1, self.h2, self.h3, self.h4];
+        for i in 0..h.len() {
+            for j in (i + 1)..h.len() {
+                if h[i] == h[j] {
+                    anyhow::bail!("AmneziaWG H1~H4 必须互不相同（H{}==H{}）", i + 1, j + 1);
+                }
+            }
+        }
+        // 官方建议 magic header 避开默认的 1/2/3/4（保留给标准 WireGuard），否则混淆意义打折。
+        if h.iter().any(|&v| v <= 4) {
+            anyhow::bail!("AmneziaWG H1~H4 应大于 4（避开标准 WireGuard 的 1/2/3/4）");
+        }
+        // 垃圾包大小上下界一致性 + 合理上限（防呆、防超大 junk 拖垮握手）。
+        if self.jmin > self.jmax {
+            anyhow::bail!("AmneziaWG Jmin 不能大于 Jmax");
+        }
+        if self.jmax > 1280 {
+            anyhow::bail!("AmneziaWG Jmax 过大（应 ≤ 1280，避免超 MTU 分片）");
+        }
+        if self.jc > 128 {
+            anyhow::bail!("AmneziaWG Jc 过大（垃圾包数应 ≤ 128）");
+        }
+        // S1..S4 前置随机字节数上限（AmneziaWG 建议单值 < 1280）。
+        for (name, v) in [
+            ("S1", self.s1),
+            ("S2", self.s2),
+            ("S3", self.s3),
+            ("S4", self.s4),
+        ] {
+            if v > 1280 {
+                anyhow::bail!("AmneziaWG {name} 过大（应 ≤ 1280）");
+            }
+        }
+        Ok(())
+    }
 }
 
 impl WgConfig {
@@ -167,6 +250,8 @@ impl WgConfig {
         let mut public_key = String::new();
         let mut pre_shared_key = String::new();
         let mut endpoint = String::new();
+        // AmneziaWG 混淆参数（在 [Interface] 段；标准 wg-quick 无这些键，全 None 即普通 WG）。
+        let mut am: std::collections::HashMap<&'static str, u64> = std::collections::HashMap::new();
 
         for raw in text.lines() {
             let line = raw.trim();
@@ -193,6 +278,30 @@ impl WgConfig {
                 (Section::Peer, "publickey") => public_key = val,
                 (Section::Peer, "presharedkey") => pre_shared_key = val,
                 (Section::Peer, "endpoint") => endpoint = val,
+                // AmneziaWG 的 Jc/Jmin/Jmax/S1..S4/H1..H4（十进制或 0x 十六进制）。
+                (
+                    Section::Interface,
+                    k @ ("jc" | "jmin" | "jmax" | "s1" | "s2" | "s3" | "s4" | "h1" | "h2" | "h3"
+                    | "h4"),
+                ) => {
+                    if let Some(n) = parse_uint(&val) {
+                        // key 是从固定字面量匹配来的，映射到 'static 名字。
+                        let name = match k {
+                            "jc" => "jc",
+                            "jmin" => "jmin",
+                            "jmax" => "jmax",
+                            "s1" => "s1",
+                            "s2" => "s2",
+                            "s3" => "s3",
+                            "s4" => "s4",
+                            "h1" => "h1",
+                            "h2" => "h2",
+                            "h3" => "h3",
+                            _ => "h4",
+                        };
+                        am.insert(name, n);
+                    }
+                }
                 _ => {}
             }
         }
@@ -237,6 +346,28 @@ impl WgConfig {
             .parse()
             .map_err(|_| anyhow::anyhow!("Endpoint 端口非法：{port_s}"))?;
 
+        // AmneziaWG：只要出现任一 magic header（H1~H4）即视为 AmneziaWG 配置，缺失的数值补 0。
+        // （Jc/S* 全 0 是合法的「仅改 magic header」配置；H 才是判据。）校验留给 validate。
+        let amnezia = if ["h1", "h2", "h3", "h4"].iter().any(|k| am.contains_key(k)) {
+            let g16 = |k: &str| am.get(k).copied().unwrap_or(0).min(u16::MAX as u64) as u16;
+            let g32 = |k: &str| am.get(k).copied().unwrap_or(0).min(u32::MAX as u64) as u32;
+            Some(AmneziaConfig {
+                jc: g16("jc"),
+                jmin: g16("jmin"),
+                jmax: g16("jmax"),
+                s1: g16("s1"),
+                s2: g16("s2"),
+                s3: g16("s3"),
+                s4: g16("s4"),
+                h1: g32("h1"),
+                h2: g32("h2"),
+                h3: g32("h3"),
+                h4: g32("h4"),
+            })
+        } else {
+            None
+        };
+
         Ok(WgConfig {
             server: host,
             port,
@@ -245,6 +376,7 @@ impl WgConfig {
             public_key,
             pre_shared_key,
             mtu: mtu.unwrap_or_else(default_mtu),
+            amnezia,
         })
     }
 
@@ -266,6 +398,9 @@ impl WgConfig {
         valid::wg_key(&self.public_key).context("WG 公钥非法")?;
         if !self.pre_shared_key.is_empty() {
             valid::wg_key(&self.pre_shared_key).context("WG 预共享密钥非法")?;
+        }
+        if let Some(a) = &self.amnezia {
+            a.validate().context("AmneziaWG 混淆参数非法")?;
         }
         Ok(())
     }
@@ -369,6 +504,14 @@ impl NetPolicySettings {
     }
 }
 
+/// 临时直连（限时应急）覆盖：`active` 时默认出口临时改 DIRECT，`except` 进程强制 Blackhole
+/// （防敏感流量在隧道故障时泄漏到直连）。这是 agent 的**运行态**，不落 settings.json；配置生成时传入。
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct TempDirect {
+    pub active: bool,
+    pub except: Vec<ProcessRef>,
+}
+
 /// 规则集合（与 settings 分文件存）。
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct RuleSet {
@@ -438,6 +581,22 @@ impl RuleSet {
         }
         Ok(())
     }
+}
+
+/// 跨表一致性校验（settings + rules）：除各自的格式校验外，确认「指向海外(SBN)的默认出口 / 规则 /
+/// 程序组」都有合法 WG 兜底——否则 mihomo 加载会引用到不存在的 `wg-out`，给出可读报错而非起栈超时。
+///
+/// 从 zero-desktop `mod.rs::validate_combined` 提级到 core（纯逻辑，agent apply/reload 复用）。
+pub fn validate_combined(settings: &NetPolicySettings, rules: &RuleSet) -> Result<()> {
+    settings.validate()?;
+    rules.validate()?;
+    let wg_needed = settings.default_route == Route::Wg
+        || rules.rules.iter().any(|r| r.route() == Route::Wg)
+        || rules.groups.iter().any(|g| g.route == Route::Wg);
+    if wg_needed && settings.wg.validate().is_err() {
+        anyhow::bail!("有「默认出口/规则」指向海外(SBN)，但 WireGuard 未配置或无效——请先配置 SBN，或把它们改为「阻断/直连」");
+    }
+    Ok(())
 }
 
 /// net-policy workspace 子目录。
@@ -558,6 +717,91 @@ AllowedIPs = 0.0.0.0/0, ::/0
     }
 
     #[test]
+    fn parse_wg_quick_with_amnezia() {
+        let conf = "\
+[Interface]
+PrivateKey = aGVsbG9oZWxsb2hlbGxvaGVsbG9oZWxsb2hlbGxvMTI=
+Address = 10.66.66.5/32
+Jc = 4
+Jmin = 40
+Jmax = 70
+S1 = 15
+S2 = 20
+H1 = 1234567890
+H2 = 2345678901
+H3 = 3456789012
+H4 = 987654321
+
+[Peer]
+PublicKey = cGVlcnB1YmtleXB1YmtleXB1YmtleXB1YmtleXB1Yj0=
+Endpoint = 38.209.122.38:29987
+";
+        let wg = WgConfig::from_wg_quick(conf).expect("parse");
+        let a = wg.amnezia.as_ref().expect("应解析出 amnezia");
+        assert_eq!(a.jc, 4);
+        assert_eq!(a.jmin, 40);
+        assert_eq!(a.jmax, 70);
+        assert_eq!(a.s1, 15);
+        assert_eq!(a.s2, 20);
+        assert_eq!(a.h1, 1234567890);
+        assert_eq!(a.h4, 987654321);
+        assert_eq!(a.s3, 0, "旧版无 S3 → 0");
+        wg.validate().expect("合法 amnezia 应通过校验");
+    }
+
+    #[test]
+    fn parse_wg_quick_without_amnezia_is_none() {
+        let conf = "\
+[Interface]
+PrivateKey = aGVsbG9oZWxsb2hlbGxvaGVsbG9oZWxsb2hlbGxvMTI=
+Address = 10.0.0.2
+
+[Peer]
+PublicKey = cGVlcnB1YmtleXB1YmtleXB1YmtleXB1YmtleXB1Yj0=
+Endpoint = 1.2.3.4:51820
+";
+        let wg = WgConfig::from_wg_quick(conf).expect("parse");
+        assert!(wg.amnezia.is_none(), "无 Amnezia 键 → None（普通 WG）");
+    }
+
+    #[test]
+    fn amnezia_validate_rejects_duplicate_and_low_headers() {
+        let base = AmneziaConfig {
+            jc: 4,
+            jmin: 40,
+            jmax: 70,
+            s1: 0,
+            s2: 0,
+            s3: 0,
+            s4: 0,
+            h1: 100,
+            h2: 200,
+            h3: 300,
+            h4: 400,
+        };
+        base.validate().expect("互异且 >4 应通过");
+        // H 重复
+        let dup = AmneziaConfig {
+            h2: 100,
+            ..base.clone()
+        };
+        assert!(dup.validate().is_err(), "H1==H2 应被拒");
+        // H 落在保留区 1~4
+        let low = AmneziaConfig {
+            h1: 3,
+            ..base.clone()
+        };
+        assert!(low.validate().is_err(), "H≤4 应被拒");
+        // Jmin>Jmax
+        let jbad = AmneziaConfig {
+            jmin: 80,
+            jmax: 70,
+            ..base.clone()
+        };
+        assert!(jbad.validate().is_err(), "Jmin>Jmax 应被拒");
+    }
+
+    #[test]
     fn parse_wg_quick_minimal_defaults_mtu_and_optional_psk() {
         let conf = "\
 [Interface]
@@ -640,5 +884,22 @@ Endpoint = 1.2.3.4:51820
 
         assert!(!try_load_settings(&workspace).unwrap().enabled);
         assert!(try_load_rules(&workspace).unwrap().rules.is_empty());
+    }
+
+    #[test]
+    fn validate_combined_rejects_wg_route_without_wg() {
+        let settings = NetPolicySettings {
+            default_route: Route::Direct,
+            ..Default::default()
+        };
+        let rules = RuleSet {
+            rules: vec![Rule::DomainSuffix {
+                value: "example.com".into(),
+                route: Route::Wg,
+            }],
+            groups: vec![],
+        };
+        // 规则指向海外但 WG 未配 → 跨表校验应拒绝。
+        assert!(validate_combined(&settings, &rules).is_err());
     }
 }

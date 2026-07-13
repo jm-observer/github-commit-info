@@ -1,51 +1,30 @@
 //! Windows 防火墙 kill-switch（§0.4/§0.9 验证过的"默认 Block + 白名单"模型）。
 //!
-//! 模型：`Set-NetFirewallProfile -DefaultOutboundAction Block` + 纯 Allow 白名单
-//! （v1 的「Allow + Block 兜底」在 New-NetFirewallRule 层不工作，§0.2②实测 Block 永远赢 Allow）。
-//!
-//! 白名单（v2.2 重设计，修复审查 P1-1：原 RemoteAddress 白名单使域名/程序 DIRECT 在
-//! kill-switch 下被拦死）：
-//! - **R-mihomo（Program=mihomo.exe）**：放行 mihomo 进程出物理网卡的全部流量
-//!   —— 覆盖 WG 握手、上游 DNS（§0.8.1）、**以及 DIRECT 命中后 mihomo 替程序/域名拨号**。
-//!   fail-closed 不破：mihomo 崩溃 → 进程没了 → 此规则不匹配任何流量 → 物理全 Block。
-//! - R-TUN(InterfaceAlias=Meta)：应用流量进 TUN。
-//! - R-LO(127.0.0.0/8) / R-LAN(物理 NIC 的 LAN 段，非 mihomo 的本机互访)。
-//! - R-IPv6Block（block_ipv6 时）：显式 Block 2000::/3，真正阻断 IPv6 公网（修 P2-1）。
-//!
-//! 移除（-Remove）按状态文件还原原 DefaultOutboundAction（实测原值 NotConfigured，不可盲设 Allow）。
+//! 白名单：R-mihomo（Program=mihomo.exe，放行 mihomo 出物理网卡）/ R-TUN(Meta) / R-LO / R-LAN /
+//! R-IPv6Block。移除按状态文件还原原 DefaultOutboundAction（原值多为 NotConfigured，不可盲设 Allow）。
 
-use super::config::{killswitch_state_path, NetPolicySettings, RuleSet};
-use super::valid;
-use super::win::run_ps;
+use crate::win::run_ps;
 use anyhow::Result;
-use serde::Serialize;
+use net_policy_core::config::{killswitch_state_path, NetPolicySettings, RuleSet};
+use net_policy_core::types::FirewallStatus;
+use net_policy_core::valid;
 use std::path::Path;
 
 const GROUP: &str = "NetPolicy-KillSwitch";
 /// mihomo TUN 适配器名（gvisor wintun，固定 "Meta"）。
 const TUN_ALIAS: &str = "Meta";
 
-#[derive(Clone, Debug, Serialize)]
-pub struct FirewallStatus {
-    pub default_outbound: String,
-    pub rule_count: u32,
-    pub active: bool,
-}
-
 fn ps_squote(s: &str) -> String {
     s.replace('\'', "''")
 }
 
-/// 阶段 A（审查 P1-2）：**在启动 mihomo 之前** 建立 fail-closed——快照 + 不依赖 Meta 的白名单
-/// （KS-mihomo / KS-LO / KS-LAN / KS-IPv6Block）+ 设默认 Block。这样 mihomo 起栈期间已有兜底，
-/// 消除"先起 mihomo 再补防火墙"的无保护窗口。
+/// 阶段 A：**在启动 mihomo 之前** 建立 fail-closed——快照 + 不依赖 Meta 的白名单 + 设默认 Block。
 pub fn apply_base(workspace: &Path, settings: &NetPolicySettings, mihomo_bin: &Path) -> Result<()> {
     run_ps(&build_base_script(workspace, settings, mihomo_bin)?)?;
     Ok(())
 }
 
-/// 阶段 B：mihomo 起栈、Meta 适配器出现后，补 KS-TUN（放行应用流量进 TUN）。
-/// 此前 app→Meta 被默认 Block 拦（不泄漏，仅短暂不通），符合 fail-closed。
+/// 阶段 B：mihomo 起栈、Meta 出现后，补 KS-TUN（放行应用流量进 TUN）。
 pub fn apply_tun(_workspace: &Path) -> Result<()> {
     run_ps(&format!(
         "New-NetFirewallRule -Group '{GROUP}' -Name 'KS-TUN' -DisplayName 'KS TUN' -Direction Outbound -Action Allow -InterfaceAlias '{TUN_ALIAS}' -Enabled True | Out-Null; 'OK'"
@@ -57,7 +36,6 @@ fn base_rules_ps(settings: &NetPolicySettings, mihomo_bin: &Path) -> String {
     let lan = settings.lan_ranges.join(",");
     let mihomo = ps_squote(&mihomo_bin.to_string_lossy());
     let mut s = String::new();
-    // R-mihomo：放行 mihomo 进程出物理网卡（覆盖 WG 握手 / 上游 DNS / DIRECT 拨号）。
     s.push_str(&format!(
         "New-NetFirewallRule -Group $G -Name 'KS-mihomo' -DisplayName 'KS mihomo egress' -Direction Outbound -Action Allow -Program '{mihomo}' -InterfaceAlias $eth -Enabled True | Out-Null\n"
     ));
@@ -76,8 +54,6 @@ fn base_rules_ps(settings: &NetPolicySettings, mihomo_bin: &Path) -> String {
 }
 
 fn validate_fw_inputs(settings: &NetPolicySettings) -> Result<()> {
-    // kill-switch 白名单不直接用 WG server IP（放行的是 mihomo.exe 整进程），故 WG 留空（纯黑洞、
-    // 不依赖 SBN）时不应卡防火墙——仅当填了 server 才校验其为合法 IP。
     if !settings.wg.server.trim().is_empty() {
         valid::ip(&settings.wg.server)?;
     }
@@ -119,7 +95,8 @@ Get-NetFirewallRule -Group $G -ErrorAction SilentlyContinue | Remove-NetFirewall
     ))
 }
 
-/// CLI 预览用：完整脚本（base + KS-TUN，展示全部规则）。实际 apply 走 apply_base + apply_tun 两阶段。
+/// CLI 预览用：完整脚本（base + KS-TUN）。真实 apply 走 apply_base + apply_tun 两阶段。
+#[allow(dead_code)]
 pub fn build_apply_script(
     workspace: &Path,
     settings: &NetPolicySettings,
@@ -127,7 +104,6 @@ pub fn build_apply_script(
     mihomo_bin: &Path,
 ) -> Result<String> {
     let base = build_base_script(workspace, settings, mihomo_bin)?;
-    // 在 Set Block 前插入 KS-TUN（仅为预览完整性；真实流程 KS-TUN 在 mihomo 起栈后补）。
     let tun = format!(
         "New-NetFirewallRule -Group $G -Name 'KS-TUN' -DisplayName 'KS TUN' -Direction Outbound -Action Allow -InterfaceAlias '{TUN_ALIAS}' -Enabled True | Out-Null\n"
     );
@@ -149,14 +125,27 @@ if(Test-Path $state){{
   $s=Get-Content $state -Raw | ConvertFrom-Json
   foreach($p in 'Domain','Private','Public'){{ if($s.$p){{ Set-NetFirewallProfile -Profile $p -DefaultOutboundAction $s.$p }} }}
   Remove-Item $state -Force
-}}else{{
-  Set-NetFirewallProfile -Profile Domain,Private,Public -DefaultOutboundAction NotConfigured
 }}
+# 无快照：只删本产品规则，**不动 Profile**（评审点 6：不擅自设 NotConfigured，避免覆盖用户原有 Block 策略；
+# 需强设 NotConfigured 走 repair --force）。
 'OK'
 "#
     );
     run_ps(&script)?;
     Ok(())
+}
+
+/// 只删本产品的规则、**不动 Profile**（repair 的 `removed_owned_rules_only` 用；无可信快照时的安全默认）。
+pub fn remove_owned_rules_only() -> Result<()> {
+    run_ps(&format!(
+        "Get-NetFirewallRule -Group '{GROUP}' -ErrorAction SilentlyContinue | Remove-NetFirewallRule; 'OK'"
+    ))?;
+    Ok(())
+}
+
+/// 是否存在可信的 Profile 快照（repair 分级判定用）。
+pub fn snapshot_exists(workspace: &Path) -> bool {
+    killswitch_state_path(workspace).exists()
 }
 
 /// 查询 kill-switch 当前状态。
@@ -165,8 +154,8 @@ pub fn status() -> Result<FirewallStatus> {
 }
 
 fn native_status() -> Result<FirewallStatus> {
-    let default_outbound = super::win::firewall_default_outbound_domain()?;
-    let rule_count = super::win::firewall_rule_group_count(GROUP)?;
+    let default_outbound = crate::win::firewall_default_outbound_domain()?;
+    let rule_count = crate::win::firewall_rule_group_count(GROUP)?;
     Ok(FirewallStatus {
         active: default_outbound.eq_ignore_ascii_case("Block"),
         default_outbound,

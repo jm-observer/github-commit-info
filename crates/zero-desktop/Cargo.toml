@@ -42,7 +42,9 @@ axum = { workspace = true }
 tower-http = { workspace = true }
 headless_chrome = "1.0"
 tracing = "0.1"
-# net-policy 模块依赖（controller secret 随机生成 + PowerShell -EncodedCommand 传脚本）
+# net-policy：GUI 现为**瘦客户端**，经命名管道调 net-policy-agent（提权副作用全在 agent）。
+net-policy-core = { path = "../net-policy-core" }
+net-policy-client = { path = "../net-policy-client" }
 rand = "0.8"
 base64 = "0.21"
 # Speech 模块依赖

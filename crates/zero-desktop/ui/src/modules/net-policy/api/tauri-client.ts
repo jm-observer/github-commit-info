@@ -17,6 +17,22 @@ export interface RuleSet {
   groups: unknown[]
 }
 
+/** AmneziaWG 混淆参数（对应 mihomo amnezia-wg-option）。填了即让 mihomo 以 AmneziaWG 方式
+ *  握手，破坏原生 WireGuard 固定包特征以规避 DPI 丢包。客户端/服务端参数必须完全一致。 */
+export interface AmneziaConfig {
+  jc: number
+  jmin: number
+  jmax: number
+  s1: number
+  s2: number
+  s3: number
+  s4: number
+  h1: number
+  h2: number
+  h3: number
+  h4: number
+}
+
 export interface WgConfig {
   server: string
   port: number
@@ -25,6 +41,8 @@ export interface WgConfig {
   public_key: string
   pre_shared_key: string
   mtu: number
+  /** 可选：AmneziaWG 混淆。缺省 = 标准 WireGuard。导入带 Jc/H1.. 的 .conf 时自动带出。 */
+  amnezia?: AmneziaConfig | null
 }
 
 export interface Settings {
@@ -61,6 +79,59 @@ export interface Status {
   enabled: boolean
   /** 当前进程是否以管理员身份运行（改防火墙/建 TUN 需要）。false → 提示并禁用「开始观察」。 */
   elevated: boolean
+  /** 记录库是否已降级为内存（磁盘打开失败，历史将在重启后丢失）。 */
+  record_store_degraded?: boolean
+}
+
+// ── 记录 / 进程树 / 路由 / 临时直连（minor 2） ─────────────────────────────────
+
+export interface RequestLogEntry {
+  ts_ms: number
+  conn_id: string
+  process: string
+  process_path: string
+  host: string
+  dest_ip: string
+  dest_port: string
+  network: string
+  outbound: string
+  rule: string
+}
+
+export interface LifecycleEvent {
+  ts_ms: number
+  kind: string
+  detail: string
+}
+
+export interface ProcessNode {
+  pid: number
+  ppid: number
+  name: string
+  path: string
+  children: ProcessNode[]
+}
+
+/** 一条生效路由（priority = 匹配顺序；source = builtin_lan/temp_except/group/rule/default）。 */
+export interface RouteEntry {
+  priority: number
+  kind: string
+  value: string
+  route: Route
+  source: string
+  deletable: boolean
+}
+
+export interface ProcessRef {
+  kind: 'process_path' | 'process_name'
+  value: string
+}
+
+export interface TempDirectStatus {
+  active: boolean
+  until_ms: number | null
+  remaining_secs: number
+  except: ProcessRef[]
 }
 
 export interface ProcessCandidate {
@@ -177,4 +248,21 @@ export const NetPolicyAPI = {
   /** 域名↔IP/进程 关联快照。 */
   dnsMap: () => invoke<DomainAssoc[]>('net_policy_dns_map'),
   verify: () => invoke<VerifyReport>('net_policy_verify'),
+
+  // ── 记录 / 进程树 / 路由 / 临时直连（minor 2） ─────────────────────────────
+  /** 历史进程请求记录（最近 limit 条，倒序；后端上限 1000）。 */
+  requests: (limit = 500) => invoke<RequestLogEntry[]>('net_policy_requests', { limit }),
+  /** 生命周期事件（启停 / 策略 / 临时直连，最近 limit 条）。 */
+  events: (limit = 200) => invoke<LifecycleEvent[]>('net_policy_events', { limit }),
+  /** 生效路由列表（含优先级/来源/是否可删）。 */
+  routes: () => invoke<RouteEntry[]>('net_policy_routes'),
+  /** 当前进程树。 */
+  processTree: () => invoke<ProcessNode[]>('net_policy_process_tree'),
+  /** 临时直连状态（剩余时间等）。 */
+  tempStatus: () => invoke<TempDirectStatus>('net_policy_temp_status'),
+  /** 开启临时直连（限时应急）：durationSecs 后自动还原；except 进程被强制 Blackhole。 */
+  tempDirectOn: (durationSecs: number, except: ProcessRef[]) =>
+    invoke<TempDirectStatus>('net_policy_temp_direct_on', { durationSecs, except }),
+  /** 提前解除临时直连。 */
+  tempDirectOff: () => invoke<TempDirectStatus>('net_policy_temp_direct_off'),
 }
