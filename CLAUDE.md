@@ -223,8 +223,7 @@ pwsh ./deploy-g10.ps1 -SkipBuild # 仅复制已有产物
 - [docs/english-shadow-scoring-ui-design.md](docs/english-shadow-scoring-ui-design.md) — 评分可解释 + 对齐明细 UI 设计：评分细则透明化 + 新增「对齐可靠性/uncertain」(把没对齐上的音素从 bad 改判存疑,不冤枉用户) + 音素明细表展示。
 - [docs/english-pron-evaluator-design.md](docs/english-pron-evaluator-design.md) — 发音评测单元(PronEvaluator)设计：词/短语/句通用的可复用组件(评分+朗读+听标准TTS+听自己+LLM 二次反馈),含失败词 drill-down 单练。
 - [docs/distributed-worker-design.md](docs/distributed-worker-design.md) — 分布式爬虫底座设计（公共库 · Worker · 出口 IP 池）：统一模型（一支 fleet 两个面 / 库的两档接入：请求级 egress 代理 + 任务级 worker 分发 / cookie·匿名 IP 策略分裂 / proxy_pool 提级）+ pull 调度 + 两段式自更新。
-- [docs/net-policy-observer-first-design.md](docs/net-policy-observer-first-design.md) — 网络出口策略「观察者优先」设计：默认出口三档姿态（直连观察/海外VPN/阻断收紧，默认直连）+ 与 SBN 解耦 + 关闭/停止语义（关窗=保持、仅手动停止拆除并清 enabled）+ 防火墙 kill-switch 跟随姿态（观察不挂、切姿态 reload 对齐）+ 逐项放行热加载 + 可观测（观察主表 / 被阻断 feed / 域名↔IP）。
-- [docs/zero-desktop-firewall-extraction-design.md](docs/zero-desktop-firewall-extraction-design.md) — 把 `net_policy` 独立为桌面 app `zero-desktop-firewall` **并进一步拆到单独 git 仓** 的方案：依据是 net_policy「零后端 + 零 toolkit 内部依赖」（已核实,唯一重外部依赖 custom-utils 是版本依赖）；含身份改名三件套（productName/identifier/数据目录）+ 8 非网络模块 `git mv` 移出到承接软件 + 旧 workspace 数据一次性迁移 + 依赖/UI/配置瘦身 + `filter-repo` 保历史拆仓（两阶段:先证可独立编译→再物理拆仓）。net_policy 行为/端口/命令名全不变;提权/托盘等留待后续。
+- [docs/net-policy/](docs/net-policy/README.md) — **网络出口策略文档集**（入口 README 有完整地图）：观察者优先行为模型（三姿态 直连观察/海外VPN/阻断收紧 + kill-switch 跟随姿态 + 与 SBN 解耦）、agent/GUI 分离架构（四 crate + 版本化管道协议）、真机验证报告（VP 矩阵）、独立 `net-policy-gui` app（含 AmneziaWG 混淆、mihomo 日志、切姿态重置连接）、UI 设计稿。拆独立 git 仓（`zero-desktop-firewall`）为规划中未落地项。
 - [docs/toolkit-rfc/2026-06-04-initial-skeleton/data-model.md](docs/toolkit-rfc/2026-06-04-initial-skeleton/data-model.md) — SQLite 数据模型。
 - [docs/toolkit-rfc/2026-06-10-toolkit-elevation/plan.md](docs/toolkit-rfc/2026-06-10-toolkit-elevation/plan.md) — 提级为统一工具中台的分阶段规划。
 - [docs/retrospective.md](docs/retrospective.md) — 复盘记录。

@@ -1,7 +1,7 @@
 # 网络出口策略：观察者优先 + 生命周期 + 防火墙跟随姿态
 
 > 承接 [net-policy-validation-report.md](net-policy-validation-report.md)（真机验证结论）与
-> [unified-desktop-shell-design.md](unified-desktop-shell-design.md) §14（原始设计）、
+> [unified-desktop-shell-design.md](../unified-desktop-shell-design.md) §14（原始设计）、
 > [net-policy-ui-redesign.md](net-policy-ui-redesign.md)（信息架构重排）。本文记录**行为模型的一次转向**：
 > 从「默认走海外 + 强依赖 SBN」改为「**观察者优先** + 姿态可配 + 与 SBN 解耦」，以及随之定下的
 > **关闭/停止语义**与**防火墙跟随姿态**。仅 Windows。

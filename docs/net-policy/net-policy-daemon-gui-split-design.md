@@ -388,9 +388,69 @@ GUI↔agent 桥接（命名管道连接、三姿态切换、ApplyStepper 事件�
 
 ### 14.1 后续待办（GUI 层，2026-07-14 用户反馈）
 
+> **✅ 下列两项本轮均已落地**（`FlowTopology` 按实际连接点亮 + 实时出口 IP、诊断页拆出「当前实时状态」面板 `LiveStatusPanel`），详见 §15.4。
+
 - **数据通路图（`FlowTopology`）应反映实际流量、而非只按策略点亮**：现在「点亮哪条出口分支」只看 `status.default_route`（策略默认出口），切姿态后（尤其旧长连接残留）会与真实走向割裂——用户切直连后，海外分支仍显示 `wg_count` 活跃计数。应改为**按 `conns` 每条连接的实际 `chains`（direct/wg-out/reject）点亮 + 计数**，并显示实时出口 IP，真实反映「现在流量怎么走」。
 - **诊断页（`VerifyMatrix`）把历史结论与当前状态混在一起**：`ROWS` 硬编码自旧报告 §0.8.2 的 18 条**历史结论**（静态参考），只有 3 项（VP-01 出口IP / VP-07 DNS劫持 / 表头引擎在线）能实时查、且仅在手动「一键自检」时跑（`verify` 走 api.ipify.org 10s 超时，故意不进快轮询）。其余 15 项无实时能力。应**拆出「当前实时状态」面板**（出口IP/DNS/引擎 + 可加 kill-switch 是否挂、TUN 是否起栈、当前默认出口，进自动刷新）置顶，下方历史大表明确标注「历史验证参考（报告结论，非实时）」。
 
 ### 14.2 第二阶段（extraction 设计，未做）
 
 身份改名（productName/identifier/数据目录）、系统托盘/提权自启、`git filter-repo` 拆独立仓——按 [zero-desktop-firewall-extraction-design.md] 规划，本轮未触及。当前 `net-policy-gui` 与 zero-desktop 内嵌版**并存**（两份前端，改动需同步或后续删 zero-desktop 内嵌）。
+
+## 15. 真机健壮性复盘（2026-07-14，0.228 真机）
+
+本轮在 0.228 真机上把 fail-closed 复测和 daemon 生命周期一起过了一遍，同时修了两个真机暴露的 bug
+（DNS 域名污染、`firewall.active` 读反）。记录如下，作为「进生产前」的健壮性缺陷清单。
+
+### 15.1 fail-closed VP-08/09/10 在**当前 Program 放行模型**上复测通过
+
+背景：报告 §0.8.2 的 VP-08/09/10 ✅ 是**旧 RemoteAddress 白名单模型**的证物；当前代码已换 **Program 放行
+模型**（kill-switch 只放行 `mihomo.exe` 整进程），§0.10.1 明确新模型 `FIREWALL_MODEL_VALIDATED=false` 未复测。
+
+本轮**当前模型**真机复测（海外姿态，硬杀 mihomo = 引擎崩溃）：
+
+| 断言 | 真机结果 |
+|---|---|
+| VP-08/09 引擎崩溃/WG 断 → 不泄漏 | `9.9.9.9:443` TcpTest **True → False**（外网立即不可达） |
+| VP-10 mihomo 死、路由回落物理 → 防火墙仍拦 | `DefaultOutboundAction` 仍 **Block**、外网仍 False |
+| 不误伤内网 | SSH(LAN) 全程存活 |
+
+**结论：新 Program 模型 fail-closed 成立**，`FIREWALL_MODEL_VALIDATED` 具备翻 `true` 的证据（安全面达标）。
+但**可用面**（下节）仍有阻塞，「fail-closed 越硬 = mihomo 意外死时断网越彻底」，故先修可用性再翻 banner。
+
+### 15.2 daemon 健壮性缺陷清单（真机坐实）
+
+| # | 缺陷 | 现象 / 根因 | 证据 |
+|---|---|---|---|
+| **D-1** | **agent 绑登录会话** | agent+mihomo 都在 **Session 2**（`install` 用 `LogonType Interactive` 计划任务，非系统服务）。注销/断 RDP/切用户 → 会话销毁 → agent+mihomo 一起被杀 → 防火墙 kill-switch 残留 → **fail-closed 断网**。这就是用户报的「关 GUI 断网」（当"关"伴随会话结束时）。 | `query session`=rdp-tcp#0/ID2；`Get-Process` agent+mihomo SessionId=2 |
+| **D-2** | **mihomo 无 watchdog** | `state::setup` 只在 **agent 启动时** `auto_apply`；运行中 mihomo 崩溃**不监控、不自动重拉** → 持续 fail-closed 断网直到 agent 重启。 | 代码：setup 仅启动恢复 + 采样器，无健康环 |
+| **D-3** | **崩溃重起撞 9090 TIME_WAIT** | 硬杀 mihomo 后立即重起，新 mihomo 绑 `127.0.0.1:9090` 撞 TIME_WAIT 失败 → 起来即崩。缺重试退避/等端口释放。 | 真机：第一次恢复 `STILL-GONE`/外网 False；等足端口释放后 auto_apply 成功 |
+| **D-4** | **agent 日志不落文件** | debug build（无 `--features prod`）日志走控制台，计划任务**无控制台 → 日志全丢**。崩溃时无任何 agent 日志可查——**研究其他一切的前提缺失**。 | 真机只找到空 `mihomo.log`，无 agent 日志文件 |
+| **D-5** | **Mutex poison 连锁 panic（疑）** | 「切姿态时 agent 有时崩溃」，但**无 Windows crash 事件**（非标准崩溃）。`do_reload` 本身错误处理健全（spawn_blocking+map_err 捕获 panic、firewall 失败返 Err）；崩溃更可能是 `rt.lock().unwrap()`/`op_flag` 遍布，某次持锁 panic 毒化 Mutex 后，后续 status 轮询/reload 的每个 `.lock().unwrap()` 连锁 panic。**未定位**（受 D-4/D-6 阻塞）。 | 无 Application Error 事件；代码遍布 `lock().unwrap()` |
+| **D-6** | **CLI 无 reload** | `net-policy` 救援 CLI 只有 status/stop/repair/temp-*，**无 apply/reload/set-route** → 切姿态只能走 GUI → 崩溃**难脚本化重现**。 | `net-policy --help` |
+
+### 15.3 修复优先级建议
+
+- **P0 · D-4 日志落文件**：`init_log` 强制文件输出（或 `--features prod` 部署）。是定位 D-5 和一切运维的前提。
+- **P1 · D-2+D-3 watchdog + 退避**：agent 盯 mihomo，崩溃自动重拉（带端口释放退避）。治「崩溃/断网不自愈」。
+- **P1 · D-1 服务化**：agent 改 **Session 0 Windows 服务**（mihomo 作服务子进程常驻），根治「注销/断 RDP 断网」。最大改动，是「真 daemon」的终态。
+- **P2 · D-5 poison 防护**：热路径 `lock().unwrap()` 改 `parking_lot`（不毒化）或对 poison 优雅降级；定位切姿态崩溃真因。
+- **附**：安全面 fail-closed 已验证 → `FIREWALL_MODEL_VALIDATED` 可翻 `true`（但建议在 D-2/D-3 落地、mihomo 不再莫名死后再翻，避免「保护横幅绿了但一崩就断网」的错觉）。
+
+### 15.4 本轮代码交付（对应提交）
+
+- **fix DNS 域名污染**（`net-policy-core/mihomo.rs`）：海外姿态 + WG 就绪时 `nameserver` 改走隧道内 DoH
+  （`https://1.1.1.1/dns-query#wg-out`），被墙域名走隧道解析不被国内 DNS 污染。真机：`google.com` 由
+  FAIL → REACHABLE。其余姿态（无隧道可走）仍用国内 bootstrap。
+- **fix `firewall.active` 读反**（`net-policy-agent/win.rs`）：注册表 `DefaultOutboundAction` REG_DWORD
+  的 0/1 映射写反了（0.228 实测 `0x1`=CIM Block），导致 kill-switch 实际 Block 却被读成 Allow →
+  `status.firewall.active=false` → GUI 误报「不受保护」。**是拆分独立 crate（`6725368`）时新增 native
+  注册表快读时引入的 regression**（zero-desktop 旧代码无此读法），只在海外/阻断姿态（真设 Block）暴露，
+  本轮首次真机提权 apply 海外姿态才现形。对调修正。
+- **feat 记录去重**（`net-policy-agent/store.rs`）：`requests` 从「按 `conn_id` 去重」改为「按 进程+目标
+  去重 upsert」——同一进程访问同一目标只留一行、每次采样刷新时间，不堆逐连接冗余；含幂等迁移（塌陷历史
+  重复 + `conn_id` 唯一键换成 `(process_path,host,dest_ip,dest_port)`）+ 列表按 `ts_ms` 倒序。
+- **feat GUI 交互**（`net-policy-gui`）：① 活跃连接页出口过滤 chips（全部/直连/VPN/阻断，兼作图例）+
+  LAN 直连说明（192.168/10/172.16 走系统直连、不经引擎，非丢失）；② 进程关联页进程/域名搜索 + 域名收起
+  为「N 个域名」按钮点开展开；③ 操作记录页进程/域名搜索；④ `FlowTopology` 按 `conns` 实际连接点亮 +
+  实时出口 IP；⑤ 诊断页拆出「当前实时状态」面板 `LiveStatusPanel`（引擎/kill-switch/TUN/出口 3s 快轮询）。

@@ -847,7 +847,7 @@ command 命名：
 4. 验证 Windows 防火墙最小规则集能否在 mihomo 或 WireGuard 异常退出时 fail-closed。
 5. 验证 DNS 行为：未知域名、本地直连域名、DoH/DoT 应用、浏览器内置 DNS 的处理差异。
 6. 验证 IPv6 泄漏风险，并决定首版是完整支持 IPv6 还是默认阻断 IPv6。
-7. 输出一份 `docs/net-policy-validation-report.md`，给出是否采用“mihomo TUN + WG + Windows 防火墙兜底”的最终判断。
+7. 输出一份 `docs/net-policy/net-policy-validation-report.md`，给出是否采用“mihomo TUN + WG + Windows 防火墙兜底”的最终判断。
 
 ### 14.11 阶段决策门槛
 
