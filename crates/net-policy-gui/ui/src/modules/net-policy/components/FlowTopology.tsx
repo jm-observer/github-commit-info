@@ -129,10 +129,9 @@ export function FlowTopology({
   const chips = fenceChips(settings)
 
   return (
-    <section className="rounded-lg border border-gray-200 dark:border-gray-800">
-      <div className="flex items-center justify-between border-b border-gray-200 px-4 py-2 dark:border-gray-800">
-        <h2 className="text-sm font-semibold">数据通路全景</h2>
-        <div className="flex flex-wrap items-center gap-x-3 gap-y-1 text-xs text-gray-500">
+    <div className="space-y-3">
+      <div className="flex justify-end">
+        <div className="flex flex-wrap items-center gap-x-3 gap-y-1 text-[11px] text-gray-500">
           <span>活跃连接 {appCount}（绿=正常 · 黄=就绪中/降级 · 灰=未起 · 红=阻断）</span>
           <span className="inline-flex items-center gap-1">
             <span className="rounded bg-sky-100 px-1 py-px text-[9px] font-medium text-sky-700 dark:bg-sky-950/60 dark:text-sky-300">现状可查</span>
@@ -141,7 +140,7 @@ export function FlowTopology({
         </div>
       </div>
 
-      <div className="space-y-3 p-4">
+      <div className="space-y-3">
         {/* 上游链路 */}
         <div className="flex flex-col items-stretch gap-2 md:flex-row md:items-center">
           <Node icon={<Laptop size={18} />} title="本机应用" sub={`${appCount} 活跃连接`} state={appState} prov="live" />
@@ -249,6 +248,6 @@ export function FlowTopology({
           </div>
         </div>
       </div>
-    </section>
+    </div>
   )
 }

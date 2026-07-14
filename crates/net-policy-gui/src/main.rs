@@ -140,6 +140,8 @@ fn run_gui(workspace: PathBuf) -> Result<()> {
             net_policy::net_policy_temp_direct_off,
             net_policy::net_policy_clear_requests,
             net_policy::net_policy_clear_events,
+            net_policy::net_policy_reset_connections,
+            net_policy::net_policy_get_mihomo_log,
         ])
         .setup(move |app| {
             net_policy::setup(app.handle(), state.net_policy.clone())

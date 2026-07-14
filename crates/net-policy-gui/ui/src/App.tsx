@@ -1,8 +1,7 @@
 import NetPolicyPage from "./modules/net-policy/NetPolicyPage";
 import { NetPolicyProbeProvider } from "./modules/net-policy/ProbeContext";
 
-// 独立 app：只有网络策略一个页面，不需要 ShellLayout / react-router（zero-desktop 那套多模块
-// 侧边栏在这里没有意义——单页直接渲染）。
+// 独立 app：只有网络策略一个模块，不需要 react-router；模块内部侧栏由 NetPolicyShell 管理。
 export default function App() {
   return (
     <NetPolicyProbeProvider>

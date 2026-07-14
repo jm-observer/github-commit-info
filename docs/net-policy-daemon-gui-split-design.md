@@ -372,3 +372,25 @@ GUI↔agent 桥接（命名管道连接、三姿态切换、ApplyStepper 事件�
 - **`status.firewall.active` 读取不一致**：`win.rs::native_status`（读注册表）与 `Get-NetFirewallProfile`（CIM）不一致——实际 `DefaultOutboundAction=Block` 时 native 误报 `active:false`（`rule_count` 正确）。
 
 > 真机测试机连接方式见记忆 `net-policy-228-test-machine`；AmneziaWG 混淆隧道穿透验证见 `amneziawg-obfuscation-verified` + `D:\git\toolkit\awg-clients\`（已 gitignore）。
+
+## 14. 独立 GUI 落地：`crates/net-policy-gui`（extraction 第一阶段）
+
+§8 把「独立 GUI 产品」列为「首版不做（复用 zero-desktop）」；本轮把它做了——建独立 Tauri v2 crate **`crates/net-policy-gui`**（从 zero-desktop 剥离，行为/协议不变），对应 [zero-desktop-firewall-extraction-design.md] 的**第一阶段（独立可编译 crate）**。
+
+**已落地**：
+- **剥离**：复制 net_policy 桥接（25 command + setup，最小 `AppState`——command 只 connect 管道不读 state）+ net-policy 前端模块（**零跨模块 import**，`Panel` 本就内联）；砍掉 speech/music/cookie 等无关模块，依赖只剩 tauri+net-policy-client/core。zero-desktop 零改动。
+- **布局**：从长单页改成**左侧菜单（8 项 3 组：核心[概览/流量/策略编排]、工具[临时直连/操作记录/日志]、系统[诊断/WireGuard设置]）+ 右侧内容区**（无 react-router，`useState` 切页；状态提到 `NetPolicyController` context，probe 仍单例）。
+- **聚合打磨**：`PageHeader`/`Section` 统一分区，折叠面板全展开，进程关联表（进程维度：进程→连接数→访问的所有域名）。
+- **flash 浮层**：报错改 `fixed` 右下角 toast（不再挤动布局）+ `cleanErr` 去掉 `[error_kind]`/`Error:` 噪音 + `hotReloadIfApplied` 加 `mihomo_running` 判断（引擎没真跑不热载、不误报「连不上」）。
+- **新功能（协议 minor 2→3，纯追加向后兼容）**：
+  - **切姿态自动重置连接**：`engine::reset_connections`（PowerShell `DELETE /connections`）+ `Request::ResetConnections`；`changeDefaultRoute` reload 后 best-effort 调、概览页加手动「重置连接」按钮。逼旧长连接用新出口重连。**真机验证**：mihomo 重起后新连接全 `using wg-out`。
+  - **mihomo 运行日志**：`engine::start` 把 mihomo stdout/stderr 重定向到 `{home}/mihomo.log`（每次启动覆盖）+ `Request::GetMihomoLog{lines}`（读尾 N 行，上限 1000）+ 「日志」页（自动刷新）。**真机验证**：`mihomo.log` 生成、含 TUN 起栈 + 每条连接 `进程→目标 using wg-out`。
+
+### 14.1 后续待办（GUI 层，2026-07-14 用户反馈）
+
+- **数据通路图（`FlowTopology`）应反映实际流量、而非只按策略点亮**：现在「点亮哪条出口分支」只看 `status.default_route`（策略默认出口），切姿态后（尤其旧长连接残留）会与真实走向割裂——用户切直连后，海外分支仍显示 `wg_count` 活跃计数。应改为**按 `conns` 每条连接的实际 `chains`（direct/wg-out/reject）点亮 + 计数**，并显示实时出口 IP，真实反映「现在流量怎么走」。
+- **诊断页（`VerifyMatrix`）把历史结论与当前状态混在一起**：`ROWS` 硬编码自旧报告 §0.8.2 的 18 条**历史结论**（静态参考），只有 3 项（VP-01 出口IP / VP-07 DNS劫持 / 表头引擎在线）能实时查、且仅在手动「一键自检」时跑（`verify` 走 api.ipify.org 10s 超时，故意不进快轮询）。其余 15 项无实时能力。应**拆出「当前实时状态」面板**（出口IP/DNS/引擎 + 可加 kill-switch 是否挂、TUN 是否起栈、当前默认出口，进自动刷新）置顶，下方历史大表明确标注「历史验证参考（报告结论，非实时）」。
+
+### 14.2 第二阶段（extraction 设计，未做）
+
+身份改名（productName/identifier/数据目录）、系统托盘/提权自启、`git filter-repo` 拆独立仓——按 [zero-desktop-firewall-extraction-design.md] 规划，本轮未触及。当前 `net-policy-gui` 与 zero-desktop 内嵌版**并存**（两份前端，改动需同步或后续删 zero-desktop 内嵌）。

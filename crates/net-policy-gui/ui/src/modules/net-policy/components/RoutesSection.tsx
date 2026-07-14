@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useState } from 'react'
-import { ListOrdered, RefreshCw, Trash2 } from 'lucide-react'
+import { RefreshCw, Trash2 } from 'lucide-react'
 import { NetPolicyAPI, type Route, type RouteEntry, type RuleKind } from '../api/tauri-client'
 
 /**
@@ -66,12 +66,10 @@ export function RoutesSection({ busy }: { busy: boolean }) {
   }
 
   return (
-    <details className="group rounded-lg border border-gray-200 dark:border-gray-800">
-      <summary className="flex cursor-pointer list-none items-center gap-2 border-b border-gray-200 px-4 py-2 select-none hover:bg-gray-50 dark:border-gray-800 dark:hover:bg-gray-800/40">
-        <span className="text-[10px] text-gray-400 transition-transform group-open:rotate-90">▶</span>
-        <ListOrdered size={15} className="text-gray-500" />
-        <h2 className="text-sm font-semibold">生效路由（优先级）</h2>
-        <div className="ml-auto flex items-center gap-2 text-xs text-gray-500" onClick={(e) => e.stopPropagation()}>
+    <div className="space-y-3">
+      <div className="flex items-center justify-between gap-3">
+        <p className="text-xs text-gray-500">按 mihomo 的实际匹配顺序排列，首个命中即生效。</p>
+        <div className="flex items-center gap-2 text-xs text-gray-500">
           <span>{routes.length} 条</span>
           <button
             className="inline-flex items-center gap-1 rounded border border-gray-300 px-2 py-0.5 hover:bg-gray-100 disabled:opacity-50 dark:border-gray-700 dark:hover:bg-gray-800"
@@ -81,10 +79,10 @@ export function RoutesSection({ busy }: { busy: boolean }) {
             <RefreshCw size={12} className={loading ? 'animate-spin' : ''} /> 刷新
           </button>
         </div>
-      </summary>
-      <div className="p-3">
+      </div>
+      <div>
         {err && <p className="mb-2 text-[11px] text-red-600 dark:text-red-400">{err}</p>}
-        <div className="overflow-x-auto rounded border border-gray-200 dark:border-gray-800">
+        <div className="overflow-x-auto rounded-lg border border-gray-200 bg-white dark:border-gray-800 dark:bg-gray-900">
           <table className="w-full text-left text-xs">
             <thead className="bg-gray-50 text-gray-500 dark:bg-gray-800/40">
               <tr>
@@ -124,9 +122,9 @@ export function RoutesSection({ busy }: { busy: boolean }) {
           </table>
         </div>
         <p className="mt-2 px-1 text-[11px] text-gray-500 dark:text-gray-400">
-          优先级 = mihomo 匹配顺序，首个命中即生效。删除仅对「用户规则」，删后需自行「应用/热载」使之生效。
+          优先级 = mihomo 匹配顺序，首个命中即生效。只有用户规则可删除；引擎运行中会自动热加载。
         </p>
       </div>
-    </details>
+    </div>
   )
 }

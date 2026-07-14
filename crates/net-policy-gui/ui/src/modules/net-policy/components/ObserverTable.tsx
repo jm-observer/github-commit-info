@@ -210,21 +210,8 @@ export function ObserverTable({
   }
 
   return (
-    <details className="group rounded-xl border border-gray-200 dark:border-gray-800" open>
-      {/* ── 摘要行（折叠控制） ── */}
-      <summary className="flex cursor-pointer list-none items-center gap-2 border-b border-gray-200 px-4 py-2.5 select-none hover:bg-gray-50 dark:border-gray-800 dark:hover:bg-gray-800/40">
-        <span className="text-gray-400 transition-transform group-open:rotate-90">▶</span>
-        <h2 className="text-sm font-semibold">观察主表</h2>
-        <span className="text-xs text-gray-500">域名/IP 聚合 · 进程关联 · 可直接改路</span>
-        {rows.length > 0 && (
-          <span className="ml-auto text-xs text-gray-400">
-            {search ? `${filteredRows.length} / ${rows.length}` : rows.length} 条
-          </span>
-        )}
-      </summary>
-
-      {/* ── 搜索栏 ── */}
-      <div className="flex items-center gap-2 border-b border-gray-100 px-4 py-2 dark:border-gray-800">
+    <div className="overflow-hidden rounded-lg border border-gray-200 bg-white dark:border-gray-800 dark:bg-gray-900">
+      <div className="flex items-center gap-2 border-b border-gray-100 px-3 py-2 dark:border-gray-800">
         <Search size={13} className="shrink-0 text-gray-400" />
         <input
           type="search"
@@ -234,6 +221,9 @@ export function ObserverTable({
           onClick={(e) => e.stopPropagation()}
           className="flex-1 bg-transparent text-sm outline-none placeholder:text-gray-400 dark:placeholder:text-gray-600"
         />
+        {rows.length > 0 && (
+          <span className="text-xs text-gray-400">{search ? `${filteredRows.length} / ${rows.length}` : rows.length} 条</span>
+        )}
         {/* 图例 */}
         <div className="ml-auto flex items-center gap-3 text-[11px] text-gray-400">
           <span className="inline-flex items-center gap-1">
@@ -350,6 +340,6 @@ export function ObserverTable({
           </table>
         </div>
       )}
-    </details>
+    </div>
   )
 }

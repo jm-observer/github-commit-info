@@ -113,11 +113,8 @@ export function CurrentStateSection({
   const wgConfigured = !!status?.wg_configured
 
   return (
-    <section className="rounded-lg border border-gray-200 dark:border-gray-800">
-      <div className="flex flex-wrap items-center gap-x-3 gap-y-1 border-b border-gray-200 px-4 py-2 dark:border-gray-800">
-        <Search size={15} className="text-gray-500" />
-        <h2 className="text-sm font-semibold">本机现状（只读 · 不改系统）</h2>
-        <span className="text-[11px] text-gray-400">App 启动即在后台预探测；切到此页直接展示</span>
+    <div className="space-y-4">
+      <div className="flex flex-wrap items-center gap-x-3 gap-y-1">
         <span className="ml-auto flex items-center gap-1.5 text-xs text-gray-500 dark:text-gray-400">
           {verifyUpdatedAt ? `最后更新 ${verifyUpdatedAt}` : '查询中…'}
         </span>
@@ -131,7 +128,7 @@ export function CurrentStateSection({
         </button>
       </div>
 
-      <div className="space-y-3 p-4">
+      <div className="space-y-4">
         {err && (
           <div className="rounded-md bg-red-100 px-3 py-1.5 text-xs text-red-800 dark:bg-red-950/40 dark:text-red-300">
             查询出错：{err}
@@ -246,7 +243,7 @@ export function CurrentStateSection({
             </button>
           </div>
           {candidates === null ? (
-            <p className="text-xs text-gray-500">点「扫描进程」列出近期有公网连接的进程（纯查询，不改系统）。如需「设为直连」请到下方「应用策略区」。</p>
+            <p className="text-xs text-gray-500">点「扫描进程」列出近期有公网连接的进程（纯查询，不改系统）。如需改路，请前往「策略编排」。</p>
           ) : candidates.length === 0 ? (
             <p className="text-xs text-gray-500">未发现近期有公网连接的进程。</p>
           ) : (
@@ -277,6 +274,6 @@ export function CurrentStateSection({
           )}
         </div>
       </div>
-    </section>
+    </div>
   )
 }

@@ -75,15 +75,10 @@ export function TempDirectControl() {
   const active = status?.active ?? false
 
   return (
-    <div className="space-y-3 rounded-xl border border-amber-200/70 bg-amber-50/40 p-3 dark:border-amber-900/40 dark:bg-amber-950/10">
-      <div className="flex items-center gap-2 px-1 text-xs font-semibold uppercase tracking-wide text-amber-700 dark:text-amber-300">
-        <Zap size={14} />
-        <span>临时直连 · 限时应急</span>
-        <span className="font-normal normal-case text-amber-600/70 dark:text-amber-400/70">
-          海外出口故障时，限时把默认出口改直连；例外进程仍被阻断
-        </span>
+    <div className="space-y-5">
+      <div className="rounded-md border border-amber-200 bg-amber-50 px-3 py-2 text-xs text-amber-800 dark:border-amber-900/50 dark:bg-amber-950/20 dark:text-amber-300">
+        这是应急操作：默认出口会在限定时间内改为直连；列入例外的敏感进程仍保持阻断。
       </div>
-
       {active ? (
         <div className="flex flex-wrap items-center gap-3">
           <span className="inline-flex items-center gap-1.5 rounded-md bg-amber-100 px-3 py-1.5 text-sm font-medium text-amber-800 dark:bg-amber-900/40 dark:text-amber-200">

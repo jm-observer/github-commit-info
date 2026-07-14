@@ -251,3 +251,17 @@ pub async fn net_policy_clear_requests() -> Result<(), String> {
 pub async fn net_policy_clear_events() -> Result<(), String> {
     connect().await?.clear_events().await.map_err(estr)
 }
+
+// ── 连接重置 / 运行日志（minor 3） ────────────────────────────────────────
+
+/// 切姿态后强制旧连接用新出口重连（best-effort：前端失败只提示不阻塞）。
+#[tauri::command]
+pub async fn net_policy_reset_connections(_state: State<'_, AppState>) -> Result<(), String> {
+    connect().await?.reset_connections().await.map_err(estr)
+}
+
+/// mihomo / WireGuard 运行日志（最近 `lines` 行）。
+#[tauri::command]
+pub async fn net_policy_get_mihomo_log(lines: u32) -> Result<Vec<String>, String> {
+    connect().await?.mihomo_log(lines).await.map_err(estr)
+}

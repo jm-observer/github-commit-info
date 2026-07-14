@@ -128,9 +128,8 @@ export function VerifyMatrix({
   const engineOnline = verify?.mihomo_running ?? status.mihomo_running
 
   return (
-    <section className="rounded-lg border border-gray-200 dark:border-gray-800">
-      <div className="flex flex-wrap items-center gap-x-3 gap-y-1 border-b border-gray-200 px-4 py-2 dark:border-gray-800">
-        <h2 className="text-sm font-semibold">验证矩阵（VP / §9，源自报告 §0.8.2）</h2>
+    <div className="space-y-3">
+      <div className="flex flex-wrap items-center gap-x-3 gap-y-1">
         <span className="flex items-center gap-1.5 text-xs text-gray-500 dark:text-gray-400" title="verify.mihomo_running（一键自检后更新）/ 否则 status.mihomo_running">
           <Cpu size={13} className={engineOnline ? 'text-green-500' : 'text-gray-400'} />
           引擎 {engineOnline ? '在线' : '离线'}
@@ -146,7 +145,7 @@ export function VerifyMatrix({
       </div>
 
       {/* 列说明 + 旧模型告警 */}
-      <div className="border-b border-gray-100 px-4 py-2 text-[11px] text-gray-500 dark:border-gray-800 dark:text-gray-400">
+      <div className="rounded-md bg-gray-100 px-3 py-2 text-[11px] text-gray-500 dark:bg-gray-800/50 dark:text-gray-400">
         <p>
           <b>报告历史结论</b>取自 §0.8.2 原值；其中 fail-closed 相关项标「(旧模型)」——在旧 RemoteAddress 白名单模型上取证。
           <b className="ml-1">当前代码模型</b>已换成「程序放行」（Program=mihomo.exe），
@@ -157,7 +156,7 @@ export function VerifyMatrix({
       </div>
 
       {/* 矩阵表（窄页响应式） */}
-      <div className="overflow-x-auto">
+      <div className="overflow-x-auto rounded-lg border border-gray-200 bg-white dark:border-gray-800 dark:bg-gray-900">
         <table className="w-full table-fixed text-sm">
           <colgroup>
             <col className="w-[34%]" />
@@ -206,6 +205,6 @@ export function VerifyMatrix({
           </tbody>
         </table>
       </div>
-    </section>
+    </div>
   )
 }

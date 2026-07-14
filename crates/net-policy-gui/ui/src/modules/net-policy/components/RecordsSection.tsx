@@ -1,74 +1,11 @@
 import { useCallback, useEffect, useState } from 'react'
-import { History, ListTree, ScrollText, RefreshCw, Trash2 } from 'lucide-react'
-import {
-  NetPolicyAPI,
-  type LifecycleEvent,
-  type ProcessNode,
-  type RequestLogEntry,
-} from '../api/tauri-client'
+import { History, ListTree, RefreshCw, ScrollText, Trash2 } from 'lucide-react'
+import { NetPolicyAPI, type LifecycleEvent, type ProcessNode, type RequestLogEntry } from '../api/tauri-client'
 
-/**
- * 记录区：
- *  - 进程请求记录（SQLite requests 表，采样自 mihomo 活跃连接，含进程/路径/目标/出口/规则）；
- *  - 生命周期事件（agent 启停 / 策略 apply·stop / 临时直连开关）；
- *  - 当前进程树。
- * 均按需拉取（展开时刷新）+ 手动刷新；请求/事件可清空（隐私）。
- */
+type RecordView = 'requests' | 'events' | 'processes'
 
 function ts(ms: number): string {
-  if (!ms) return ''
-  return new Date(ms).toLocaleString()
-}
-
-function SubSection({
-  title,
-  icon,
-  count,
-  onRefresh,
-  onClear,
-  loading,
-  children,
-}: {
-  title: string
-  icon: React.ReactNode
-  count: number
-  onRefresh: () => void
-  onClear?: () => void
-  loading: boolean
-  children: React.ReactNode
-}) {
-  return (
-    <details
-      className="group rounded-lg border border-gray-200 dark:border-gray-800"
-      onToggle={(e) => (e.currentTarget as HTMLDetailsElement).open && onRefresh()}
-    >
-      <summary className="flex cursor-pointer list-none items-center gap-2 border-b border-gray-200 px-4 py-2 select-none hover:bg-gray-50 dark:border-gray-800 dark:hover:bg-gray-800/40">
-        <span className="text-[10px] text-gray-400 transition-transform group-open:rotate-90">▶</span>
-        {icon}
-        <h2 className="text-sm font-semibold">{title}</h2>
-        <div className="ml-auto flex items-center gap-2 text-xs text-gray-500" onClick={(e) => e.stopPropagation()}>
-          <span>{count} 条</span>
-          <button
-            className="inline-flex items-center gap-1 rounded border border-gray-300 px-2 py-0.5 hover:bg-gray-100 disabled:opacity-50 dark:border-gray-700 dark:hover:bg-gray-800"
-            onClick={onRefresh}
-            disabled={loading}
-          >
-            <RefreshCw size={12} className={loading ? 'animate-spin' : ''} /> 刷新
-          </button>
-          {onClear && (
-            <button
-              className="inline-flex items-center gap-1 rounded border border-gray-300 px-2 py-0.5 hover:bg-gray-100 disabled:opacity-50 dark:border-gray-700 dark:hover:bg-gray-800"
-              onClick={onClear}
-              disabled={loading || count === 0}
-            >
-              <Trash2 size={12} /> 清空
-            </button>
-          )}
-        </div>
-      </summary>
-      <div className="p-3">{children}</div>
-    </details>
-  )
+  return ms ? new Date(ms).toLocaleString() : ''
 }
 
 function TreeNode({ node, depth }: { node: ProcessNode; depth: number }) {
@@ -78,165 +15,167 @@ function TreeNode({ node, depth }: { node: ProcessNode; depth: number }) {
         <span className="font-mono text-gray-800 dark:text-gray-200">{node.name || '(?)'}</span>
         <span className="text-gray-400">#{node.pid}</span>
         {node.path && (
-          <span className="min-w-0 flex-1 truncate font-mono text-[11px] text-gray-400" title={node.path}>
-            {node.path}
-          </span>
+          <span className="min-w-0 flex-1 truncate font-mono text-[11px] text-gray-400" title={node.path}>{node.path}</span>
         )}
       </div>
-      {node.children.map((c) => (
-        <TreeNode key={c.pid} node={c} depth={depth + 1} />
-      ))}
+      {node.children.map((child) => <TreeNode key={child.pid} node={child} depth={depth + 1} />)}
     </div>
   )
 }
 
 export function RecordsSection() {
+  const [view, setView] = useState<RecordView>('requests')
   const [requests, setRequests] = useState<RequestLogEntry[]>([])
   const [events, setEvents] = useState<LifecycleEvent[]>([])
   const [tree, setTree] = useState<ProcessNode[]>([])
-  const [loading, setLoading] = useState<{ req: boolean; ev: boolean; tree: boolean }>({
-    req: false,
-    ev: false,
-    tree: false,
-  })
+  const [loading, setLoading] = useState<Record<RecordView, boolean>>({ requests: false, events: false, processes: false })
 
-  const loadReq = useCallback(async () => {
-    setLoading((l) => ({ ...l, req: true }))
-    try {
-      setRequests(await NetPolicyAPI.requests(500))
-    } catch {
-      /* 后端会以结构化错误返回；此处静默，用户可点刷新重试 */
-    } finally {
-      setLoading((l) => ({ ...l, req: false }))
-    }
-  }, [])
-  const loadEv = useCallback(async () => {
-    setLoading((l) => ({ ...l, ev: true }))
-    try {
-      setEvents(await NetPolicyAPI.events(200))
-    } catch {
-      /* noop */
-    } finally {
-      setLoading((l) => ({ ...l, ev: false }))
-    }
-  }, [])
-  const loadTree = useCallback(async () => {
-    setLoading((l) => ({ ...l, tree: true }))
-    try {
-      setTree(await NetPolicyAPI.processTree())
-    } catch {
-      /* noop */
-    } finally {
-      setLoading((l) => ({ ...l, tree: false }))
-    }
+  const loadRequests = useCallback(async () => {
+    setLoading((state) => ({ ...state, requests: true }))
+    try { setRequests(await NetPolicyAPI.requests(500)) } catch { /* 用户可手动重试 */ }
+    finally { setLoading((state) => ({ ...state, requests: false })) }
   }, [])
 
-  const clearReq = async () => {
-    await NetPolicyAPI.clearRequests()
-    await loadReq()
-  }
-  const clearEv = async () => {
-    await NetPolicyAPI.clearEvents()
-    await loadEv()
-  }
+  const loadEvents = useCallback(async () => {
+    setLoading((state) => ({ ...state, events: true }))
+    try { setEvents(await NetPolicyAPI.events(200)) } catch { /* 用户可手动重试 */ }
+    finally { setLoading((state) => ({ ...state, events: false })) }
+  }, [])
+
+  const loadProcesses = useCallback(async () => {
+    setLoading((state) => ({ ...state, processes: true }))
+    try { setTree(await NetPolicyAPI.processTree()) } catch { /* 用户可手动重试 */ }
+    finally { setLoading((state) => ({ ...state, processes: false })) }
+  }, [])
 
   useEffect(() => {
-    void loadEv()
-  }, [loadEv])
+    if (view === 'requests') void loadRequests()
+    if (view === 'events') void loadEvents()
+    if (view === 'processes') void loadProcesses()
+  }, [view, loadRequests, loadEvents, loadProcesses])
+
+  const refresh = () => {
+    if (view === 'requests') void loadRequests()
+    if (view === 'events') void loadEvents()
+    if (view === 'processes') void loadProcesses()
+  }
+
+  const clear = async () => {
+    if (view === 'requests') {
+      await NetPolicyAPI.clearRequests()
+      await loadRequests()
+    } else if (view === 'events') {
+      await NetPolicyAPI.clearEvents()
+      await loadEvents()
+    }
+  }
+
+  const counts: Record<RecordView, number> = { requests: requests.length, events: events.length, processes: tree.length }
+  const tabs: { key: RecordView; label: string; icon: React.ReactNode }[] = [
+    { key: 'requests', label: '网络请求', icon: <History size={14} /> },
+    { key: 'events', label: '生命周期', icon: <ScrollText size={14} /> },
+    { key: 'processes', label: '进程树', icon: <ListTree size={14} /> },
+  ]
 
   return (
-    <div className="space-y-2">
-      {/* 进程请求记录 */}
-      <SubSection
-        title="进程请求记录"
-        icon={<History size={15} className="text-indigo-500" />}
-        count={requests.length}
-        onRefresh={() => void loadReq()}
-        onClear={() => void clearReq()}
-        loading={loading.req}
-      >
-        {requests.length === 0 ? (
-          <p className="py-2 text-sm text-gray-500">
-            暂无记录——mihomo 在跑并产生流量后，活跃连接会被采样记入（每 3s，去重）。
-          </p>
-        ) : (
-          <div className="max-h-80 overflow-auto rounded border border-gray-200 dark:border-gray-800">
-            <table className="w-full text-left text-[11px]">
-              <thead className="sticky top-0 bg-gray-50 text-gray-500 dark:bg-gray-800/60">
-                <tr>
-                  <th className="px-2 py-1 font-medium">时间</th>
-                  <th className="px-2 py-1 font-medium">进程</th>
-                  <th className="px-2 py-1 font-medium">目标</th>
-                  <th className="px-2 py-1 font-medium">出口</th>
-                  <th className="px-2 py-1 font-medium">规则</th>
-                </tr>
-              </thead>
-              <tbody className="divide-y divide-gray-100 dark:divide-gray-800">
-                {requests.map((r, i) => (
-                  <tr key={`${r.conn_id}-${i}`}>
-                    <td className="whitespace-nowrap px-2 py-1 text-gray-400">{ts(r.ts_ms)}</td>
-                    <td className="px-2 py-1 font-mono" title={r.process_path}>
-                      {r.process || '(?)'}
-                    </td>
-                    <td className="px-2 py-1 font-mono text-gray-600 dark:text-gray-400">
-                      {r.host || r.dest_ip}
-                      <span className="text-gray-400">:{r.dest_port}</span>
-                    </td>
-                    <td className="px-2 py-1 font-mono">{r.outbound}</td>
-                    <td className="px-2 py-1 text-gray-500">{r.rule}</td>
-                  </tr>
-                ))}
-              </tbody>
-            </table>
-          </div>
-        )}
-        <p className="mt-2 px-1 text-[11px] text-gray-500 dark:text-gray-400">
-          存于 <code>~/.config/net-policy-agent/net-policy/net-policy.db</code>；保留上限 10 万条，可随时清空（隐私）。
-        </p>
-      </SubSection>
+    <div className="space-y-4">
+      <div className="flex flex-wrap items-center justify-between gap-3">
+        <div className="inline-flex rounded-lg bg-gray-100 p-1 dark:bg-gray-800">
+          {tabs.map((tab) => (
+            <button
+              key={tab.key}
+              className={`inline-flex items-center gap-1.5 rounded-md px-3 py-1.5 text-sm transition-colors ${
+                view === tab.key ? 'bg-white font-medium text-gray-900 shadow-sm dark:bg-gray-700 dark:text-white' : 'text-gray-500'
+              }`}
+              onClick={() => setView(tab.key)}
+            >
+              {tab.icon} {tab.label} <span className="text-xs text-gray-400">{counts[tab.key]}</span>
+            </button>
+          ))}
+        </div>
+        <div className="flex items-center gap-2 text-xs text-gray-500">
+          <button
+            className="inline-flex items-center gap-1 rounded border border-gray-300 px-2 py-1 hover:bg-gray-100 disabled:opacity-50 dark:border-gray-700 dark:hover:bg-gray-800"
+            onClick={refresh}
+            disabled={loading[view]}
+          >
+            <RefreshCw size={12} className={loading[view] ? 'animate-spin' : ''} /> 刷新
+          </button>
+          {view !== 'processes' && (
+            <button
+              className="inline-flex items-center gap-1 rounded border border-gray-300 px-2 py-1 hover:bg-gray-100 disabled:opacity-50 dark:border-gray-700 dark:hover:bg-gray-800"
+              onClick={() => void clear()}
+              disabled={loading[view] || counts[view] === 0}
+            >
+              <Trash2 size={12} /> 清空
+            </button>
+          )}
+        </div>
+      </div>
 
-      {/* 生命周期事件 */}
-      <SubSection
-        title="生命周期事件"
-        icon={<ScrollText size={15} className="text-teal-500" />}
-        count={events.length}
-        onRefresh={() => void loadEv()}
-        onClear={() => void clearEv()}
-        loading={loading.ev}
-      >
-        {events.length === 0 ? (
-          <p className="py-2 text-sm text-gray-500">暂无事件。</p>
+      {view === 'requests' && (
+        <>
+          {requests.length === 0 ? (
+            <div className="rounded-lg border border-dashed border-gray-300 px-4 py-10 text-center text-sm text-gray-500 dark:border-gray-700">
+              暂无网络请求。mihomo 运行并产生流量后，活跃连接会每 3 秒去重采样。
+            </div>
+          ) : (
+            <div className="max-h-[32rem] overflow-auto rounded-lg border border-gray-200 bg-white dark:border-gray-800 dark:bg-gray-900">
+              <table className="w-full text-left text-[11px]">
+                <thead className="sticky top-0 bg-gray-50 text-gray-500 dark:bg-gray-800/60">
+                  <tr>
+                    <th className="px-3 py-2 font-medium">时间</th><th className="px-3 py-2 font-medium">进程</th>
+                    <th className="px-3 py-2 font-medium">目标</th><th className="px-3 py-2 font-medium">出口</th>
+                    <th className="px-3 py-2 font-medium">规则</th>
+                  </tr>
+                </thead>
+                <tbody className="divide-y divide-gray-100 dark:divide-gray-800">
+                  {requests.map((request, index) => (
+                    <tr key={`${request.conn_id}-${index}`}>
+                      <td className="whitespace-nowrap px-3 py-2 text-gray-400">{ts(request.ts_ms)}</td>
+                      <td className="px-3 py-2 font-mono" title={request.process_path}>{request.process || '(?)'}</td>
+                      <td className="px-3 py-2 font-mono text-gray-600 dark:text-gray-400">
+                        {request.host || request.dest_ip}<span className="text-gray-400">:{request.dest_port}</span>
+                      </td>
+                      <td className="px-3 py-2 font-mono">{request.outbound}</td>
+                      <td className="px-3 py-2 text-gray-500">{request.rule}</td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            </div>
+          )}
+          <p className="text-[11px] text-gray-500 dark:text-gray-400">
+            数据保存在 <code>~/.config/net-policy-agent/net-policy/net-policy.db</code>，上限 10 万条，可随时清空。
+          </p>
+        </>
+      )}
+
+      {view === 'events' && (
+        events.length === 0 ? (
+          <div className="rounded-lg border border-dashed border-gray-300 px-4 py-10 text-center text-sm text-gray-500 dark:border-gray-700">暂无生命周期事件。</div>
         ) : (
-          <ul className="divide-y divide-gray-100 text-xs dark:divide-gray-800">
-            {events.map((e, i) => (
-              <li key={i} className="flex items-center gap-2 py-1">
-                <span className="whitespace-nowrap text-gray-400">{ts(e.ts_ms)}</span>
-                <span className="rounded bg-gray-200 px-1.5 py-0.5 font-mono text-[10px] dark:bg-gray-700">{e.kind}</span>
-                {e.detail && <span className="min-w-0 flex-1 truncate text-gray-500" title={e.detail}>{e.detail}</span>}
+          <ul className="divide-y divide-gray-100 rounded-lg border border-gray-200 bg-white px-3 text-xs dark:divide-gray-800 dark:border-gray-800 dark:bg-gray-900">
+            {events.map((event, index) => (
+              <li key={index} className="flex items-center gap-2 py-2">
+                <span className="whitespace-nowrap text-gray-400">{ts(event.ts_ms)}</span>
+                <span className="rounded bg-gray-100 px-1.5 py-0.5 font-mono text-[10px] dark:bg-gray-800">{event.kind}</span>
+                {event.detail && <span className="min-w-0 flex-1 truncate text-gray-500" title={event.detail}>{event.detail}</span>}
               </li>
             ))}
           </ul>
-        )}
-      </SubSection>
+        )
+      )}
 
-      {/* 进程树 */}
-      <SubSection
-        title="进程树"
-        icon={<ListTree size={15} className="text-amber-500" />}
-        count={tree.length}
-        onRefresh={() => void loadTree()}
-        loading={loading.tree}
-      >
-        {tree.length === 0 ? (
-          <p className="py-2 text-sm text-gray-500">点「刷新」加载当前进程树。</p>
+      {view === 'processes' && (
+        tree.length === 0 ? (
+          <div className="rounded-lg border border-dashed border-gray-300 px-4 py-10 text-center text-sm text-gray-500 dark:border-gray-700">未读取到当前进程树。</div>
         ) : (
-          <div className="max-h-96 overflow-auto rounded border border-gray-200 p-2 dark:border-gray-800">
-            {tree.map((n) => (
-              <TreeNode key={n.pid} node={n} depth={0} />
-            ))}
+          <div className="max-h-[36rem] overflow-auto rounded-lg border border-gray-200 bg-white p-3 dark:border-gray-800 dark:bg-gray-900">
+            {tree.map((node) => <TreeNode key={node.pid} node={node} depth={0} />)}
           </div>
-        )}
-      </SubSection>
+        )
+      )}
     </div>
   )
 }

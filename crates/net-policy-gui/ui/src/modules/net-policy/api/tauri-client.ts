@@ -269,4 +269,10 @@ export const NetPolicyAPI = {
   clearRequests: () => invoke('net_policy_clear_requests'),
   /** 清空生命周期事件。 */
   clearEvents: () => invoke('net_policy_clear_events'),
+
+  // ── 连接重置 / 运行日志（minor 3） ────────────────────────────────────────
+  /** 关闭 mihomo 所有活跃连接，逼流量用新出口重连（切姿态后 best-effort 调用）。 */
+  resetConnections: () => invoke<void>('net_policy_reset_connections'),
+  /** mihomo / WireGuard 运行日志（最近 limit 行；后端上限 1000）。 */
+  getMihomoLog: (limit = 500) => invoke<string[]>('net_policy_get_mihomo_log', { lines: limit }),
 }
