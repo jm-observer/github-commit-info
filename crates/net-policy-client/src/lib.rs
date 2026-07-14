@@ -135,6 +135,12 @@ impl Client {
         self.request(req).await
     }
 
+    /// minor 3 门控后再发请求（`ResetConnections` / `GetMihomoLog`）。
+    async fn request_v3(&mut self, req: Request) -> Result<Response> {
+        self.require_minor(3)?;
+        self.request(req).await
+    }
+
     // ── 逐操作 typed 便捷方法（对应今天前端 NetPolicyAPI 的 17 个 invoke） ─────────────
 
     pub async fn status(&mut self) -> Result<NetPolicyStatus> {
@@ -341,6 +347,22 @@ impl Client {
     pub async fn clear_temp_direct(&mut self) -> Result<TempDirectStatus> {
         match Client::expect_ok(self.request_v2(Request::ClearTempDirect).await?)? {
             Response::TempDirect { status } => Ok(status),
+            other => unexpected(other),
+        }
+    }
+
+    // ── minor 3：连接重置 / 运行日志 ─────────────────────────────────────────
+
+    /// 关闭 mihomo 所有活跃连接，逼流量用新出口重连（切姿态 reload 后调用；best-effort）。
+    pub async fn reset_connections(&mut self) -> Result<()> {
+        Client::expect_ok(self.request_v3(Request::ResetConnections).await?)?;
+        Ok(())
+    }
+
+    /// mihomo 运行日志（最近 `lines` 行；agent 侧硬上限 1000）。
+    pub async fn mihomo_log(&mut self, lines: u32) -> Result<Vec<String>> {
+        match Client::expect_ok(self.request_v3(Request::GetMihomoLog { lines }).await?)? {
+            Response::MihomoLog { lines } => Ok(lines),
             other => unexpected(other),
         }
     }

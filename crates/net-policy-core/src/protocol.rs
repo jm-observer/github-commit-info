@@ -27,8 +27,9 @@ pub const PIPE_NAME: &str = r"\\.\pipe\net-policy-agent";
 /// 协议主版本：改/删字段必须 +1。
 pub const PROTOCOL_MAJOR: u16 = 1;
 /// 协议次版本：仅加字段/加请求时 +1（向后兼容）。minor 1：`Repair` + `ResyncRequired`；
-/// minor 2：请求记录 / 进程树 / 路由视图 / 临时直连 / 生命周期事件。
-pub const PROTOCOL_MINOR: u16 = 2;
+/// minor 2：请求记录 / 进程树 / 路由视图 / 临时直连 / 生命周期事件；
+/// minor 3：`ResetConnections`（切姿态后强制旧连接重连新出口）+ `GetMihomoLog`（运行日志查看）。
+pub const PROTOCOL_MINOR: u16 = 3;
 
 /// 单帧最大字节数（防超大帧拖垮提权 agent，设计 §3.1 DoS 防护）。
 pub const MAX_FRAME_LEN: u32 = 8 * 1024 * 1024;
@@ -168,6 +169,16 @@ pub enum Request {
     ClearRequests,
     /// 清空生命周期事件。
     ClearEvents,
+
+    // ── minor 3：连接重置 / 运行日志 ────────────────────────────────────────
+    /// 关闭 mihomo 所有活跃连接（`DELETE /connections`），逼流量用新出口重连。
+    /// best-effort：agent 侧失败只回 `Error`，调用方决定是否阻塞提示。
+    ResetConnections,
+    /// 取 mihomo 运行日志（stdout/stderr 落 `mihomo.log`）最近 `lines` 行；
+    /// 引擎未跑过（日志文件不存在）返回空列表，不是错误。
+    GetMihomoLog {
+        lines: u32,
+    },
 }
 
 /// agent → 客户端响应。逐 Request 定型（设计 §4：响应与今天前端各命令返回一致）。
@@ -226,7 +237,11 @@ pub enum Response {
     Events {
         entries: Vec<LifecycleEvent>,
     },
-    /// 无载荷成功（SaveSettings / ClearBlocked / SubscribeEvents 确认）。
+    /// mihomo 运行日志（最近 N 行）。
+    MihomoLog {
+        lines: Vec<String>,
+    },
+    /// 无载荷成功（SaveSettings / ClearBlocked / SubscribeEvents 确认 / ResetConnections）。
     Ok,
     Error {
         error: ProtocolError,

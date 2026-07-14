@@ -49,19 +49,54 @@ pub fn write_config(
     Ok(path)
 }
 
+/// mihomo stdout/stderr 落盘的日志文件名（`home` 下，即 `-d` 家目录）。mihomo 配置
+/// `log-level: info`，日志走 stdout，默认不落盘——重定向后 agent 才能读给前端「运行日志」页。
+pub const MIHOMO_LOG_FILE: &str = "mihomo.log";
+
 /// 启动 mihomo（配置须已写）。`bin` 是**已完整性校验**的绝对路径（见 paths::resolve_mihomo_bin），
-/// `home` 是 `-d` 家目录，`cfg` 是 `-f` 配置路径。返回 pid。
+/// `home` 是 `-d` 家目录，`cfg` 是 `-f` 配置路径。stdout/stderr 重定向到 `{home}/mihomo.log`
+/// （每次启动**覆盖**旧日志，避免无限增长）。返回 pid。
 pub fn start(bin: &Path, home: &Path, cfg: &Path) -> Result<u32> {
     if !bin.exists() {
         bail!("mihomo 可执行文件不存在：{}", bin.display());
     }
+    std::fs::create_dir_all(home)
+        .with_context(|| format!("create mihomo home: {}", home.display()))?;
+    let log_path = home.join(MIHOMO_LOG_FILE);
+    let out_file = std::fs::File::create(&log_path)
+        .with_context(|| format!("create {}", log_path.display()))?;
+    let err_file = out_file
+        .try_clone()
+        .with_context(|| format!("clone log handle: {}", log_path.display()))?;
+
     let mut cmd = std::process::Command::new(bin);
-    cmd.arg("-d").arg(home).arg("-f").arg(cfg);
+    cmd.arg("-d")
+        .arg(home)
+        .arg("-f")
+        .arg(cfg)
+        .stdout(std::process::Stdio::from(out_file))
+        .stderr(std::process::Stdio::from(err_file));
     crate::proc::hide_console(&mut cmd);
     let child = cmd
         .spawn()
         .with_context(|| format!("spawn mihomo: {}", bin.display()))?;
     Ok(child.id())
+}
+
+/// 重置 mihomo 所有活跃连接（`DELETE /connections`），逼旧连接用新出口重连（切姿态 reload 后调用）。
+/// best-effort：失败只返回 `Err`，由调用方决定是否阻塞/提示，不 panic。
+pub fn reset_connections(secret: &str) -> Result<()> {
+    let h = auth_header(secret);
+    let out = run_ps(&format!(
+        r#"$h={h}
+try{{ Invoke-RestMethod 'http://{CONTROLLER}/connections' -Method DELETE -Headers $h -TimeoutSec 4 | Out-Null; 'OK' }}
+catch{{ "ERR:$($_.Exception.Message)" }}
+"#
+    ))?;
+    if !out.trim().starts_with("OK") {
+        bail!("重置 mihomo 连接失败：{}", out.trim());
+    }
+    Ok(())
 }
 
 /// 热重载配置（逐项放行不重启隧道）：调用方须**先** `write_config` 再调本函数。

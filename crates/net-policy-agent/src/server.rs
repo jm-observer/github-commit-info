@@ -3,8 +3,8 @@
 use crate::frame::{read_frame, write_frame};
 use crate::ops::{self, OpError};
 use crate::state::AgentState;
-use crate::{connections, engine, process_watch, ptree, repair, verify};
-use anyhow::Result;
+use crate::{connections, engine, paths, process_watch, ptree, repair, verify};
+use anyhow::{Context, Result};
 use net_policy_core::config::{self, WgConfig};
 use net_policy_core::protocol::{
     ErrorKind, Event, Frame, ProtocolError, Request, Response, Version,
@@ -253,7 +253,43 @@ async fn dispatch(state: Arc<AgentState>, req: Request) -> Response {
         } => temp_result(ops::run_set_temp_direct(state.clone(), duration_secs, except).await),
 
         Request::ClearTempDirect => temp_result(ops::run_clear_temp_direct(state.clone()).await),
+
+        // ── minor 3：连接重置 / 运行日志 ────────────────────────────────────
+        Request::ResetConnections => {
+            let secret = {
+                let rt = state.rt.lock().unwrap();
+                rt.secret.clone().unwrap_or_default()
+            };
+            match tokio::task::spawn_blocking(move || engine::reset_connections(&secret)).await {
+                Ok(Ok(())) => Response::Ok,
+                Ok(Err(e)) => err_resp(ErrorKind::MihomoUnreachable, format!("{e:#}")),
+                Err(_) => err_resp(ErrorKind::Internal, "重置连接任务异常"),
+            }
+        }
+
+        Request::GetMihomoLog { lines } => {
+            // limit 硬上限 1000（同 GetRequests：防单帧超 8MiB 上限）。
+            let n = lines.min(1000) as usize;
+            let path = paths::mihomo_home(&ws).join(engine::MIHOMO_LOG_FILE);
+            match tokio::task::spawn_blocking(move || read_log_tail(&path, n)).await {
+                Ok(Ok(entries)) => Response::MihomoLog { lines: entries },
+                Ok(Err(e)) => err_resp(ErrorKind::Internal, format!("读运行日志失败：{e:#}")),
+                Err(_) => err_resp(ErrorKind::Internal, "读日志任务异常"),
+            }
+        }
     }
+}
+
+/// 读日志文件最近 `n` 行；文件不存在（引擎没跑过）返回空列表，不是错误。
+fn read_log_tail(path: &std::path::Path, n: usize) -> Result<Vec<String>> {
+    if !path.exists() {
+        return Ok(Vec::new());
+    }
+    let content =
+        std::fs::read_to_string(path).with_context(|| format!("read {}", path.display()))?;
+    let all: Vec<&str> = content.lines().collect();
+    let start = all.len().saturating_sub(n);
+    Ok(all[start..].iter().map(|s| s.to_string()).collect())
 }
 
 fn temp_result(r: Result<net_policy_core::types::TempDirectStatus, OpError>) -> Response {
