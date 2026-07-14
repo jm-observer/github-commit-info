@@ -1,5 +1,6 @@
 //! 持久化记录（SQLite，`<workspace>/net-policy/net-policy.db`）：
-//! - `requests`：进程请求历史（连接观测留痕；按 mihomo 连接 id 去重，带保留上限）。
+//! - `requests`：进程请求历史（「谁访问过什么」的留痕；**按 进程+目标 去重**，同一进程访问同一
+//!   目标只留一行、每次采样只刷新时间，不堆逐连接冗余流水，带保留上限）。
 //! - `events`：生命周期事件（agent 启停 / 策略 apply·stop / 临时直连开关）。
 //!
 //! **错误不伪装**（评审点 2）：查询返回 `Result`，写入失败 `log::warn` + dropped 计数；降级到内存库
@@ -30,7 +31,14 @@ CREATE TABLE IF NOT EXISTS requests(
   outbound TEXT NOT NULL DEFAULT '',
   rule TEXT NOT NULL DEFAULT ''
 );
-CREATE UNIQUE INDEX IF NOT EXISTS uq_requests_conn ON requests(conn_id) WHERE conn_id != '';
+-- 去重维度迁移（幂等，每次开库跑）：从「按 conn_id 去重」改为「按 进程+目标 去重」。
+-- 先塌陷历史冗余（同 进程+目标 只保留 id 最大即最新的一行），再退旧索引、建新唯一键，
+-- 否则已有重复行会让 CREATE UNIQUE INDEX 失败。去重后 DELETE 命中 0 行、DROP/CREATE 皆 no-op。
+DELETE FROM requests WHERE id NOT IN (
+  SELECT MAX(id) FROM requests GROUP BY process_path,host,dest_ip,dest_port
+);
+DROP INDEX IF EXISTS uq_requests_conn;
+CREATE UNIQUE INDEX IF NOT EXISTS uq_requests_target ON requests(process_path,host,dest_ip,dest_port);
 CREATE INDEX IF NOT EXISTS idx_requests_ts ON requests(ts_ms);
 CREATE TABLE IF NOT EXISTS events(
   id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -100,12 +108,16 @@ impl Store {
         self.dropped.load(Ordering::Relaxed)
     }
 
-    /// 记一条请求（非空 conn_id 幂等去重）。失败 warn + 计数（不阻塞采样）。
+    /// 记一条请求（**按 进程+目标 去重 upsert**）。同一 `(process_path,host,dest_ip,dest_port)` 已存在
+    /// 则只更新时间与最新 conn_id/出口/规则，不新增冗余行。失败 warn + 计数（不阻塞采样）。
     pub fn record_request(&self, e: &RequestLogEntry) {
         let c = self.conn.lock().unwrap();
         if let Err(err) = c.execute(
-            "INSERT OR IGNORE INTO requests(conn_id,ts_ms,process,process_path,host,dest_ip,dest_port,network,outbound,rule) \
-             VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10)",
+            "INSERT INTO requests(conn_id,ts_ms,process,process_path,host,dest_ip,dest_port,network,outbound,rule) \
+             VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10) \
+             ON CONFLICT(process_path,host,dest_ip,dest_port) DO UPDATE SET \
+               ts_ms=excluded.ts_ms,conn_id=excluded.conn_id,process=excluded.process,\
+               network=excluded.network,outbound=excluded.outbound,rule=excluded.rule",
             params![e.conn_id, e.ts_ms as i64, e.process, e.process_path, e.host, e.dest_ip, e.dest_port, e.network, e.outbound, e.rule],
         ) {
             self.dropped.fetch_add(1, Ordering::Relaxed);
@@ -118,7 +130,7 @@ impl Store {
         let c = self.conn.lock().unwrap();
         let mut stmt = c.prepare(
             "SELECT conn_id,ts_ms,process,process_path,host,dest_ip,dest_port,network,outbound,rule \
-             FROM requests ORDER BY id DESC LIMIT ?1",
+             FROM requests ORDER BY ts_ms DESC, id DESC LIMIT ?1",
         )?;
         let rows = stmt
             .query_map(params![limit], |r| {
