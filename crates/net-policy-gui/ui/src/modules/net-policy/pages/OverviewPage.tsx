@@ -61,7 +61,7 @@ export function OverviewPage() {
       <ExitStatsCards conns={conns} wgConfigured={status?.wg_configured} />
 
       <Section title="流量路径" description="当前连接从本机应用到物理出口的完整链路">
-        <FlowTopology status={status ?? LOADING_STATUS} conns={conns} settings={settings} />
+        <FlowTopology status={status ?? LOADING_STATUS} conns={conns} settings={settings} exitIp={exitIp} exitIpAt={exitIpAt} />
       </Section>
     </div>
   )

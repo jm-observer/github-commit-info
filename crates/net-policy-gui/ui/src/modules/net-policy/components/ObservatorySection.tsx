@@ -1,5 +1,5 @@
 import { useMemo, useState } from 'react'
-import { Globe2, Network, ShieldCheck, Trash2 } from 'lucide-react'
+import { ChevronDown, ChevronRight, Globe2, Network, Search, ShieldCheck, Trash2 } from 'lucide-react'
 import type { BlockedEntry, DomainAssoc } from '../api/tauri-client'
 
 function ago(ms: number): string {
@@ -151,26 +151,44 @@ export function DomainMap({ dnsMap }: { dnsMap: DomainAssoc[] }) {
  */
 export function ProcessMap({ dnsMap }: { dnsMap: DomainAssoc[] }) {
   const [showAll, setShowAll] = useState(false)
+  const [search, setSearch] = useState('')
+  // 域名默认收起，点每行「N 个域名」按钮才展开该进程的域名列表。
+  const [expanded, setExpanded] = useState<Set<string>>(new Set())
 
   const procs = useMemo(() => {
-    const m = new Map<string, { process: string; domains: Set<string>; ips: Set<string>; count: number }>()
+    const m = new Map<string, { process: string; domains: string[]; ips: Set<string>; count: number }>()
     for (const e of dnsMap) {
       const list = e.processes.length ? e.processes : ['(unknown)']
       for (const p of list) {
         let cur = m.get(p)
         if (!cur) {
-          cur = { process: p, domains: new Set(), ips: new Set(), count: 0 }
+          cur = { process: p, domains: [], ips: new Set(), count: 0 }
           m.set(p, cur)
         }
-        cur.domains.add(e.domain)
+        if (!cur.domains.includes(e.domain)) cur.domains.push(e.domain)
         e.ips.forEach((ip) => cur!.ips.add(ip))
         cur.count += e.count
       }
     }
-    return Array.from(m.values()).sort((a, b) => b.count - a.count || b.domains.size - a.domains.size)
+    return Array.from(m.values()).sort((a, b) => b.count - a.count || b.domains.length - a.domains.length)
   }, [dnsMap])
 
-  const rows = showAll ? procs : procs.slice(0, 10)
+  const filtered = useMemo(() => {
+    const q = search.trim().toLowerCase()
+    if (!q) return procs
+    // 进程名或它访问过的任一域名命中即保留。
+    return procs.filter(
+      (p) => p.process.toLowerCase().includes(q) || p.domains.some((d) => d.toLowerCase().includes(q)),
+    )
+  }, [procs, search])
+
+  const rows = showAll ? filtered : filtered.slice(0, 10)
+  const toggle = (proc: string) =>
+    setExpanded((prev) => {
+      const next = new Set(prev)
+      next.has(proc) ? next.delete(proc) : next.add(proc)
+      return next
+    })
 
   if (procs.length === 0) {
     return (
@@ -183,46 +201,80 @@ export function ProcessMap({ dnsMap }: { dnsMap: DomainAssoc[] }) {
   return (
     <div className="space-y-2">
       <div className="overflow-hidden rounded-lg border border-gray-200 bg-white dark:border-gray-800 dark:bg-gray-900">
-        <table className="w-full text-left text-xs">
-          <thead className="bg-gray-50 text-gray-500 dark:bg-gray-800/40">
-            <tr>
-              <th className="px-3 py-2 font-medium">进程</th>
-              <th className="px-3 py-2 text-right font-medium">连接数</th>
-              <th className="px-3 py-2 text-right font-medium">域名数</th>
-              <th className="px-3 py-2 font-medium">访问的域名</th>
-            </tr>
-          </thead>
-          <tbody className="divide-y divide-gray-100 dark:divide-gray-800">
-            {rows.map((p) => (
-              <tr key={p.process} className="align-top">
-                <td className="whitespace-nowrap px-3 py-2 font-medium">{p.process}</td>
-                <td className="px-3 py-2 text-right text-gray-500">{p.count}</td>
-                <td className="px-3 py-2 text-right text-gray-500">{p.domains.size}</td>
-                <td className="px-3 py-2">
-                  <div className="flex flex-wrap gap-1">
-                    {Array.from(p.domains).map((d) => (
-                      <span
-                        key={d}
-                        className="rounded bg-gray-100 px-1.5 py-0.5 font-mono text-[11px] text-gray-600 dark:bg-gray-800 dark:text-gray-300"
-                      >
-                        {d}
-                      </span>
-                    ))}
-                  </div>
-                </td>
+        <div className="flex items-center gap-2 border-b border-gray-100 px-3 py-2 dark:border-gray-800">
+          <Search size={13} className="shrink-0 text-gray-400" />
+          <input
+            type="search"
+            placeholder="搜索进程 / 域名…"
+            value={search}
+            onChange={(e) => setSearch(e.target.value)}
+            className="flex-1 bg-transparent text-sm outline-none placeholder:text-gray-400 dark:placeholder:text-gray-600"
+          />
+          <span className="text-xs text-gray-400">
+            {search ? `${filtered.length} / ${procs.length}` : `${procs.length}`} 个进程
+          </span>
+        </div>
+        {filtered.length === 0 ? (
+          <div className="px-4 py-6 text-center text-sm text-gray-500">没有匹配「{search}」的进程或域名。</div>
+        ) : (
+          <table className="w-full text-left text-xs">
+            <thead className="bg-gray-50 text-gray-500 dark:bg-gray-800/40">
+              <tr>
+                <th className="px-3 py-2 font-medium">进程</th>
+                <th className="px-3 py-2 text-right font-medium">连接数</th>
+                <th className="px-3 py-2 font-medium">域名</th>
               </tr>
-            ))}
-          </tbody>
-        </table>
+            </thead>
+            <tbody className="divide-y divide-gray-100 dark:divide-gray-800">
+              {rows.map((p) => {
+                const open = expanded.has(p.process)
+                return (
+                  <tr key={p.process} className="align-top">
+                    <td className="whitespace-nowrap px-3 py-2 font-medium">{p.process}</td>
+                    <td className="px-3 py-2 text-right text-gray-500">{p.count}</td>
+                    <td className="px-3 py-2">
+                      {p.domains.length === 0 ? (
+                        <span className="text-gray-400">—</span>
+                      ) : (
+                        <>
+                          <button
+                            onClick={() => toggle(p.process)}
+                            className="inline-flex items-center gap-1 rounded bg-gray-100 px-2 py-0.5 text-[11px] text-gray-600 transition-colors hover:bg-gray-200 dark:bg-gray-800 dark:text-gray-300 dark:hover:bg-gray-700"
+                            title={open ? '收起域名列表' : '展开该进程访问过的域名列表'}
+                          >
+                            {open ? <ChevronDown size={11} /> : <ChevronRight size={11} />}
+                            {p.domains.length} 个域名
+                          </button>
+                          {open && (
+                            <div className="mt-1 flex flex-wrap gap-1">
+                              {p.domains.map((d) => (
+                                <span
+                                  key={d}
+                                  className="rounded bg-gray-100 px-1.5 py-0.5 font-mono text-[11px] text-gray-600 dark:bg-gray-800 dark:text-gray-300"
+                                >
+                                  {d}
+                                </span>
+                              ))}
+                            </div>
+                          )}
+                        </>
+                      )}
+                    </td>
+                  </tr>
+                )
+              })}
+            </tbody>
+          </table>
+        )}
       </div>
       <div className="flex items-center justify-between gap-3">
         <p className="text-[11px] text-gray-500 dark:text-gray-400">
-          按进程聚合：连接数 = 该进程活跃连接累计，右侧是它访问过的所有域名。
+          按进程聚合：连接数 = 该进程活跃连接累计，点「N 个域名」展开它访问过的域名。
         </p>
-        {procs.length > 10 && (
+        {filtered.length > 10 && (
           <button className="inline-flex items-center gap-1 text-xs text-sky-600 hover:underline" onClick={() => setShowAll((value) => !value)}>
             {showAll ? <Globe2 size={12} /> : <Network size={12} />}
-            {showAll ? '收起' : `查看全部 ${procs.length} 个进程`}
+            {showAll ? '收起' : `查看全部 ${filtered.length} 个进程`}
           </button>
         )}
       </div>

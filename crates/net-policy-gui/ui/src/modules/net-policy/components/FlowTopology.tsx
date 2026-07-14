@@ -104,10 +104,14 @@ export function FlowTopology({
   status,
   conns,
   settings,
+  exitIp,
+  exitIpAt,
 }: {
   status: Status
   conns: ConnectionsSnapshot
   settings: Settings | null
+  exitIp?: string | null
+  exitIpAt?: string | null
 }) {
   const running = status.mihomo_running
   const tun = status.tun_ready
@@ -244,7 +248,13 @@ export function FlowTopology({
         {/* 出口 */}
         <div className="flex justify-center">
           <div className="w-full md:w-1/2">
-            <Node icon={<Globe2 size={18} />} title="海外出口 IP" sub="经 WG endpoint" state={exitState} prov="live" />
+            <Node
+              icon={<Globe2 size={18} />}
+              title="海外出口 IP"
+              sub={exitIp ? `${exitIp}${exitIpAt ? ` · ${exitIpAt}` : ''}` : '经 WG 隧道（诊断页自检取 IP）'}
+              state={exitState}
+              prov="live"
+            />
           </div>
         </div>
       </div>

@@ -147,19 +147,25 @@ export function ObserverTable({
 }) {
   const [actionBusy, setActionBusy] = useState<string | null>(null)
   const [search, setSearch] = useState('')
+  const [routeFilter, setRouteFilter] = useState<'all' | RouteLabel>('all')
 
   const rows = useMemo(() => buildRows(connections, rules.rules, dnsMap ?? []), [connections, rules, dnsMap])
 
   const filteredRows = useMemo(() => {
     const q = search.trim().toLowerCase()
-    if (!q) return rows
-    return rows.filter(
-      (r) =>
+    return rows.filter((r) => {
+      // 出口过滤：全部 / 直连 / VPN / 阻断（按当前 outbound 归类）。
+      if (routeFilter !== 'all' && outboundToRoute(r.outbound) !== routeFilter) return false
+      if (!q) return true
+      return (
         (r.host && r.host.toLowerCase().includes(q)) ||
         (r.ip && r.ip.toLowerCase().includes(q)) ||
-        r.processes.some((p) => p.toLowerCase().includes(q)),
-    )
-  }, [rows, search])
+        r.processes.some((p) => p.toLowerCase().includes(q))
+      )
+    })
+  }, [rows, search, routeFilter])
+
+  const filterActive = !!search || routeFilter !== 'all'
 
   const reroute = async (row: GroupedRow, route: RouteLabel) => {
     const target = row.host || row.ip
@@ -222,19 +228,30 @@ export function ObserverTable({
           className="flex-1 bg-transparent text-sm outline-none placeholder:text-gray-400 dark:placeholder:text-gray-600"
         />
         {rows.length > 0 && (
-          <span className="text-xs text-gray-400">{search ? `${filteredRows.length} / ${rows.length}` : rows.length} 条</span>
+          <span className="text-xs text-gray-400">{filterActive ? `${filteredRows.length} / ${rows.length}` : rows.length} 条</span>
         )}
-        {/* 图例 */}
-        <div className="ml-auto flex items-center gap-3 text-[11px] text-gray-400">
-          <span className="inline-flex items-center gap-1">
-            <span className="inline-block h-2 w-2 rounded-full bg-gray-400" /> 直连
-          </span>
-          <span className="inline-flex items-center gap-1">
-            <span className="inline-block h-2 w-2 rounded-full bg-blue-500" /> VPN
-          </span>
-          <span className="inline-flex items-center gap-1">
-            <span className="inline-block h-2 w-2 rounded-full bg-red-500" /> 阻断
-          </span>
+        {/* 出口过滤（兼作图例）：点击按当前出口筛选 */}
+        <div className="ml-auto flex items-center gap-1">
+          {(['all', 'direct', 'wg', 'blackhole'] as const).map((rf) => {
+            const label = rf === 'all' ? '全部' : rf === 'direct' ? '直连' : rf === 'wg' ? 'VPN' : '阻断'
+            const dot = rf === 'direct' ? 'bg-gray-400' : rf === 'wg' ? 'bg-blue-500' : rf === 'blackhole' ? 'bg-red-500' : ''
+            const active = routeFilter === rf
+            return (
+              <button
+                key={rf}
+                onClick={() => setRouteFilter(rf)}
+                className={`inline-flex items-center gap-1 rounded px-2 py-0.5 text-[11px] transition-colors ${
+                  active
+                    ? 'bg-gray-200 font-medium text-gray-800 dark:bg-gray-700 dark:text-gray-100'
+                    : 'text-gray-400 hover:bg-gray-100 dark:hover:bg-gray-800'
+                }`}
+                title={rf === 'all' ? '显示全部出口' : `只看走「${label}」的目标`}
+              >
+                {dot && <span className={`inline-block h-2 w-2 rounded-full ${dot}`} />}
+                {label}
+              </button>
+            )
+          })}
         </div>
       </div>
 
@@ -243,8 +260,8 @@ export function ObserverTable({
         <div className="px-4 py-6 text-center text-sm text-gray-500">
           {!applied
             ? '开始观察后，这里列出每条连接的 域名/IP → 出口，可逐行改路。'
-            : search
-              ? `没有匹配「${search}」的记录。`
+            : filterActive
+              ? '没有匹配当前搜索 / 出口筛选的记录。'
               : '引擎运行中，暂无活跃连接。'}
         </div>
       ) : (

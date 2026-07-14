@@ -1,5 +1,5 @@
-import { useCallback, useEffect, useState } from 'react'
-import { History, ListTree, RefreshCw, ScrollText, Trash2 } from 'lucide-react'
+import { useCallback, useEffect, useMemo, useState } from 'react'
+import { History, ListTree, RefreshCw, ScrollText, Search, Trash2 } from 'lucide-react'
 import { NetPolicyAPI, type LifecycleEvent, type ProcessNode, type RequestLogEntry } from '../api/tauri-client'
 
 type RecordView = 'requests' | 'events' | 'processes'
@@ -29,6 +29,20 @@ export function RecordsSection() {
   const [events, setEvents] = useState<LifecycleEvent[]>([])
   const [tree, setTree] = useState<ProcessNode[]>([])
   const [loading, setLoading] = useState<Record<RecordView, boolean>>({ requests: false, events: false, processes: false })
+  const [search, setSearch] = useState('')
+
+  // 请求记录搜索：按 进程 / 域名 / IP 过滤（仅「网络请求」视图）。
+  const filteredRequests = useMemo(() => {
+    const q = search.trim().toLowerCase()
+    if (!q) return requests
+    return requests.filter(
+      (r) =>
+        (r.process || '').toLowerCase().includes(q) ||
+        (r.process_path || '').toLowerCase().includes(q) ||
+        (r.host || '').toLowerCase().includes(q) ||
+        (r.dest_ip || '').toLowerCase().includes(q),
+    )
+  }, [requests, search])
 
   const loadRequests = useCallback(async () => {
     setLoading((state) => ({ ...state, requests: true }))
@@ -115,9 +129,26 @@ export function RecordsSection() {
 
       {view === 'requests' && (
         <>
+          {requests.length > 0 && (
+            <div className="flex items-center gap-2 rounded-lg border border-gray-200 bg-white px-3 py-2 dark:border-gray-800 dark:bg-gray-900">
+              <Search size={13} className="shrink-0 text-gray-400" />
+              <input
+                type="search"
+                placeholder="搜索进程 / 域名 / IP…"
+                value={search}
+                onChange={(e) => setSearch(e.target.value)}
+                className="flex-1 bg-transparent text-sm outline-none placeholder:text-gray-400 dark:placeholder:text-gray-600"
+              />
+              <span className="text-xs text-gray-400">{search ? `${filteredRequests.length} / ${requests.length}` : requests.length} 条</span>
+            </div>
+          )}
           {requests.length === 0 ? (
             <div className="rounded-lg border border-dashed border-gray-300 px-4 py-10 text-center text-sm text-gray-500 dark:border-gray-700">
-              暂无网络请求。mihomo 运行并产生流量后，活跃连接会每 3 秒去重采样。
+              暂无网络请求。mihomo 运行并产生流量后，活跃连接会每 3 秒按「进程+目标」去重、只刷新时间。
+            </div>
+          ) : filteredRequests.length === 0 ? (
+            <div className="rounded-lg border border-dashed border-gray-300 px-4 py-10 text-center text-sm text-gray-500 dark:border-gray-700">
+              没有匹配「{search}」的记录。
             </div>
           ) : (
             <div className="max-h-[32rem] overflow-auto rounded-lg border border-gray-200 bg-white dark:border-gray-800 dark:bg-gray-900">
@@ -130,7 +161,7 @@ export function RecordsSection() {
                   </tr>
                 </thead>
                 <tbody className="divide-y divide-gray-100 dark:divide-gray-800">
-                  {requests.map((request, index) => (
+                  {filteredRequests.map((request, index) => (
                     <tr key={`${request.conn_id}-${index}`}>
                       <td className="whitespace-nowrap px-3 py-2 text-gray-400">{ts(request.ts_ms)}</td>
                       <td className="px-3 py-2 font-mono" title={request.process_path}>{request.process || '(?)'}</td>
@@ -146,7 +177,7 @@ export function RecordsSection() {
             </div>
           )}
           <p className="text-[11px] text-gray-500 dark:text-gray-400">
-            数据保存在 <code>~/.config/net-policy-agent/net-policy/net-policy.db</code>，上限 10 万条，可随时清空。
+            数据保存在 <code>~/.config/net-policy-agent/net-policy/net-policy.db</code>，按「进程+目标」去重、上限 10 万条，可随时清空。
           </p>
         </>
       )}
