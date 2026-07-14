@@ -8,7 +8,7 @@
 //! - `strict-route: true` + `dns-hijack: any:53`（§0.6 拦系统 DNS，含显式 8.8.8.8）。
 //! - DNS 模式 A：上游 nameserver 走物理 bootstrap（§0.8.1），kill-switch 放行其 IP。
 
-use crate::config::{NetPolicySettings, RuleSet, TempDirect};
+use crate::config::{NetPolicySettings, Route, RuleSet, TempDirect};
 use crate::routes;
 
 /// mihomo 外部控制器端口（loopback）。
@@ -40,6 +40,16 @@ pub fn generate_config(
         .join("\n");
     let rule_lines = routes::to_lines(settings, rules, temp).join("\n");
     let ipv6 = !settings.block_ipv6; // block_ipv6=true → mihomo ipv6:false
+
+    // DNS nameserver：**海外姿态 + WG 就绪**时，被墙域名走隧道内 DoH（`#wg-out`）解析——否则用国内
+    // bootstrap 解墙外域名会被污染，现象是「纯 IP 通、google 等域名解不出」（真机实测）。国内直连
+    // 域名仍走下方 direct-nameserver（国内）。其余姿态（直连/阻断）没有隧道可走，仍用国内 bootstrap。
+    let use_tunnel_dns = settings.default_route == Route::Wg && wg.validate().is_ok();
+    let nameserver = if use_tunnel_dns {
+        "\"https://1.1.1.1/dns-query#wg-out\", \"https://8.8.8.8/dns-query#wg-out\"".to_string()
+    } else {
+        dns_bootstrap.clone()
+    };
 
     // WG 已配 → 输出 wg-out outbound；未配 → 空 proxies（黑洞/直连仍可运行，不强制 SBN）。
     let proxies = if wg.validate().is_ok() {
@@ -94,7 +104,7 @@ dns:
     - '+.msftncsi.com'
   # DNS 模式 A：上游 bootstrap 走物理（§0.8.1，kill-switch 放行其 IP）。
   default-nameserver: [{dns_bootstrap}]
-  nameserver: [{dns_bootstrap}]
+  nameserver: [{nameserver}]
   direct-nameserver: [{dns_bootstrap}]
   fallback: []
 

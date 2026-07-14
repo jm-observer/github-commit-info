@@ -211,9 +211,12 @@ pub fn firewall_default_outbound_domain() -> Result<String> {
     if ty != REG_DWORD {
         bail!("DefaultOutboundAction registry type is {ty}, expected REG_DWORD");
     }
+    // 注册表 DefaultOutboundAction REG_DWORD：**0=Allow、1=Block**（0.228 真机实测 0x1 = CIM Block）。
+    // 早期这里 0/1 写反了 → kill-switch 实际 Block 却被读成 Allow → status.firewall.active=false →
+    // GUI 误报「不受保护预览」，而实际是受保护的。此处对调修正。
     Ok(match data {
-        0 => "Block".to_string(),
-        1 => "Allow".to_string(),
+        0 => "Allow".to_string(),
+        1 => "Block".to_string(),
         n => format!("Unknown({n})"),
     })
 }
