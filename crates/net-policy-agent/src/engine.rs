@@ -86,33 +86,19 @@ pub fn start(bin: &Path, home: &Path, cfg: &Path) -> Result<u32> {
 /// 重置 mihomo 所有活跃连接（`DELETE /connections`），逼旧连接用新出口重连（切姿态 reload 后调用）。
 /// best-effort：失败只返回 `Err`，由调用方决定是否阻塞/提示，不 panic。
 pub fn reset_connections(secret: &str) -> Result<()> {
-    let h = auth_header(secret);
-    let out = run_ps(&format!(
-        r#"$h={h}
-try{{ Invoke-RestMethod 'http://{CONTROLLER}/connections' -Method DELETE -Headers $h -TimeoutSec 4 | Out-Null; 'OK' }}
-catch{{ "ERR:$($_.Exception.Message)" }}
-"#
-    ))?;
-    if !out.trim().starts_with("OK") {
-        bail!("重置 mihomo 连接失败：{}", out.trim());
+    if !controller_request_ok("DELETE", "/connections", secret, None)? {
+        bail!("重置 mihomo 连接失败：控制器返回非 2xx 状态");
     }
     Ok(())
 }
 
 /// 热重载配置（逐项放行不重启隧道）：调用方须**先** `write_config` 再调本函数。
 pub fn reload(workspace: &Path, secret: &str) -> Result<()> {
-    let h = auth_header(secret);
     let cfg = mihomo_config_path(workspace);
-    let path = cfg.to_string_lossy().replace('\\', "\\\\");
-    let out = run_ps(&format!(
-        r#"$h={h}
-$body='{{"path":"{path}"}}'
-try{{ Invoke-RestMethod 'http://{CONTROLLER}/configs' -Method PUT -Headers $h -ContentType 'application/json' -Body $body -TimeoutSec 8 | Out-Null; 'OK' }}
-catch{{ "ERR:$($_.Exception.Message)" }}
-"#
-    ))?;
-    if !out.trim().starts_with("OK") {
-        bail!("mihomo 热重载失败：{}", out.trim());
+    let body = serde_json::to_string(&serde_json::json!({ "path": cfg.to_string_lossy() }))
+        .context("serialize mihomo reload body")?;
+    if !controller_request_ok("PUT", "/configs", secret, Some(&body))? {
+        bail!("mihomo 热重载失败：控制器返回非 2xx 状态");
     }
     Ok(())
 }
@@ -123,24 +109,51 @@ pub fn graceful_stop(pid: Option<u32>, secret: &str, fallback_name: &str) -> Res
     let h = auth_header(secret);
     let kill = match pid {
         Some(p) => format!(
-            "Stop-Process -Id {p} -Force -ErrorAction SilentlyContinue; \
-             if(Get-Process -Id {p} -ErrorAction SilentlyContinue){{ throw 'mihomo pid {p} 未能结束' }}"
+            r#"$proc=Get-Process -Id {p} -ErrorAction SilentlyContinue
+if($proc){{
+    try{{ Stop-Process -InputObject $proc -Force -ErrorAction Stop }}
+    catch{{ throw "结束 mihomo pid {p} 失败：$($_.Exception.Message)" }}
+    $stopped=$false
+    for($i=0;$i -lt 20;$i++){{
+        if(-not (Get-Process -Id {p} -ErrorAction SilentlyContinue)){{ $stopped=$true; break }}
+        Start-Sleep -Milliseconds 250
+    }}
+    if(-not $stopped){{ throw 'mihomo pid {p} 在 5 秒内未结束' }}
+}}"#
         ),
         None => format!(
-            "Get-Process '{}' -ErrorAction SilentlyContinue | Stop-Process -Force",
-            fallback_name.replace('\'', "''")
+            r#"$procs=@(Get-Process '{}' -ErrorAction SilentlyContinue)
+if($procs.Count -gt 0){{
+    try{{ $procs | Stop-Process -Force -ErrorAction Stop }}
+    catch{{ throw "结束 mihomo 进程失败：$($_.Exception.Message)" }}
+    $stopped=$false
+    for($i=0;$i -lt 20;$i++){{
+        if(-not (Get-Process '{}' -ErrorAction SilentlyContinue)){{ $stopped=$true; break }}
+        Start-Sleep -Milliseconds 250
+    }}
+    if(-not $stopped){{ throw 'mihomo 进程在 5 秒内未结束' }}
+}}"#,
+            fallback_name.replace('\'', "''"),
+            fallback_name.replace('\'', "''"),
         ),
     };
-    run_ps(&format!(
+    let out = run_ps(&format!(
         r#"$h={h}
-try{{ Invoke-RestMethod 'http://{CONTROLLER}/configs' -Method PATCH -Headers $h -Body '{{"tun":{{"enable":false}}}}' -TimeoutSec 4 | Out-Null }}catch{{}}
-$gone=$false
-for($i=0;$i -lt 14;$i++){{ if(-not (Get-NetAdapter -Name Meta -ErrorAction SilentlyContinue)){{ $gone=$true; break }}; Start-Sleep -Milliseconds 500 }}
-if(-not $gone){{ throw 'TUN(Meta) 未在超时内优雅拆除——拒绝强杀以避免 wintun 路由残留；防火墙保持生效（请重试或本地排查）' }}
-{kill}
-'OK'
+try{{
+    try{{ Invoke-RestMethod 'http://{CONTROLLER}/configs' -Method PATCH -Headers $h -Body '{{"tun":{{"enable":false}}}}' -TimeoutSec 4 | Out-Null }}catch{{}}
+    $gone=$false
+    for($i=0;$i -lt 14;$i++){{ if(-not (Get-NetAdapter -Name Meta -ErrorAction SilentlyContinue)){{ $gone=$true; break }}; Start-Sleep -Milliseconds 500 }}
+    if(-not $gone){{ throw 'TUN(Meta) 未在超时内优雅拆除——拒绝强杀以避免 wintun 路由残留；防火墙保持生效（请重试或本地排查）' }}
+    {kill}
+    'OK'
+}}catch{{
+    "ERR:$($_.Exception.Message)"
+}}
 "#
     ))?;
+    if !out.trim().starts_with("OK") {
+        bail!("{}", out.trim().trim_start_matches("ERR:"));
+    }
     if controller_present() {
         bail!(
             "mihomo 进程未能结束（controller 仍在响应）——请确认进程名 {fallback_name}，或手动结束进程"
@@ -186,6 +199,15 @@ pub fn running(secret: &str) -> bool {
     })
 }
 
+/// 探测 mihomo 控制器并保留失败上下文，供诊断页展示具体原因。
+pub fn probe_controller(secret: &str) -> Result<()> {
+    if controller_get_ok("/version", secret)? {
+        Ok(())
+    } else {
+        bail!("控制器已响应，但 /version 返回非 200 状态（可能是鉴权失败）")
+    }
+}
+
 /// mihomo TUN（Meta 适配器）是否已起栈并 Up。
 pub fn tun_up() -> bool {
     crate::win::adapter_up("Meta").unwrap_or_else(|_| {
@@ -198,6 +220,16 @@ pub fn tun_up() -> bool {
 }
 
 fn controller_get_ok(path: &str, secret: &str) -> Result<bool> {
+    controller_request_ok("GET", path, secret, None)
+}
+
+/// 直接访问本机 mihomo HTTP 控制器，避免每次热载/断连都冷启动 PowerShell。
+fn controller_request_ok(
+    method: &str,
+    path: &str,
+    secret: &str,
+    body: Option<&str>,
+) -> Result<bool> {
     let addr: SocketAddr = CONTROLLER.parse().context("parse mihomo controller addr")?;
     let timeout = Duration::from_millis(900);
     let mut stream =
@@ -210,16 +242,29 @@ fn controller_get_ok(path: &str, secret: &str) -> Result<bool> {
     } else {
         format!("Authorization: Bearer {secret}\r\n")
     };
-    let req =
-        format!("GET {path} HTTP/1.1\r\nHost: {CONTROLLER}\r\n{auth}Connection: close\r\n\r\n");
+    let body = body.unwrap_or_default();
+    let content_type = if body.is_empty() {
+        String::new()
+    } else {
+        "Content-Type: application/json\r\n".to_string()
+    };
+    let req = format!(
+        "{method} {path} HTTP/1.1\r\nHost: {CONTROLLER}\r\n{auth}{content_type}Content-Length: {}\r\nConnection: close\r\n\r\n{body}",
+        body.len()
+    );
     stream
         .write_all(req.as_bytes())
         .context("write mihomo controller request")?;
 
-    let mut buf = [0u8; 128];
+    let mut buf = [0u8; 256];
     let n = stream
         .read(&mut buf)
         .context("read mihomo controller response")?;
     let head = std::str::from_utf8(&buf[..n]).unwrap_or_default();
-    Ok(head.starts_with("HTTP/1.1 200") || head.starts_with("HTTP/1.0 200"))
+    let status = head
+        .lines()
+        .next()
+        .and_then(|line| line.split_whitespace().nth(1))
+        .unwrap_or_default();
+    Ok(status.starts_with('2'))
 }

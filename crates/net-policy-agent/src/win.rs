@@ -15,12 +15,20 @@ const RUN_PS_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(120);
 /// 在 Windows 上执行一段 PowerShell 脚本，返回 stdout（UTF-8）。超时（120s）杀进程并报错。
 #[cfg(windows)]
 pub fn run_ps(script: &str) -> Result<String> {
+    run_ps_timeout(script, RUN_PS_TIMEOUT)
+}
+
+/// 同 [`run_ps`]，但可指定超时。用于 MITM 引擎部署等**长耗时**步骤（下载 ~80MB + 解压可能远超
+/// 默认 120s，见 mitm_engine）。其余安全约束（EncodedCommand / null stdin / 隐藏控制台 / 超时杀进程）
+/// 与 `run_ps` 一致。
+#[cfg(windows)]
+pub fn run_ps_timeout(script: &str, timeout: std::time::Duration) -> Result<String> {
     use base64::Engine;
     use std::process::{Command, Stdio};
     use std::time::Instant;
 
     let wrapped = format!(
-        "[Console]::OutputEncoding=[Text.Encoding]::UTF8\n$ErrorActionPreference='Stop'\n{script}"
+        "[Console]::OutputEncoding=[Text.Encoding]::UTF8\n$ErrorActionPreference='Stop'\n$ProgressPreference='SilentlyContinue'\n{script}"
     );
     let utf16: Vec<u8> = wrapped
         .encode_utf16()
@@ -42,17 +50,14 @@ pub fn run_ps(script: &str) -> Result<String> {
     .stderr(Stdio::piped());
     crate::proc::hide_console(&mut cmd);
     let mut child = cmd.spawn().context("spawn powershell")?;
-    let deadline = Instant::now() + RUN_PS_TIMEOUT;
+    let deadline = Instant::now() + timeout;
     loop {
         match child.try_wait().context("wait powershell")? {
             Some(_) => break,
             None if Instant::now() >= deadline => {
                 let _ = child.kill();
                 let _ = child.wait();
-                bail!(
-                    "powershell 执行超时（{}s），已强制结束",
-                    RUN_PS_TIMEOUT.as_secs()
-                );
+                bail!("powershell 执行超时（{}s），已强制结束", timeout.as_secs());
             }
             None => std::thread::sleep(std::time::Duration::from_millis(50)),
         }
@@ -69,6 +74,11 @@ pub fn run_ps(script: &str) -> Result<String> {
 
 #[cfg(not(windows))]
 pub fn run_ps(_script: &str) -> Result<String> {
+    bail!("net-policy 仅支持 Windows（当前非 Windows 平台）")
+}
+
+#[cfg(not(windows))]
+pub fn run_ps_timeout(_script: &str, _timeout: std::time::Duration) -> Result<String> {
     bail!("net-policy 仅支持 Windows（当前非 Windows 平台）")
 }
 

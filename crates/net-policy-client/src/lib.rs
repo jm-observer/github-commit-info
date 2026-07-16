@@ -9,6 +9,7 @@
 pub mod frame;
 
 use anyhow::{bail, Context, Result};
+use net_policy_core::capture::{CaptureOpts, CaptureSession, CaptureTarget};
 use net_policy_core::config::{NetPolicySettings, ProcessRef, Rule, RuleSet, WgConfig};
 use net_policy_core::operation::OperationInfo;
 use net_policy_core::protocol::{
@@ -57,6 +58,15 @@ pub struct Client {
     next_id: u64,
     /// agent 端协商后的版本。
     pub server_version: Version,
+    /// agent 声明的能力清单（minor 5，如 `capture_v1`；旧 agent 为空）。
+    pub server_capabilities: Vec<String>,
+}
+
+impl Client {
+    /// agent 是否声明了某能力（如 `net_policy_core::capture::CAPABILITY_CAPTURE_V1`）。
+    pub fn has_capability(&self, cap: &str) -> bool {
+        self.server_capabilities.iter().any(|c| c == cap)
+    }
 }
 
 impl Client {
@@ -72,6 +82,7 @@ impl Client {
             conn,
             next_id: 1,
             server_version: Version::CURRENT,
+            server_capabilities: Vec::new(),
         };
         // 握手：先声明本端版本，取 agent 版本。major 不同 agent 会回 Error(VersionIncompatible)。
         let resp = c
@@ -80,8 +91,12 @@ impl Client {
             })
             .await?;
         match resp {
-            Response::Hello { version } => {
+            Response::Hello {
+                version,
+                capabilities,
+            } => {
                 c.server_version = version;
+                c.server_capabilities = capabilities;
                 Ok(c)
             }
             Response::Error { error } => Err(anyhow::anyhow!(
@@ -138,6 +153,12 @@ impl Client {
     /// minor 3 门控后再发请求（`ResetConnections` / `GetMihomoLog`）。
     async fn request_v3(&mut self, req: Request) -> Result<Response> {
         self.require_minor(3)?;
+        self.request(req).await
+    }
+
+    /// minor 5 门控后再发请求（抓包 `Capture*`）。
+    async fn request_v5(&mut self, req: Request) -> Result<Response> {
+        self.require_minor(5)?;
         self.request(req).await
     }
 
@@ -366,6 +387,69 @@ impl Client {
             other => unexpected(other),
         }
     }
+
+    // ── minor 5：抓包（Capture*，抓包设计 §10）─────────────────────────────────
+
+    /// 开始抓包（`All` 全 TUN，或定向 Process/Domain/Ip）。返回 `running` 会话。
+    pub async fn capture_start(
+        &mut self,
+        target: CaptureTarget,
+        opts: CaptureOpts,
+    ) -> Result<CaptureSession> {
+        match Client::expect_ok(self.request_v5(Request::CaptureStart { target, opts }).await?)? {
+            Response::CaptureSession { session } => Ok(session),
+            other => unexpected(other),
+        }
+    }
+
+    /// 停止抓包（幂等）。
+    pub async fn capture_stop(&mut self, id: String) -> Result<CaptureSession> {
+        match Client::expect_ok(self.request_v5(Request::CaptureStop { id }).await?)? {
+            Response::CaptureSession { session } => Ok(session),
+            other => unexpected(other),
+        }
+    }
+
+    /// 取单个会话当前态。
+    pub async fn capture_get(&mut self, id: String) -> Result<CaptureSession> {
+        match Client::expect_ok(self.request_v5(Request::CaptureGet { id }).await?)? {
+            Response::CaptureSession { session } => Ok(session),
+            other => unexpected(other),
+        }
+    }
+
+    /// 列出所有会话。
+    pub async fn capture_list(&mut self) -> Result<Vec<CaptureSession>> {
+        match Client::expect_ok(self.request_v5(Request::CaptureList).await?)? {
+            Response::CaptureSessions { sessions } => Ok(sessions),
+            other => unexpected(other),
+        }
+    }
+
+    /// 删除会话（运行态返回 `capture_busy`）。
+    pub async fn capture_delete(&mut self, id: String) -> Result<()> {
+        Client::expect_ok(self.request_v5(Request::CaptureDelete { id }).await?)?;
+        Ok(())
+    }
+
+    /// 分块读取 `done` 会话 pcapng，返回 `(offset, data_base64, eof)`。
+    pub async fn capture_read(
+        &mut self,
+        id: String,
+        offset: u64,
+        len: u32,
+    ) -> Result<(u64, String, bool)> {
+        let req = Request::CaptureRead { id, offset, len };
+        match Client::expect_ok(self.request_v5(req).await?)? {
+            Response::CaptureChunk {
+                offset,
+                data_base64,
+                eof,
+                ..
+            } => Ok((offset, data_base64, eof)),
+            other => unexpected(other),
+        }
+    }
 }
 
 /// 事件订阅流（独立连接：发一条 `SubscribeEvents` 后本连接只收 `Event` 帧）。
@@ -451,5 +535,26 @@ fn kind_str(k: ErrorKind) -> &'static str {
         ErrorKind::VersionIncompatible => "version_incompatible",
         ErrorKind::Unsupported => "unsupported",
         ErrorKind::Internal => "internal",
+        ErrorKind::CaptureUnsupported => "capture_unsupported",
+        ErrorKind::CaptureEngineBusy => "capture_engine_busy",
+        ErrorKind::CaptureFiltersBusy => "capture_filters_busy",
+        ErrorKind::CaptureComponentNotFound => "capture_component_not_found",
+        ErrorKind::CaptureTargetEmpty => "capture_target_empty",
+        ErrorKind::CaptureFilterLimit => "capture_filter_limit",
+        ErrorKind::CaptureConflict => "capture_conflict",
+        ErrorKind::CaptureNotFound => "capture_not_found",
+        ErrorKind::CaptureBusy => "capture_busy",
+        ErrorKind::CaptureStorageFull => "capture_storage_full",
+        ErrorKind::CaptureConvertFailed => "capture_convert_failed",
+        ErrorKind::DecryptUnsupported => "decrypt_unsupported",
+        ErrorKind::DecryptCaMissing => "decrypt_ca_missing",
+        ErrorKind::DecryptCaBroken => "decrypt_ca_broken",
+        ErrorKind::DecryptTargetStale => "decrypt_target_stale",
+        ErrorKind::DecryptEngineUnhealthy => "decrypt_engine_unhealthy",
+        ErrorKind::DecryptConflict => "decrypt_conflict",
+        ErrorKind::DecryptLimitReached => "decrypt_limit_reached",
+        ErrorKind::DecryptClientRejectedCert => "decrypt_client_rejected_cert",
+        ErrorKind::DecryptQuicNotSupported => "decrypt_quic_not_supported",
+        ErrorKind::DecryptFinalizeFailed => "decrypt_finalize_failed",
     }
 }

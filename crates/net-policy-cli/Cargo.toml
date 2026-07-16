@@ -17,6 +17,7 @@ tokio = { workspace = true, features = ["rt-multi-thread", "macros"] }
 clap = { workspace = true, features = ["env"] }
 log = { workspace = true }
 custom-utils = { workspace = true }
+base64 = "0.21"
 
 [features]
 # prod 构建：日志写文件、stdout 保持干净（AGENTS.md）。

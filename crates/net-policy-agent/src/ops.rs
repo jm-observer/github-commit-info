@@ -118,8 +118,14 @@ pub async fn run_set_temp_direct(
     let gen = state.set_temp(duration_secs, except.clone());
     // reload 使配置生效（未应用时 no-op 返回 Ok，下次 apply 自然带上）。失败回滚。
     if let Err(err) = run_reload_operation(state.clone()).await {
+        let primary = err.to_string();
         state.restore_temp(prev);
-        return Err(err);
+        return match run_reload_operation(state.clone()).await {
+            Ok(_) => Err(OpError::Failed(primary)),
+            Err(rollback_err) => Err(OpError::Failed(format!(
+                "{primary}；恢复原临时直连配置亦失败：{rollback_err}"
+            ))),
+        };
     }
     state.record_event(
         "temp_direct_on",
@@ -143,8 +149,14 @@ pub async fn run_clear_temp_direct(state: Arc<AgentState>) -> Result<TempDirectS
     let prev = state.temp_snapshot();
     state.clear_temp();
     if let Err(err) = run_reload_operation(state.clone()).await {
+        let primary = err.to_string();
         state.restore_temp(prev);
-        return Err(err);
+        return match run_reload_operation(state.clone()).await {
+            Ok(_) => Err(OpError::Failed(primary)),
+            Err(rollback_err) => Err(OpError::Failed(format!(
+                "{primary}；恢复临时直连状态亦失败：{rollback_err}"
+            ))),
+        };
     }
     state.record_event("temp_direct_off", "manual");
     Ok(state.temp_status())
@@ -204,6 +216,11 @@ async fn do_apply(state: Arc<AgentState>) -> Result<(), String> {
     // 观察/Direct 姿态 kill-switch 无安全意义（崩溃只是不走代理，不泄密）；强装反而会砖网。
     let killswitch = settings.killswitch_enabled && settings.default_route != Route::Direct;
     let mihomo_bin = paths::resolve_mihomo_bin(state.dev).map_err(e)?;
+    let firewall_signature = if killswitch {
+        Some(firewall::configuration_signature(&settings, &mihomo_bin))
+    } else {
+        None
+    };
     let mihomo_home = paths::mihomo_home(&ws);
     let secret = engine::gen_secret();
     let temp = state.temp_for_config();
@@ -245,6 +262,7 @@ async fn do_apply(state: Arc<AgentState>) -> Result<(), String> {
             let mut rt = state.rt.lock().unwrap();
             rt.mihomo_pid = None;
             rt.secret = None;
+            rt.firewall_signature = None;
         }
 
         // 回滚：有新 pid 时先优雅停引擎；停不掉则保留防火墙维持 fail-closed。
@@ -255,6 +273,7 @@ async fn do_apply(state: Arc<AgentState>) -> Result<(), String> {
                     rt.applied = true;
                     rt.mihomo_pid = Some(p);
                     rt.secret = Some(secret.clone());
+                    rt.firewall_signature = firewall_signature.clone();
                     return Err(e(err));
                 }
             }
@@ -265,6 +284,7 @@ async fn do_apply(state: Arc<AgentState>) -> Result<(), String> {
             rt.applied = false;
             rt.mihomo_pid = None;
             rt.secret = None;
+            rt.firewall_signature = None;
             Ok(())
         };
         let rollback_note = if killswitch && was_applied {
@@ -272,6 +292,16 @@ async fn do_apply(state: Arc<AgentState>) -> Result<(), String> {
         } else {
             ""
         };
+
+        // 安装器覆盖升级时不会杀数据面，而是把新 mihomo 留为 pending。只有来到本来就会
+        // 受控重启引擎的 reapply 窗口，才在旧进程已停、kill-switch 仍保持时切换二进制。
+        if let Err(err) = paths::activate_pending_mihomo() {
+            state.emit_progress(1, "fail", Some(format!("{}{rollback_note}", e(&err))));
+            return Err(with_rollback(
+                format!("切换暂存 mihomo：{}{rollback_note}", e(err)),
+                rollback(None),
+            ));
+        }
 
         // 步 1：先建 fail-closed 基线（不依赖 Meta），再写配置。
         state.emit_progress(1, "running", None);
@@ -373,6 +403,7 @@ async fn do_apply(state: Arc<AgentState>) -> Result<(), String> {
             rt.applied = true;
             rt.mihomo_pid = Some(pid);
             rt.secret = Some(secret.clone());
+            rt.firewall_signature = firewall_signature;
         }
         state.emit_progress(5, "ok", Some("引擎在线 · TUN 已起栈".into()));
         Ok(())
@@ -414,6 +445,7 @@ async fn do_stop(state: Arc<AgentState>) -> Result<(), String> {
         rt.applied = false;
         rt.mihomo_pid = None;
         rt.secret = None;
+        rt.firewall_signature = None;
     }
     // 手动停止 → 清 enabled（下次启动不自动恢复）。
     if let Ok(mut s) = config::try_load_settings(&state.workspace) {
@@ -433,9 +465,13 @@ async fn do_reload(state: Arc<AgentState>) -> Result<(), String> {
     }
     state.invalidate_status_cache();
     let ws = state.workspace.clone();
-    let (applied, secret) = {
+    let (applied, secret, current_firewall_signature) = {
         let rt = state.rt.lock().unwrap();
-        (rt.applied, rt.secret.clone().unwrap_or_default())
+        (
+            rt.applied,
+            rt.secret.clone().unwrap_or_default(),
+            rt.firewall_signature.clone(),
+        )
     };
     if !applied {
         return Ok(());
@@ -445,6 +481,7 @@ async fn do_reload(state: Arc<AgentState>) -> Result<(), String> {
     config::validate_combined(&settings, &rules).map_err(e)?;
     let dev = state.dev;
     let temp = state.temp_for_config();
+    let state_for_reload = state.clone();
     tokio::task::spawn_blocking(move || -> Result<(), String> {
         // kill-switch 仍按用户设定姿态挂（临时直连只改 mihomo MATCH，不摘围栏——DIRECT 经 mihomo
         // 拨号出物理由 R-mihomo 放行，例外进程仍被 Blackhole/IPv6 阻断，更安全）。
@@ -452,8 +489,15 @@ async fn do_reload(state: Arc<AgentState>) -> Result<(), String> {
         let up = firewall::status()
             .map(|f| f.rule_count > 0 || f.active)
             .unwrap_or(false);
-        if want {
-            let bin = paths::resolve_mihomo_bin(dev).map_err(e)?;
+        let bin = paths::resolve_mihomo_bin(dev).map_err(e)?;
+        let desired_firewall_signature = if want {
+            Some(firewall::configuration_signature(&settings, &bin))
+        } else {
+            None
+        };
+        let firewall_needs_sync =
+            want && (!up || current_firewall_signature != desired_firewall_signature);
+        if firewall_needs_sync {
             firewall::apply_base(&ws, &settings, &bin).map_err(e)?;
         }
         if let Err(err) = engine::write_config(&ws, &settings, &rules, &secret, &temp)
@@ -464,11 +508,15 @@ async fn do_reload(state: Arc<AgentState>) -> Result<(), String> {
             }
             return Err(e(err));
         }
-        if want {
+        if firewall_needs_sync {
             firewall::apply_tun(&ws).map_err(e)?;
         } else if !want && up {
             firewall::remove(&ws).map_err(e)?;
         }
+        // mihomo 热载只影响新连接；旧连接必须主动关闭，才能保证改路、规则删除、临时直连
+        // 开关及到期还原都在本次操作返回前真正生效。
+        engine::reset_connections(&secret).map_err(e)?;
+        state_for_reload.rt.lock().unwrap().firewall_signature = desired_firewall_signature;
         Ok(())
     })
     .await

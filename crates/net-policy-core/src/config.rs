@@ -47,6 +47,8 @@ pub enum Rule {
     ProcessName { value: String, route: Route },
     /// 域名后缀（`DOMAIN-SUFFIX`）。
     DomainSuffix { value: String, route: Route },
+    /// 域名关键词（`DOMAIN-KEYWORD`），用于一条规则覆盖同品牌/同服务的多种域名后缀。
+    DomainKeyword { value: String, route: Route },
     /// IP/CIDR（`IP-CIDR`）。
     IpCidr { value: String, route: Route },
 }
@@ -64,6 +66,9 @@ impl Rule {
             Rule::DomainSuffix { value, route } => {
                 format!("  - DOMAIN-SUFFIX,{value},{}", route.outbound())
             }
+            Rule::DomainKeyword { value, route } => {
+                format!("  - DOMAIN-KEYWORD,{value},{}", route.outbound())
+            }
             Rule::IpCidr { value, route } => {
                 format!("  - IP-CIDR,{value},{},no-resolve", route.outbound())
             }
@@ -76,6 +81,7 @@ impl Rule {
             Rule::ProcessPath { route, .. }
             | Rule::ProcessName { route, .. }
             | Rule::DomainSuffix { route, .. }
+            | Rule::DomainKeyword { route, .. }
             | Rule::IpCidr { route, .. } => *route,
         }
     }
@@ -90,7 +96,22 @@ impl Rule {
             (ProcessPath { value: a, .. }, ProcessPath { value: b, .. })
             | (ProcessName { value: a, .. }, ProcessName { value: b, .. })
             | (DomainSuffix { value: a, .. }, DomainSuffix { value: b, .. })
+            | (DomainKeyword { value: a, .. }, DomainKeyword { value: b, .. })
             | (IpCidr { value: a, .. }, IpCidr { value: b, .. }) => a.eq_ignore_ascii_case(b),
+            _ => false,
+        }
+    }
+
+    /// 本规则是否在同出口下已被另一条规则覆盖。只做保守去重：目前用于
+    /// `DOMAIN-KEYWORD` 覆盖 `DOMAIN-SUFFIX`，避免 UI 里同一服务散成多条规则。
+    pub fn covered_by_same_route(&self, other: &Rule) -> bool {
+        if self.route() != other.route() {
+            return false;
+        }
+        match (self, other) {
+            (Rule::DomainSuffix { value, .. }, Rule::DomainKeyword { value: keyword, .. }) => value
+                .to_ascii_lowercase()
+                .contains(&keyword.to_ascii_lowercase()),
             _ => false,
         }
     }
@@ -101,6 +122,7 @@ impl Rule {
             Rule::ProcessPath { value, .. } => valid::process_path(value),
             Rule::ProcessName { value, .. } => valid::process_name(value),
             Rule::DomainSuffix { value, .. } => valid::domain(value),
+            Rule::DomainKeyword { value, .. } => valid::domain_keyword(value),
             Rule::IpCidr { value, .. } => valid::ip_or_cidr(value),
         }
     }
@@ -118,7 +140,7 @@ pub struct ProgramGroup {
     pub route: Route,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", content = "value", rename_all = "snake_case")]
 pub enum ProcessRef {
     ProcessPath(String),
@@ -431,6 +453,12 @@ pub struct NetPolicySettings {
     /// 防火墙；用户在 UI 显式启用后持久化为 true，此后每次启动自动恢复上次策略。
     #[serde(default)]
     pub enabled: bool,
+    /// L2 域名嗅探（mihomo `sniffer`，抓包设计 §11 Phase 1）：对缺域名的连接从 TLS SNI /
+    /// HTTP Host / QUIC 补全 `/connections.host`，只增强观察数据。**默认关闭**——先在真机验证无
+    /// 兼容性回归再评估新安装默认开启。`override-destination` 恒为 false：只观察，不因嗅探结果改
+    /// 路由或实际目标。
+    #[serde(default)]
+    pub sniffer_enabled: bool,
 }
 
 /// 默认出口缺省值 = 直连·观察（observer-first：进页即可观察流量，不改路由，不依赖 SBN）。
@@ -465,6 +493,7 @@ impl Default for NetPolicySettings {
             block_ipv6: true,
             default_route: Route::Direct,
             enabled: false,
+            sniffer_enabled: false,
         }
     }
 }
@@ -650,7 +679,9 @@ pub fn read_generated_secret(workspace: &Path) -> Option<String> {
 
 /// secret 合法性：恰好 48 个小写 hex 字符（= `gen_secret` 的 24 字节）。
 fn is_valid_secret(s: &str) -> bool {
-    s.len() == 48 && s.bytes().all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+    s.len() == 48
+        && s.bytes()
+            .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
 }
 
 pub fn load_settings(workspace: &Path) -> NetPolicySettings {
@@ -704,7 +735,9 @@ mod tests {
     fn secret_validation_accepts_only_hex48() {
         // gen_secret 产物：48 位小写 hex。
         assert!(is_valid_secret(&"a".repeat(48)));
-        assert!(is_valid_secret("0123456789abcdef0123456789abcdef0123456789abcdef"));
+        assert!(is_valid_secret(
+            "0123456789abcdef0123456789abcdef0123456789abcdef"
+        ));
         // 长度不符。
         assert!(!is_valid_secret(&"a".repeat(47)));
         assert!(!is_valid_secret(&"a".repeat(49)));
@@ -886,6 +919,24 @@ Endpoint = 1.2.3.4:51820
         };
         assert!(a.same_target(&b)); // 同 kind+value（大小写不敏感），route 不同也算同目标
         assert!(!a.same_target(&c)); // kind 不同即不同目标
+    }
+
+    #[test]
+    fn domain_keyword_covers_suffix_only_on_same_route() {
+        let suffix = Rule::DomainSuffix {
+            value: "s.c-ctrip.com".into(),
+            route: Route::Direct,
+        };
+        let keyword = Rule::DomainKeyword {
+            value: "ctrip".into(),
+            route: Route::Direct,
+        };
+        let other_route = Rule::DomainKeyword {
+            value: "ctrip".into(),
+            route: Route::Wg,
+        };
+        assert!(suffix.covered_by_same_route(&keyword));
+        assert!(!suffix.covered_by_same_route(&other_route));
     }
 
     #[test]

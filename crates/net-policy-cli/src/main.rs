@@ -4,14 +4,15 @@
 //! - `status`  读真实机器状态（agent 以真实态为准对齐，不谎报）。
 //! - `stop`    优雅停引擎 + 撤防火墙（= 拆策略）。
 //! - `repair`  在线：连得上 agent 就 stop 回基线；**连不上则引导用离线提权救援**
-//!            `net-policy-agent repair-offline`（agent 起不来/防火墙残留时的唯一出口）。
+//!   `net-policy-agent repair-offline`（agent 起不来/防火墙残留时的唯一出口）。
 //!
 //! 输出单行 JSON（脚本友好，与本仓 CLI 约定一致）。
 
 use anyhow::Result;
 use clap::{Parser, Subcommand};
 use net_policy_client::Client;
-use net_policy_core::config::ProcessRef;
+use net_policy_core::capture::{CaptureOpts, CaptureTarget};
+use net_policy_core::config::{ProcessRef, Route};
 
 #[derive(Parser)]
 #[command(name = "net-policy", about = "网络策略救援 CLI（在线，打 agent 管道）")]
@@ -63,6 +64,34 @@ enum Cmd {
     ClearRequests,
     /// 清空生命周期事件。
     ClearEvents,
+
+    /// 设置默认出口姿态（direct=直连观察 / wg=海外 / blackhole=阻断）并持久化。
+    SetRoute {
+        #[arg(value_parser = ["direct", "wg", "blackhole"])]
+        route: String,
+    },
+    /// 应用当前策略（起 mihomo + TUN；直连观察姿态不阻断流量）。
+    Apply,
+    /// 开始全 TUN 抓包（返回会话；到时 agent 自动停）。
+    CaptureStart {
+        #[arg(long, default_value_t = 30)]
+        secs: u64,
+        #[arg(long, default_value_t = 128)]
+        snap_len: u32,
+        #[arg(long, default_value_t = 128)]
+        file_size_mib: u32,
+    },
+    /// 列出抓包会话。
+    CaptureList,
+    /// 停止抓包会话。
+    CaptureStop {
+        id: String,
+    },
+    /// 保存 done 会话 pcapng 到本地路径（分块 CaptureRead → 写文件）。
+    CaptureSave {
+        id: String,
+        dest: String,
+    },
 }
 
 fn print_json(v: serde_json::Value) {
@@ -135,8 +164,67 @@ async fn main() -> Result<()> {
         Cmd::ClearEvents => {
             simple(|mut c| async move { c.clear_events().await.map(|_| "cleared") }).await?
         }
+
+        Cmd::SetRoute { route } => {
+            let route = match route.as_str() {
+                "direct" => Route::Direct,
+                "wg" => Route::Wg,
+                _ => Route::Blackhole,
+            };
+            simple(|mut c| async move {
+                let mut s = c.get_settings().await?;
+                s.default_route = route;
+                c.save_settings(s).await?;
+                anyhow::Ok(serde_json::json!({"result": "route_saved", "route": route}))
+            })
+            .await?
+        }
+        Cmd::Apply => simple(|mut c| async move {
+            c.apply().await.map(|s| serde_json::json!({"result": "applied", "status": s}))
+        })
+        .await?,
+        Cmd::CaptureStart {
+            secs,
+            snap_len,
+            file_size_mib,
+        } => {
+            let opts = CaptureOpts {
+                snap_len,
+                file_size_mib,
+                max_secs: secs,
+            };
+            simple(|mut c| async move { c.capture_start(CaptureTarget::All, opts).await }).await?
+        }
+        Cmd::CaptureList => simple(|mut c| async move { c.capture_list().await }).await?,
+        Cmd::CaptureStop { id } => {
+            simple(|mut c| async move { c.capture_stop(id).await }).await?
+        }
+        Cmd::CaptureSave { id, dest } => {
+            simple(|c| async move { capture_save(c, id, dest).await }).await?
+        }
     }
     Ok(())
+}
+
+/// 分块拉取 done 会话 pcapng 落地到 `dest`（CaptureRead → base64 解码 → 追加写）。
+async fn capture_save(mut c: Client, id: String, dest: String) -> anyhow::Result<serde_json::Value> {
+    use base64::Engine;
+    use std::io::Write;
+    let mut f = std::fs::File::create(&dest)?;
+    let mut offset = 0u64;
+    let mut total = 0u64;
+    loop {
+        let (_off, data_b64, eof) = c.capture_read(id.clone(), offset, 512 * 1024).await?;
+        let bytes = base64::engine::general_purpose::STANDARD.decode(data_b64.as_bytes())?;
+        f.write_all(&bytes)?;
+        offset += bytes.len() as u64;
+        total += bytes.len() as u64;
+        if eof || bytes.is_empty() {
+            break;
+        }
+    }
+    f.flush()?;
+    Ok(serde_json::json!({"result": "saved", "dest": dest, "bytes": total}))
 }
 
 /// 连接 agent → 跑闭包 → 打印 JSON（连不上/请求失败都输出结构化错误）。

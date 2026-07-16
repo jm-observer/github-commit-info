@@ -3,6 +3,7 @@ import {
   Activity,
   FileClock,
   Gauge,
+  Radar,
   RefreshCw,
   ScrollText,
   SlidersHorizontal,
@@ -22,8 +23,9 @@ import { TempDirectPage } from './pages/TempDirectPage'
 import { DiagnosticsPage } from './pages/DiagnosticsPage'
 import { SettingsPage } from './pages/SettingsPage'
 import { LogsPage } from './pages/LogsPage'
+import { CapturePage } from './pages/CapturePage'
 
-type MenuKey = 'overview' | 'traffic' | 'policy' | 'tempdirect' | 'records' | 'logs' | 'diagnostics' | 'settings'
+type MenuKey = 'overview' | 'traffic' | 'policy' | 'tempdirect' | 'records' | 'capture' | 'logs' | 'diagnostics' | 'settings'
 
 interface MenuItem {
   key: MenuKey
@@ -46,6 +48,7 @@ const MENU_GROUPS: { label: string; items: MenuItem[] }[] = [
     items: [
       { key: 'tempdirect', label: '临时直连', description: '海外出口故障时限时切换直连。', icon: <Timer size={16} /> },
       { key: 'records', label: '操作记录', description: '查看请求、事件与进程树。', icon: <FileClock size={16} /> },
+      { key: 'capture', label: '抓包', description: '抓取 TUN 数据包，导出 Wireshark pcapng。', icon: <Radar size={16} /> },
       { key: 'logs', label: '日志', description: 'mihomo / WireGuard 隧道的实时运行日志。', icon: <ScrollText size={16} /> },
     ],
   },
@@ -66,6 +69,7 @@ function renderPage(key: MenuKey) {
     case 'traffic': return <TrafficPage />
     case 'policy': return <PolicyPage />
     case 'records': return <RecordsPage />
+    case 'capture': return <CapturePage />
     case 'logs': return <LogsPage />
     case 'tempdirect': return <TempDirectPage />
     case 'diagnostics': return <DiagnosticsPage />
@@ -74,7 +78,7 @@ function renderPage(key: MenuKey) {
 }
 
 export function NetPolicyShell() {
-  const { status } = useNetPolicyProbe()
+  const { status, probeError } = useNetPolicyProbe()
   const { busy, msg, refresh } = useNetPolicyController()
   const [active, setActive] = useState<MenuKey>('overview')
   const current = MENU_ITEMS.find((item) => item.key === active) ?? MENU_ITEMS[0]
@@ -134,6 +138,12 @@ export function NetPolicyShell() {
         {status && !status.platform_supported && (
           <div className="mb-4 rounded-md bg-yellow-100 px-4 py-2 text-sm text-yellow-800">
             net-policy 仅支持 Windows，当前平台不可用。
+          </div>
+        )}
+
+        {probeError && (
+          <div className="mb-4 rounded-md bg-red-100 px-4 py-2 text-sm text-red-800 dark:bg-red-950/40 dark:text-red-300">
+            实时状态探测失败，当前数据可能已过期：{probeError}
           </div>
         )}
 

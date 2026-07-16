@@ -18,6 +18,7 @@ import {
   type ProcessCandidate,
 } from '../api/tauri-client'
 import { useNetPolicyProbe } from '../ProbeContext'
+import { ProbeDetailDialog, type ProbeDetail } from './ProbeDetailDialog'
 
 /**
  * 本机现状查询区（只读 · 不改系统）。
@@ -51,15 +52,21 @@ function StatCard({
   value,
   tone,
   hint,
+  detail,
 }: {
   icon: React.ReactNode
   label: string
   value: React.ReactNode
   tone?: CaseTone
   hint?: string
+  detail?: ProbeDetail
 }) {
-  return (
-    <div className="flex flex-col gap-1 rounded-lg border border-gray-200 bg-white px-3 py-2.5 dark:border-gray-800 dark:bg-gray-900" title={hint}>
+  const [detailOpen, setDetailOpen] = useState(false)
+  const className = `flex flex-col gap-1 rounded-lg border border-gray-200 bg-white px-3 py-2.5 text-left dark:border-gray-800 dark:bg-gray-900 ${
+    detail ? 'cursor-pointer transition-colors hover:border-blue-300 hover:bg-blue-50/40 focus:outline-none focus:ring-2 focus:ring-blue-500 dark:hover:border-blue-700 dark:hover:bg-blue-950/20' : ''
+  }`
+  const content = (
+    <>
       <div className="flex items-center gap-1.5 text-[11px] uppercase tracking-wide text-gray-400">
         <span className="text-gray-500 dark:text-gray-400">{icon}</span>
         {label}
@@ -68,7 +75,21 @@ function StatCard({
         {tone && <ToneIcon tone={tone} />}
         <span className="min-w-0 truncate font-mono text-[13px]">{value}</span>
       </div>
-    </div>
+      {detail && <div className="text-[10px] text-blue-500">点击查看完整详情</div>}
+    </>
+  )
+
+  return (
+    <>
+      {detail ? (
+        <button type="button" className={className} title={hint} onClick={() => setDetailOpen(true)} aria-label={`查看${label}完整详情`}>
+          {content}
+        </button>
+      ) : (
+        <div className={className} title={hint}>{content}</div>
+      )}
+      <ProbeDetailDialog detail={detailOpen ? detail ?? null : null} onClose={() => setDetailOpen(false)} />
+    </>
   )
 }
 
@@ -145,6 +166,13 @@ export function CurrentStateSection({
               value={exitIp?.observed || (probing ? '探测中…' : '—')}
               tone={caseTone(exitIp)}
               hint="api.ipify.org（10s 超时）。应用 WG 策略后应为海外出口。"
+              detail={{
+                title: '当前公网出口 IP',
+                status: exitIp?.status || (probing ? '探测中' : '未探测'),
+                observed: exitIp?.observed,
+                description: '应用 WireGuard 策略后，此处应显示海外出口 IP。',
+                source: 'https://api.ipify.org',
+              }}
             />
             <StatCard
               icon={<Globe2 size={13} />}
@@ -152,6 +180,13 @@ export function CurrentStateSection({
               value={dns?.observed || (probing ? '探测中…' : '—')}
               tone={caseTone(dns)}
               hint="向 8.8.8.8 显式查询 example.com，返回 198.18.x 表示已被 TUN 劫持（防泄漏）。"
+              detail={{
+                title: 'DNS 劫持（fake-ip）',
+                status: dns?.status || (probing ? '探测中' : '未探测'),
+                observed: dns?.observed,
+                description: '向 8.8.8.8 显式查询 example.com；返回 198.18.x 表示请求已被 TUN 劫持。失败文本会在上方完整显示。',
+                source: 'Resolve-DnsName example.com -Type A -Server 8.8.8.8',
+              }}
             />
             <StatCard
               icon={<Cpu size={13} />}
@@ -159,6 +194,13 @@ export function CurrentStateSection({
               value={engine ? (engine.status === 'passed' ? '可达' : '不可达') : (probing ? '探测中…' : '—')}
               tone={caseTone(engine)}
               hint="mihomo 外部控制器 /version。未应用策略时通常不可达，属正常。"
+              detail={{
+                title: 'mihomo 控制器',
+                status: engine?.status || (probing ? '探测中' : '未探测'),
+                observed: engine?.observed,
+                description: '未应用网络策略时控制器通常不可达；应用后仍不可达时，完整探测结果会给出连接或鉴权原因。',
+                source: 'http://127.0.0.1:9090/version',
+              }}
             />
           </div>
         </div>

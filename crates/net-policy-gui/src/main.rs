@@ -142,6 +142,12 @@ fn run_gui(workspace: PathBuf) -> Result<()> {
             net_policy::net_policy_clear_events,
             net_policy::net_policy_reset_connections,
             net_policy::net_policy_get_mihomo_log,
+            net_policy::net_policy_capture_start,
+            net_policy::net_policy_capture_stop,
+            net_policy::net_policy_capture_get,
+            net_policy::net_policy_capture_list,
+            net_policy::net_policy_capture_delete,
+            net_policy::net_policy_capture_read,
         ])
         .setup(move |app| {
             net_policy::setup(app.handle(), state.net_policy.clone())

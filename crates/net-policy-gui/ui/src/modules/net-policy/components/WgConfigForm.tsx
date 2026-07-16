@@ -97,6 +97,18 @@ export function WgConfigForm({
         </div>
       )}
       </Section>
+      <Section title="观察增强" description="补全观察数据，不改路由">
+      <div className="flex flex-wrap items-center gap-4 text-sm">
+        <label className="flex items-center gap-2">
+          <input type="checkbox" checked={settings.sniffer_enabled}
+            onChange={e => setSettings({ ...settings, sniffer_enabled: e.target.checked })} />
+          L2 域名嗅探（从 TLS SNI / HTTP Host / QUIC 补全域名）
+        </label>
+      </div>
+      <div className="mt-2 rounded-md bg-gray-100 px-3 py-1.5 text-xs text-gray-600 dark:bg-gray-800 dark:text-gray-400">
+        只增强观察表的域名可见性（<code>override-destination=false</code>，不改路由/目标）；纯 IP、ECH、无 SNI、部分 QUIC 仍可能无域名。保存后引擎热加载生效。
+      </div>
+      </Section>
     </div>
   )
 }

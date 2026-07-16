@@ -13,12 +13,11 @@ export function TrafficPage() {
   const { status, conns, blocked, dnsMap } = useNetPolicyProbe()
   const {
     rules,
-    setRules,
     busy,
-    flash,
     canElevatedAction,
     allowBlocked,
     clearBlocked,
+    rerouteRule,
   } = useNetPolicyController()
 
   return (
@@ -53,8 +52,7 @@ export function TrafficPage() {
             busy={busy}
             dnsMap={dnsMap}
             canReroute={canElevatedAction}
-            onRulesChange={setRules}
-            onFlash={flash}
+            onReroute={rerouteRule}
           />
           <Section title="进程关联" description="按进程聚合：每个进程的连接数与它访问过的所有域名">
             <ProcessMap dnsMap={dnsMap} />

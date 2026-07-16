@@ -12,6 +12,8 @@ use std::path::{Path, PathBuf};
 
 /// mihomo 二进制文件名（Windows amd64 -compatible 变体）。
 pub const MIHOMO_BIN_NAME: &str = "mihomo-windows-amd64.exe";
+pub const MIHOMO_PENDING_BIN_NAME: &str = "mihomo-windows-amd64.pending.exe";
+const MIHOMO_BACKUP_BIN_NAME: &str = "mihomo-windows-amd64.previous.exe";
 
 /// 受保护安装目录：`%ProgramFiles%\net-policy\`。可执行资产只放这里。
 pub fn install_dir() -> PathBuf {
@@ -22,6 +24,91 @@ pub fn install_dir() -> PathBuf {
 /// agent 自身 exe 的安装路径（计划任务 Action 用绝对路径指向它）。
 pub fn agent_exe() -> PathBuf {
     install_dir().join("net-policy-agent.exe")
+}
+
+/// L4 MITM 引擎（mitmproxy）版本化安装根：`%ProgramFiles%\net-policy\mitm\engine\`。
+/// 引擎是**可执行资产**，按 D6 与 mihomo 同放受保护 ProgramFiles（普通用户只读，防提权替换）；
+/// CA 私钥 / 明文产物等**数据**才落 ProgramData（见 service_workspace 下的 mitm/）。
+pub fn mitm_engine_root() -> PathBuf {
+    install_dir().join("mitm").join("engine")
+}
+
+/// 指定版本的引擎目录。
+pub fn mitm_engine_dir(version: &str) -> PathBuf {
+    mitm_engine_root().join(version)
+}
+
+pub fn pending_mihomo_bin() -> PathBuf {
+    install_dir().join(MIHOMO_PENDING_BIN_NAME)
+}
+
+/// 在 mihomo 已停止、kill-switch 仍保持时，把安装器暂存的新二进制切到正式路径。
+/// 采用 old -> previous、pending -> old 的可回滚交换；若上次在交换中崩溃，也会先恢复 previous。
+pub fn activate_pending_mihomo() -> Result<bool> {
+    let dir = install_dir();
+    let target = dir.join(MIHOMO_BIN_NAME);
+    let pending = pending_mihomo_bin();
+    let backup = dir.join(MIHOMO_BACKUP_BIN_NAME);
+
+    if !target.exists() && backup.exists() {
+        std::fs::rename(&backup, &target).with_context(|| {
+            format!(
+                "恢复上次 mihomo 更新备份失败：{} → {}",
+                backup.display(),
+                target.display()
+            )
+        })?;
+    }
+    if !pending.exists() {
+        return Ok(false);
+    }
+    if !target.exists() {
+        std::fs::rename(&pending, &target).with_context(|| {
+            format!(
+                "启用暂存 mihomo 失败：{} → {}",
+                pending.display(),
+                target.display()
+            )
+        })?;
+        return Ok(true);
+    }
+
+    if backup.exists() {
+        std::fs::remove_file(&backup)
+            .with_context(|| format!("删除旧 mihomo 备份失败：{}", backup.display()))?;
+    }
+    std::fs::rename(&target, &backup).with_context(|| {
+        format!(
+            "备份当前 mihomo 失败（进程可能仍占用）：{} → {}",
+            target.display(),
+            backup.display()
+        )
+    })?;
+    if let Err(err) = std::fs::rename(&pending, &target) {
+        let restore = std::fs::rename(&backup, &target);
+        return match restore {
+            Ok(()) => Err(err).with_context(|| {
+                format!(
+                    "启用暂存 mihomo 失败，已恢复旧版本：{} → {}",
+                    pending.display(),
+                    target.display()
+                )
+            }),
+            Err(restore_err) => bail!(
+                "启用暂存 mihomo 失败（{err}），恢复旧版本亦失败（{restore_err}）；保留 kill-switch"
+            ),
+        };
+    }
+    std::fs::remove_file(&backup)
+        .with_context(|| format!("清理 mihomo 旧版本失败：{}", backup.display()))?;
+    Ok(true)
+}
+
+/// Windows 服务的机器级 workspace；日志也固定落在其 `log/` 下，避免 LocalSystem profile 不可读。
+pub fn service_workspace() -> PathBuf {
+    let program_data =
+        std::env::var("PROGRAMDATA").unwrap_or_else(|_| r"C:\ProgramData".to_string());
+    Path::new(&program_data).join("net-policy")
 }
 
 /// 用户可写的 workspace（数据目录）：`-w` / `NET_POLICY_WORKSPACE` / **`~/.config/net-policy-agent`**。

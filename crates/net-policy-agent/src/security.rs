@@ -19,8 +19,16 @@ pub fn build_pipe_security() -> *mut c_void {
         Some(s) if !s.is_empty() => s,
         _ => return std::ptr::null_mut(), // fail-closed
     };
-    // 只放 SYSTEM(SY) + 当前用户 SID；D:P = protected，无继承。
-    let sddl = format!("D:P(A;;GA;;;SY)(A;;GA;;;{sid})");
+    // D:P = protected，无继承。两种运行形态：
+    // - **服务模式**（LocalSystem，SID=S-1-5-18）：GUI 在用户会话，管道必须**跨会话可达**，故放行
+    //   交互用户组 IU（+ 内建管理员 BA，便于救援 CLI 提权运行）。代价：多用户/RDP 下 IU 含其他交互
+    //   用户；单用户机即桌面用户本人。
+    // - **每用户模式**（计划任务/手动 run）：仍严格限到 SYSTEM + 该用户本人（原设计，最小暴露面）。
+    let sddl = if sid == "S-1-5-18" {
+        "D:P(A;;GA;;;SY)(A;;GA;;;IU)(A;;GA;;;BA)".to_string()
+    } else {
+        format!("D:P(A;;GA;;;SY)(A;;GA;;;{sid})")
+    };
     const SDDL_REVISION_1: u32 = 1;
     let wide: Vec<u16> = std::ffi::OsStr::new(&sddl)
         .encode_wide()

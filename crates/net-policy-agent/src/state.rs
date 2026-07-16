@@ -38,7 +38,8 @@ pub struct TempSnapshot {
 
 /// 防火墙白名单模型是否已在新形态下真机验证。未验证前 `protected` 仅算"实验保护"。
 const FIREWALL_MODEL_VALIDATED: bool = false;
-const STATUS_CACHE_TTL: Duration = Duration::from_secs(5);
+// GUI 每 3 秒拉一次状态；缓存必须短于轮询周期，否则一次切换可能连续展示两轮旧值。
+const STATUS_CACHE_TTL: Duration = Duration::from_secs(2);
 /// broadcast 容量：慢订阅者落后会丢老事件（设计 §4.1：事件不保证不丢，以真实态对齐）。
 const EVENT_CHANNEL_CAP: usize = 512;
 
@@ -47,6 +48,8 @@ pub struct Runtime {
     pub applied: bool,
     pub mihomo_pid: Option<u32>,
     pub secret: Option<String>,
+    /// 最近一次成功落地的 kill-switch 配置指纹；接管旧进程时未知，首次 reload 会自愈重铺。
+    pub firewall_signature: Option<String>,
 }
 
 pub struct AgentState {
@@ -67,12 +70,15 @@ pub struct AgentState {
     pub store: Arc<Store>,
     /// 临时直连（限时应急）运行态。
     temp: Mutex<TempState>,
+    /// 抓包会话管理（单会话；真实 pktmon 后端，抓包设计 §7）。独立锁，与 op_flag 不共用。
+    pub capture: crate::capture::CaptureManager,
 }
 
 impl AgentState {
     pub fn new(workspace: PathBuf, dev: bool) -> Self {
         let (events, _) = broadcast::channel(EVENT_CHANNEL_CAP);
         let store = Arc::new(Store::open_or_memory(&workspace));
+        let capture = crate::capture::CaptureManager::new(&workspace);
         Self {
             workspace,
             dev,
@@ -85,6 +91,7 @@ impl AgentState {
             status_cache: Mutex::new(None),
             store,
             temp: Mutex::new(TempState::default()),
+            capture,
         }
     }
 
@@ -186,6 +193,7 @@ impl AgentState {
 
     /// 发一条 apply 进度（同时更新 current_op 的 step/name）。
     pub fn emit_progress(&self, step: usize, status: &str, detail: Option<String>) {
+        trace_step(step, status, detail.as_deref()); // 同步落 trace 文件，绕过缓冲日志——卡死/崩溃也能看到进度到了哪步
         let p = ApplyProgress::new(step, status, detail);
         if let Some(op) = self.current_op.lock().unwrap().as_mut() {
             op.step = Some(p.step);
@@ -358,6 +366,30 @@ fn fallback_status() -> NetPolicyStatus {
     }
 }
 
+/// 同步把 apply/reload 的每步进度追加到 `{USERPROFILE}\log\net-policy-agent-trace.log`（**同步写+flush**，
+/// 绕过 flexi 的缓冲日志）。用途：定位「切姿态 / auto 时卡死或崩溃」——缓冲日志卡死时看不到，这个能实时
+/// 落盘看到进度到了哪一步（最后一行即卡/崩的位置）。失败静默（诊断设施不应影响主流程）。
+fn trace_step(step: usize, status: &str, detail: Option<&str>) {
+    use std::io::Write;
+    let Ok(profile) = std::env::var("USERPROFILE") else {
+        return;
+    };
+    let dir = std::path::Path::new(&profile).join("log");
+    let _ = std::fs::create_dir_all(&dir);
+    if let Ok(mut f) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(dir.join("net-policy-agent-trace.log"))
+    {
+        let ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis())
+            .unwrap_or(0);
+        let _ = writeln!(f, "[{ms}] step={step} {status} {}", detail.unwrap_or(""));
+        let _ = f.flush();
+    }
+}
+
 /// 初始化：确保 workspace 子目录 + 接管存活旧 mihomo（读 generated secret）+ 按 `enabled` 自动恢复 +
 /// 常驻被阻断采集器。**operations/current 在 agent 重启后无内存态**，由此处按真实机器状态对齐（不谎报）。
 pub fn setup(state: std::sync::Arc<AgentState>) {
@@ -401,7 +433,7 @@ pub fn setup(state: std::sync::Arc<AgentState>) {
                     }
                 }
                 tick += 1;
-                if tick % 200 == 0 {
+                if tick.is_multiple_of(200) {
                     st.store.prune();
                 }
                 tokio::time::sleep(Duration::from_secs(3)).await;

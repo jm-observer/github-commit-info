@@ -3,6 +3,7 @@
 use crate::frame::{read_frame, write_frame};
 use crate::ops::{self, OpError};
 use crate::state::AgentState;
+use crate::store::now_ms;
 use crate::{connections, engine, paths, process_watch, ptree, repair, verify};
 use anyhow::{Context, Result};
 use net_policy_core::config::{self, WgConfig};
@@ -22,6 +23,59 @@ fn busy_resp() -> Response {
 fn err_resp(kind: ErrorKind, msg: impl Into<String>) -> Response {
     Response::Error {
         error: ProtocolError::new(kind, msg),
+    }
+}
+
+/// 探测通过的能力列表（`Hello.capabilities`，§10）：pktmon 可用 → `capture_v1`。
+/// L4 `decrypt_v1` 受 ADR 阻断（引擎/CA 未验证），此处不声明。
+fn capture_capabilities() -> Vec<String> {
+    let mut caps = Vec::new();
+    if crate::capture::available() {
+        caps.push(net_policy_core::capture::CAPABILITY_CAPTURE_V1.to_string());
+    }
+    caps
+}
+
+/// 分块读取 `done` 会话的 pcapng（§10：len ≤ 512 KiB，base64 分块，仅 done 会话）。
+fn capture_read(state: &Arc<AgentState>, id: &str, offset: u64, len: u32) -> Response {
+    use base64::Engine;
+    use std::io::{Read, Seek, SeekFrom};
+    let session = match state.capture.get(id) {
+        Ok(s) => s,
+        Err(e) => return Response::Error { error: e },
+    };
+    if !matches!(session.state, net_policy_core::capture::CaptureState::Done) {
+        return err_resp(ErrorKind::CaptureNotFound, "仅 done 会话可下载");
+    }
+    let Some(path) = state.capture.store().pcapng_path(id) else {
+        return err_resp(ErrorKind::Validation, "非法会话 id");
+    };
+    let file_len = match std::fs::metadata(&path) {
+        Ok(m) => m.len(),
+        Err(e) => return err_resp(ErrorKind::Internal, format!("读 pcapng 失败：{e}")),
+    };
+    if let Err(e) = net_policy_core::capture::validate_read_window(offset, len, file_len) {
+        return err_resp(ErrorKind::Validation, e.to_string());
+    }
+    let mut f = match std::fs::File::open(&path) {
+        Ok(f) => f,
+        Err(e) => return err_resp(ErrorKind::Internal, format!("open pcapng：{e}")),
+    };
+    if f.seek(SeekFrom::Start(offset)).is_err() {
+        return err_resp(ErrorKind::Internal, "seek 失败");
+    }
+    let to_read = std::cmp::min(len as u64, file_len - offset) as usize;
+    let mut buf = vec![0u8; to_read];
+    if f.read_exact(&mut buf).is_err() {
+        return err_resp(ErrorKind::Internal, "读取 pcapng 分块失败");
+    }
+    let eof = offset + to_read as u64 >= file_len;
+    let data_base64 = base64::engine::general_purpose::STANDARD.encode(&buf);
+    Response::CaptureChunk {
+        id: id.to_string(),
+        offset,
+        data_base64,
+        eof,
     }
 }
 
@@ -88,8 +142,12 @@ async fn dispatch(state: Arc<AgentState>, req: Request) -> Response {
                 Ok(r) => r,
                 Err(e) => return err_resp(ErrorKind::Internal, format!("{e:#}")),
             };
-            rs.rules.retain(|r| !r.same_target(&rule));
-            rs.rules.push(rule);
+            let already_covered = rs.rules.iter().any(|r| rule.covered_by_same_route(r));
+            rs.rules
+                .retain(|r| !r.same_target(&rule) && !r.covered_by_same_route(&rule));
+            if !already_covered {
+                rs.rules.push(rule);
+            }
             match config::save_rules(&ws, &rs) {
                 Ok(()) => Response::Rules { rules: rs },
                 Err(e) => err_resp(ErrorKind::Internal, format!("{e:#}")),
@@ -277,6 +335,108 @@ async fn dispatch(state: Arc<AgentState>, req: Request) -> Response {
                 Err(_) => err_resp(ErrorKind::Internal, "读日志任务异常"),
             }
         }
+
+        // ── 抓包（抓包设计 §10；Phase 2a 全 TUN，pktmon 后端真机 spike 已过）─────────
+        // pktmon→pcapng 管道见 docs/net-policy/net-policy-capture-validation-report.md。定向抓包
+        // （Process/Domain/Ip）仍待 Phase 2b（fake-ip 端点解析），manager 对定向 target 返回
+        // `capture_target_empty`。全 TUN 需 mihomo TUN 已起栈，否则 `capture_component_not_found`。
+        Request::CaptureStart { target, opts } => {
+            // 定向 target（进程/域名/IP）：先取当前连接快照解析包面端点（§5.1）。All 传空。
+            let endpoints = if target.is_directed() {
+                let secret = {
+                    let rt = state.rt.lock().unwrap();
+                    rt.secret.clone().unwrap_or_default()
+                };
+                let snap = connections::fetch(&secret).await;
+                match crate::capture::resolve_endpoints(&target, &snap.connections) {
+                    Ok(eps) => eps,
+                    Err(kind) => {
+                        return err_resp(
+                            kind,
+                            "定向目标未解析到包面端点：请先让目标产生流量，或改用全 TUN 短抓",
+                        )
+                    }
+                }
+            } else {
+                Vec::new()
+            };
+            let st = state.clone();
+            let res = tokio::task::spawn_blocking(move || {
+                let rand16: [u8; 16] = rand::random();
+                st.capture
+                    .start(target, opts, endpoints, rand16, now_ms(), String::new())
+            })
+            .await;
+            match res {
+                Ok(Ok(session)) => {
+                    // 时间上限：spawn 定时器到时自动 stop（§9 时间上限由 agent 定时 stop）。
+                    let st2 = state.clone();
+                    let id = session.id.clone();
+                    let secs = session.opts.max_secs;
+                    tokio::spawn(async move {
+                        tokio::time::sleep(std::time::Duration::from_secs(secs)).await;
+                        let _ = tokio::task::spawn_blocking(move || {
+                            st2.capture.stop(
+                                &id,
+                                net_policy_core::capture::CaptureStopReason::Timeout,
+                                now_ms(),
+                            )
+                        })
+                        .await;
+                    });
+                    Response::CaptureSession { session }
+                }
+                Ok(Err(e)) => Response::Error { error: e },
+                Err(_) => err_resp(ErrorKind::Internal, "抓包任务异常"),
+            }
+        }
+        Request::CaptureStop { id } => {
+            let st = state.clone();
+            match tokio::task::spawn_blocking(move || {
+                st.capture.stop(
+                    &id,
+                    net_policy_core::capture::CaptureStopReason::User,
+                    now_ms(),
+                )
+            })
+            .await
+            {
+                Ok(Ok(session)) => Response::CaptureSession { session },
+                Ok(Err(e)) => Response::Error { error: e },
+                Err(_) => err_resp(ErrorKind::Internal, "停止抓包异常"),
+            }
+        }
+        Request::CaptureGet { id } => match state.capture.get(&id) {
+            Ok(session) => Response::CaptureSession { session },
+            Err(e) => Response::Error { error: e },
+        },
+        Request::CaptureList => Response::CaptureSessions {
+            sessions: state.capture.list(),
+        },
+        Request::CaptureDelete { id } => match state.capture.delete(&id) {
+            Ok(()) => Response::Ok,
+            Err(e) => Response::Error { error: e },
+        },
+        Request::CaptureRead { id, offset, len } => capture_read(&state, &id, offset, len),
+
+        // ── L4 应用明文（抓包设计 §17–§18）───────────────────────────────────
+        // 协议层已就绪（core::decrypt 纯逻辑 + 脱敏 + 参数/目标校验），但真实 MITM 引擎受
+        // adr-2026-07-phase4-mitm-engine.md 阻断：mitmproxy PyInstaller 二进制被 Windows Defender
+        // 查杀，Phase 4a 冷启动待用户就 AV 处置决策；CA 生命周期 / DPAPI 私钥 / 数据面同样未验证。
+        // 未通过前不实现真实解密，也不声明 `decrypt_v1`——对所有 Decrypt* 请求返回 `decrypt_unsupported`。
+        Request::DecryptCaStatus
+        | Request::DecryptCaCreate
+        | Request::DecryptCaConfirmInstalled { .. }
+        | Request::DecryptCaRemove
+        | Request::DecryptStart { .. }
+        | Request::DecryptStop { .. }
+        | Request::DecryptGet { .. }
+        | Request::DecryptList
+        | Request::DecryptDelete { .. }
+        | Request::DecryptRead { .. } => err_resp(
+            ErrorKind::DecryptUnsupported,
+            "L4 应用明文尚未启用（引擎/CA 待 Phase 4a 真机验证与 AV 决策）",
+        ),
     }
 }
 
@@ -324,6 +484,8 @@ where
                     hello_done = true;
                     Response::Hello {
                         version: Version::CURRENT,
+                        // pktmon 探测通过才声明 `capture_v1`（§10）；L4 `decrypt_v1` 仍受 ADR 阻断不声明。
+                        capabilities: capture_capabilities(),
                     }
                 } else {
                     err_resp(
@@ -377,33 +539,55 @@ where
 
 /// 启动命名管道 server 接受循环（阻塞直到出错）。
 #[cfg(windows)]
-pub async fn serve(state: Arc<AgentState>) -> Result<()> {
+pub async fn serve(
+    state: Arc<AgentState>,
+    ready: Option<std::sync::mpsc::SyncSender<Result<(), String>>>,
+) -> Result<()> {
     use net_policy_core::protocol::PIPE_NAME;
     use tokio::net::windows::named_pipe::ServerOptions;
 
     // fail-closed（评审点 2）：提权控制面的 ACL 构建失败 **必须拒绝启动**，不降级到默认安全。
     let attrs = crate::security::build_pipe_security();
     if attrs.is_null() {
-        anyhow::bail!(
-            "无法为控制面管道构建 DACL（取用户 SID / 安全描述符失败）——拒绝以不安全方式启动"
-        );
+        let message =
+            "无法为控制面管道构建 DACL（取用户 SID / 安全描述符失败）——拒绝以不安全方式启动";
+        if let Some(tx) = ready {
+            let _ = tx.send(Err(message.to_string()));
+        }
+        anyhow::bail!(message);
     }
 
     // 第一个实例（first_pipe_instance 防同名管道被他人抢建）。
     // SAFETY: attrs 为 build_pipe_security 返回的有效 SECURITY_ATTRIBUTES 指针或 null。
-    let mut server = unsafe {
+    let first = unsafe {
         ServerOptions::new()
             .first_pipe_instance(true)
             .create_with_security_attributes_raw(PIPE_NAME, attrs)
-    }?;
+    };
+    let mut server = match first {
+        Ok(server) => server,
+        Err(error) => {
+            let message = format!("首次创建控制面管道 {PIPE_NAME} 失败：{error}");
+            if let Some(tx) = ready {
+                let _ = tx.send(Err(message.clone()));
+            }
+            anyhow::bail!(message);
+        }
+    };
     log::info!("net-policy-agent 管道 server 就绪：{PIPE_NAME}");
+    if let Some(tx) = ready {
+        let _ = tx.send(Ok(()));
+    }
 
     // 退避：accept/重建管道的瞬态失败**不得打死守护**（评审点 3）——否则一次抖动就让 agent 退出，
     // 计划任务重启 3 次耗尽后彻底躺平，而 kill-switch 可能仍挂着（网络阻断却无人管理）。
     let backoff = std::time::Duration::from_millis(500);
     loop {
         if let Err(err) = server.connect().await {
-            log::warn!("管道 connect 失败，退避 {}ms 重试：{err}", backoff.as_millis());
+            log::warn!(
+                "管道 connect 失败，退避 {}ms 重试：{err}",
+                backoff.as_millis()
+            );
             tokio::time::sleep(backoff).await;
             continue; // connect 失败不消耗 server，直接重试
         }
@@ -417,7 +601,10 @@ pub async fn serve(state: Arc<AgentState>) -> Result<()> {
             } {
                 Ok(s) => break s,
                 Err(err) => {
-                    log::warn!("重建管道实例失败，退避 {}ms 重试：{err}", backoff.as_millis());
+                    log::warn!(
+                        "重建管道实例失败，退避 {}ms 重试：{err}",
+                        backoff.as_millis()
+                    );
                     tokio::time::sleep(backoff).await;
                 }
             }
@@ -432,7 +619,10 @@ pub async fn serve(state: Arc<AgentState>) -> Result<()> {
 }
 
 #[cfg(not(windows))]
-pub async fn serve(_state: Arc<AgentState>) -> Result<()> {
+pub async fn serve(
+    _state: Arc<AgentState>,
+    _ready: Option<std::sync::mpsc::SyncSender<Result<(), String>>>,
+) -> Result<()> {
     anyhow::bail!("net-policy-agent 仅支持 Windows")
 }
 

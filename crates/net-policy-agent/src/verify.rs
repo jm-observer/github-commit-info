@@ -17,7 +17,8 @@ fn case(id: &str, name: &str, status: &str, observed: String) -> VerifyCase {
 
 /// 执行轻量验证用例。`default_route` 决定各用例的**期望方向**（黑洞下出不去=通过）。
 pub fn run(secret: &str, default_route: Route) -> Result<VerifyReport> {
-    let mihomo_running = crate::engine::running(secret);
+    let engine_probe = crate::engine::probe_controller(secret);
+    let mihomo_running = engine_probe.is_ok();
     let mut cases = Vec::new();
 
     match run_ps("try{ (Invoke-RestMethod https://api.ipify.org -TimeoutSec 10).Trim() }catch{ 'FAIL:'+$_.Exception.Message }")
@@ -63,11 +64,16 @@ pub fn run(secret: &str, default_route: Route) -> Result<VerifyReport> {
         Err(e) => cases.push(case("dns-hijack", "DNS 劫持(fake-ip)", "failed", format!("{e:#}"))),
     }
 
+    let controller_url = format!("http://{CONTROLLER}/version");
+    let engine_observed = match engine_probe {
+        Ok(()) => format!("可达 · {controller_url}"),
+        Err(error) => format!("不可达 · {controller_url} · {error:#}"),
+    };
     cases.push(case(
         "engine",
         "mihomo 控制器",
         if mihomo_running { "passed" } else { "failed" },
-        format!("http://{CONTROLLER}/version"),
+        engine_observed,
     ));
 
     Ok(VerifyReport {

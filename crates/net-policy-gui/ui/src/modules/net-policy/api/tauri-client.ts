@@ -4,7 +4,7 @@ import { invoke } from '@tauri-apps/api/core'
 
 // direct/wg 用作单条规则出口；wg/blackhole 用作默认出口（default_route）。
 export type Route = 'direct' | 'wg' | 'blackhole'
-export type RuleKind = 'process-path' | 'process-name' | 'domain-suffix' | 'ip-cidr'
+export type RuleKind = 'process-path' | 'process-name' | 'domain-suffix' | 'domain-keyword' | 'ip-cidr'
 
 export interface Rule {
   kind: RuleKind
@@ -55,6 +55,8 @@ export interface Settings {
   default_route: Route
   /** 主开关：是否「启动即生效」（持久化，开启后每次启动自动恢复策略）。 */
   enabled: boolean
+  /** L2 域名嗅探（mihomo sniffer）：补全 TLS SNI / HTTP Host / QUIC 域名，只增强观察数据。默认关。 */
+  sniffer_enabled: boolean
 }
 
 export interface FirewallStatus {
@@ -151,6 +153,50 @@ export interface VerifyCase {
 export interface VerifyReport {
   mihomo_running: boolean
   cases: VerifyCase[]
+}
+
+// ── 抓包（minor 5，抓包设计 §10/§12） ─────────────────────────────────────────
+/** 抓包目标：All 全 TUN，或定向进程/域名/IP（与 core CaptureTarget 的 tag=target/content=value 对齐）。 */
+export type CaptureTarget =
+  | { target: 'all' }
+  | { target: 'process'; value: ProcessRef }
+  | { target: 'domain'; value: string }
+  | { target: 'ip'; value: string }
+
+export interface CaptureOpts {
+  /** 每包保留字节数；0=完整包（高敏感）。默认 128。 */
+  snap_len: number
+  /** circular 容量上限（MiB）。默认 128，范围 16–512。 */
+  file_size_mib: number
+  /** 时间上限（秒）。默认 120，范围 10–600。 */
+  max_secs: number
+}
+
+export type CaptureState =
+  | 'preparing' | 'running' | 'stopping' | 'converting' | 'done' | 'failed' | 'orphaned'
+
+export type CaptureStopReason = 'user' | 'timeout' | 'agent_restart' | 'error'
+
+export interface CaptureSession {
+  id: string
+  state: CaptureState
+  target: CaptureTarget
+  opts: CaptureOpts
+  endpoint_count: number
+  started_ms: number
+  ended_ms: number | null
+  stop_reason: CaptureStopReason | null
+  /** 仅 done 时给文件名（capture.pcapng），不给绝对路径。 */
+  file_name: string | null
+  bytes: number | null
+  known_limits: string[]
+  error: { kind: string; message: string } | null
+}
+
+export interface CaptureChunk {
+  offset: number
+  data_base64: string
+  eof: boolean
 }
 
 // ── 活跃连接快照（P0-1，net_policy_connections） ───────────────────────────────
@@ -275,4 +321,14 @@ export const NetPolicyAPI = {
   resetConnections: () => invoke<void>('net_policy_reset_connections'),
   /** mihomo / WireGuard 运行日志（最近 limit 行；后端上限 1000）。 */
   getMihomoLog: (limit = 500) => invoke<string[]>('net_policy_get_mihomo_log', { lines: limit }),
+
+  // ── 抓包（minor 5，抓包设计 §10/§12） ──────────────────────────────────
+  captureStart: (target: CaptureTarget, opts: CaptureOpts) =>
+    invoke<CaptureSession>('net_policy_capture_start', { target, opts }),
+  captureStop: (id: string) => invoke<CaptureSession>('net_policy_capture_stop', { id }),
+  captureGet: (id: string) => invoke<CaptureSession>('net_policy_capture_get', { id }),
+  captureList: () => invoke<CaptureSession[]>('net_policy_capture_list'),
+  captureDelete: (id: string) => invoke<void>('net_policy_capture_delete', { id }),
+  captureRead: (id: string, offset: number, len: number) =>
+    invoke<CaptureChunk>('net_policy_capture_read', { id, offset, len }),
 }

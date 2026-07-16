@@ -1,14 +1,13 @@
 import { useState, useMemo } from 'react'
-import { Pin, Search } from 'lucide-react'
+import { Loader2, Pin, Search } from 'lucide-react'
 import type { Connection, DomainAssoc, Rule, RuleSet } from '../api/tauri-client'
-import { NetPolicyAPI } from '../api/tauri-client'
 
 /**
  * 观察主表：将活跃连接按 host/IP 聚合，叠加现有规则（pinned 行置顶），
  * 每行可直接改路（saveRule + reload）。
  *
  * 接受 connections（来自 ProbeContext.conns.connections）和 rules（本页本地状态）。
- * onRulesChange：放行动作后通知父组件刷新 rules / 触发 reload。
+ * 写操作统一交给页面 controller，和其它规则操作共享同步锁与错误反馈。
  */
 
 type RouteLabel = 'direct' | 'wg' | 'blackhole'
@@ -91,6 +90,7 @@ function buildRows(connections: Connection[], rules: Rule[], dnsMap: DomainAssoc
     for (const [key, row] of map) {
       if (
         (r.kind === 'domain-suffix' && (key === val || key.endsWith('.' + val))) ||
+        (r.kind === 'domain-keyword' && key.toLowerCase().includes(val.toLowerCase())) ||
         (r.kind === 'ip-cidr' && row.ip && val.split('/')[0] === row.ip)
       ) {
         row.pinned = true
@@ -101,11 +101,11 @@ function buildRows(connections: Connection[], rules: Rule[], dnsMap: DomainAssoc
 
   // Also add rule targets that aren't currently in active connections (pinned-only rows).
   for (const r of rules) {
-    if (r.kind !== 'domain-suffix' && r.kind !== 'ip-cidr') continue
+    if (r.kind !== 'domain-suffix' && r.kind !== 'domain-keyword' && r.kind !== 'ip-cidr') continue
     const key = r.value.split('/')[0] // strip CIDR
     if (!map.has(key)) {
       map.set(key, {
-        host: r.kind === 'domain-suffix' ? r.value : '',
+        host: r.kind === 'ip-cidr' ? '' : r.value,
         ip: r.kind === 'ip-cidr' ? key : '',
         processes: [],
         outbound: r.route === 'direct' ? 'DIRECT' : r.route === 'wg' ? 'wg-out' : 'REJECT-DROP',
@@ -133,8 +133,7 @@ export function ObserverTable({
   dnsMap,
   /** 未提权时（改路可能触发 reload 落防火墙/TUN）禁用改路交互，给出友好提示而非撞后端原始错误。 */
   canReroute = true,
-  onRulesChange,
-  onFlash,
+  onReroute,
 }: {
   connections: Connection[]
   rules: RuleSet
@@ -142,8 +141,7 @@ export function ObserverTable({
   busy: boolean
   dnsMap?: DomainAssoc[]
   canReroute?: boolean
-  onRulesChange: (rs: RuleSet) => void
-  onFlash: (kind: 'ok' | 'err', text: string) => void
+  onReroute: (rule: Rule, target: string) => Promise<void>
 }) {
   const [actionBusy, setActionBusy] = useState<string | null>(null)
   const [search, setSearch] = useState('')
@@ -184,32 +182,9 @@ export function ObserverTable({
           }
         : { kind: 'domain-suffix', value: row.host || row.assocDomain, route }
 
-      // 后端 saveRule 现为 upsert（同 kind+value 的旧规则会被先移除再追加），不再需要前端先删后加。
-      const rs = await NetPolicyAPI.saveRule(ruleObj)
-      onRulesChange(rs)
-      if (applied) {
-        try {
-          await NetPolicyAPI.reload()
-        } catch (e) {
-          // 热载失败：规则已落盘但引擎运行态未变，需强制拉一次真实规则集同步显示（不留旧乐观状态）。
-          onFlash('err', `${target} 改路已保存，但引擎热载失败：${String(e)}——规则尚未生效，请重试或重新应用。`)
-          try {
-            onRulesChange(await NetPolicyAPI.listRules())
-          } catch {
-            // listRules 也失败就保留当前 rs，不再进一步处理。
-          }
-          return
-        }
-      }
-      onFlash('ok', `已设定 ${target} → ${ROUTE_BADGE[route].label}`)
-    } catch (e) {
-      onFlash('err', `改路失败: ${String(e)}`)
-      // saveRule 本身失败：不清楚落盘状态是否与显示一致，强制同步真实规则集。
-      try {
-        onRulesChange(await NetPolicyAPI.listRules())
-      } catch {
-        // 忽略：保留原状态。
-      }
+      await onReroute(ruleObj, target)
+    } catch {
+      // controller 统一展示错误并回拉真实状态；本组件只负责收起行内 loading。
     } finally {
       setActionBusy(null)
     }
@@ -279,6 +254,9 @@ export function ObserverTable({
                 const key = row.host || row.ip
                 const routeVal = outboundToRoute(row.outbound)
                 const badge = ROUTE_BADGE[routeVal]
+                const pendingRoute = actionBusy?.startsWith(`${key}:`)
+                  ? actionBusy.slice(key.length + 1) as RouteLabel
+                  : null
                 // 未提权且策略已应用：改路会触发 reload（落防火墙/TUN），未提权下必然失败——禁用并友好提示，
                 // 不让用户撞后端原始错误字符串。
                 const rerouteDisabled = !!actionBusy || busy || (applied && !canReroute)
@@ -328,9 +306,15 @@ export function ObserverTable({
                       )}
                     </td>
                     <td className="px-2 py-2 align-top">
-                      <span className={`inline-flex rounded px-1.5 py-0.5 text-xs ${badge.cls}`}>
-                        {badge.label}
-                      </span>
+                      {pendingRoute ? (
+                        <span className="inline-flex items-center gap-1 rounded bg-amber-100 px-1.5 py-0.5 text-xs text-amber-700 dark:bg-amber-950/50 dark:text-amber-300">
+                          <Loader2 size={11} className="animate-spin" /> {badge.label} → {ROUTE_BADGE[pendingRoute].label}
+                        </span>
+                      ) : (
+                        <span className={`inline-flex rounded px-1.5 py-0.5 text-xs ${badge.cls}`}>
+                          {badge.label}
+                        </span>
+                      )}
                     </td>
                     <td className="px-2 py-2 align-top">
                       <select

@@ -9,6 +9,7 @@ path = "src/main.rs"
 
 [dependencies]
 net-policy-core = { path = "../net-policy-core" }
+net-policy-mitm = { path = "../net-policy-mitm" }
 anyhow = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
@@ -38,6 +39,7 @@ windows-sys = { version = "0.59", features = [
     "Win32_System_Pipes",
     "Win32_Storage_FileSystem",
 ] }
+windows-service = "0.7"
 
 [features]
 # prod 构建：日志写文件、stdout 保持干净（AGENTS.md）。发布/部署须带 --features prod。

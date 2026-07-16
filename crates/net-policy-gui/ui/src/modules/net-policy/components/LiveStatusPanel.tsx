@@ -1,5 +1,7 @@
+import { useState } from 'react'
 import { FlaskConical } from 'lucide-react'
 import type { Status, VerifyReport } from '../api/tauri-client'
+import { ProbeDetailDialog, type ProbeDetail } from './ProbeDetailDialog'
 
 /**
  * 当前实时状态面板：一眼看清「现在」的运行态，区分「实时」与「最近值」。
@@ -26,15 +28,21 @@ function Cell({
   sub,
   tone,
   live,
+  detail,
 }: {
   label: string
   value: string
   sub?: string
   tone: Tone
   live: boolean
+  detail?: ProbeDetail
 }) {
-  return (
-    <div className="rounded-lg border border-gray-200 bg-white px-3 py-2 dark:border-gray-800 dark:bg-gray-900">
+  const [detailOpen, setDetailOpen] = useState(false)
+  const className = `rounded-lg border border-gray-200 bg-white px-3 py-2 text-left dark:border-gray-800 dark:bg-gray-900 ${
+    detail ? 'cursor-pointer transition-colors hover:border-blue-300 hover:bg-blue-50/40 focus:outline-none focus:ring-2 focus:ring-blue-500 dark:hover:border-blue-700 dark:hover:bg-blue-950/20' : ''
+  }`
+  const content = (
+    <>
       <div className="flex items-center gap-1.5 text-[11px] text-gray-400">
         <span className={`inline-block h-2 w-2 shrink-0 rounded-full ${DOT[tone]}`} />
         <span className="truncate">{label}</span>
@@ -51,7 +59,21 @@ function Cell({
       </div>
       <div className="mt-0.5 truncate text-sm font-medium" title={value}>{value}</div>
       {sub && <div className="truncate text-[10px] text-gray-400" title={sub}>{sub}</div>}
-    </div>
+      {detail && <div className="mt-1 text-[10px] text-blue-500">点击查看完整详情</div>}
+    </>
+  )
+
+  return (
+    <>
+      {detail ? (
+        <button type="button" className={className} onClick={() => setDetailOpen(true)} aria-label={`查看${label}完整详情`}>
+          {content}
+        </button>
+      ) : (
+        <div className={className}>{content}</div>
+      )}
+      <ProbeDetailDialog detail={detailOpen ? detail ?? null : null} onClose={() => setDetailOpen(false)} />
+    </>
   )
 }
 
@@ -85,12 +107,50 @@ export function LiveStatusPanel({
   return (
     <div className="space-y-2">
       <div className="grid grid-cols-2 gap-2 sm:grid-cols-3">
-        <Cell label="引擎" value={engine ? '在线' : '离线'} tone={engine ? 'ok' : 'off'} live />
+        <Cell
+          label="引擎"
+          value={engine ? '在线' : '离线'}
+          tone={engine ? 'ok' : 'off'}
+          live
+          detail={{
+            title: 'mihomo 引擎',
+            status: engine ? '在线' : '离线',
+            observed: verify?.cases?.find((c) => c.id === 'engine')?.observed,
+            description: '实时状态来自 3 秒轮询；“完整探测结果”来自最近一次手动自检。',
+            source: 'http://127.0.0.1:9090/version',
+          }}
+        />
         <Cell label="kill-switch" value={ksOn ? '已挂载' : '未挂'} sub={ksOn ? `${ksRules} 条放行规则` : undefined} tone={ksOn ? 'ok' : 'off'} live />
         <Cell label="TUN 起栈" value={tun ? '已起栈' : '未起'} tone={tun ? 'ok' : 'off'} live />
         <Cell label="默认出口" value={routeLabel} tone={routeTone} live />
-        <Cell label="出口 IP" value={exitIp || '未自检'} sub={exitIp && exitIpAt ? exitIpAt : undefined} tone={exitIp ? 'ok' : 'off'} live={false} />
-        <Cell label="DNS 防泄漏" value={dnsValue} sub={dnsCase?.observed || undefined} tone={dnsTone} live={false} />
+        <Cell
+          label="出口 IP"
+          value={exitIp || '未自检'}
+          sub={exitIp && exitIpAt ? exitIpAt : undefined}
+          tone={exitIp ? 'ok' : 'off'}
+          live={false}
+          detail={{
+            title: '当前公网出口 IP',
+            status: exitIp ? '已获取' : '未自检',
+            observed: exitIp || undefined,
+            description: '这是最近一次手动自检的结果，不参与 3 秒快轮询。',
+            source: 'https://api.ipify.org',
+          }}
+        />
+        <Cell
+          label="DNS 防泄漏"
+          value={dnsValue}
+          sub={dnsCase?.observed || undefined}
+          tone={dnsTone}
+          live={false}
+          detail={{
+            title: 'DNS 防泄漏',
+            status: dnsValue,
+            observed: dnsCase?.observed || undefined,
+            description: '向 8.8.8.8 显式查询 example.com；返回 198.18.x 表示请求已被 TUN fake-ip 劫持。失败文本会在上方完整显示。',
+            source: 'Resolve-DnsName example.com -Type A -Server 8.8.8.8',
+          }}
+        />
       </div>
       <div className="flex items-center justify-end gap-2">
         <span className="text-[11px] text-gray-400">出口 IP / DNS 需手动自检刷新</span>

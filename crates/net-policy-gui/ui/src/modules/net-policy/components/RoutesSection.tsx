@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useState } from 'react'
 import { RefreshCw, Trash2 } from 'lucide-react'
-import { NetPolicyAPI, type Route, type RouteEntry, type RuleKind } from '../api/tauri-client'
+import { NetPolicyAPI, type Route, type RouteEntry, type Rule, type RuleKind } from '../api/tauri-client'
 
 /**
  * 生效路由（含优先级）：把「内置 LAN + 临时例外 + 程序组 + 用户规则 + 兜底 MATCH」按 mihomo 实际
@@ -35,9 +35,10 @@ function sourceBadge(s: string) {
   return <span className={`text-[11px] ${map[s] ?? 'text-gray-500'}`}>{label[s] ?? s}</span>
 }
 
-export function RoutesSection({ busy }: { busy: boolean }) {
+export function RoutesSection({ busy, onDeleteRule }: { busy: boolean; onDeleteRule: (rule: Rule) => Promise<void> }) {
   const [routes, setRoutes] = useState<RouteEntry[]>([])
   const [loading, setLoading] = useState(false)
+  const [deleting, setDeleting] = useState<string | null>(null)
   const [err, setErr] = useState<string | null>(null)
 
   const refresh = useCallback(async () => {
@@ -57,11 +58,16 @@ export function RoutesSection({ busy }: { busy: boolean }) {
   }, [refresh])
 
   const del = async (r: RouteEntry) => {
+    const key = `${r.kind}:${r.value}`
+    setDeleting(key)
+    setErr(null)
     try {
-      await NetPolicyAPI.deleteRule({ kind: r.kind as RuleKind, value: r.value, route: r.route })
+      await onDeleteRule({ kind: r.kind as RuleKind, value: r.value, route: r.route })
       await refresh()
     } catch (e) {
       setErr(String(e))
+    } finally {
+      setDeleting(null)
     }
   }
 
@@ -107,10 +113,10 @@ export function RoutesSection({ busy }: { busy: boolean }) {
                       <button
                         className="inline-flex items-center gap-1 rounded px-1.5 py-0.5 text-[11px] text-red-600 hover:bg-red-50 disabled:opacity-50 dark:text-red-400 dark:hover:bg-red-950/30"
                         onClick={() => void del(r)}
-                        disabled={busy}
+                        disabled={busy || deleting !== null}
                         title="删除该规则并热加载"
                       >
-                        <Trash2 size={11} /> 删除
+                        <Trash2 size={11} /> {deleting === `${r.kind}:${r.value}` ? '删除中…' : '删除'}
                       </button>
                     ) : (
                       <span className="text-[11px] text-gray-300 dark:text-gray-600">—</span>

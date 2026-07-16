@@ -14,6 +14,17 @@ const GROUP: &str = "NetPolicy-KillSwitch";
 /// mihomo TUN 适配器名（gvisor wintun，固定 "Meta"）。
 const TUN_ALIAS: &str = "Meta";
 
+/// 影响 kill-switch 规则内容的配置指纹。仅用于进程内判断热载时是否需要重铺防火墙；
+/// 不承担安全校验，因此无需密码学哈希。
+pub fn configuration_signature(settings: &NetPolicySettings, mihomo_bin: &Path) -> String {
+    format!(
+        "lan={:?}|ipv6={}|bin={}",
+        settings.lan_ranges,
+        settings.block_ipv6,
+        mihomo_bin.display()
+    )
+}
+
 fn ps_squote(s: &str) -> String {
     s.replace('\'', "''")
 }

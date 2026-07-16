@@ -12,6 +12,11 @@
 | [net-policy-daemon-gui-split-design.md](net-policy-daemon-gui-split-design.md) | **架构 + 落地实录**：四 crate 边界、版本化命名管道协议、§13 真机验收、§14 独立 GUI、**§15 真机健壮性复盘（6 条 daemon 缺陷 + fail-closed 复测）** | 动 agent/GUI/协议前 |
 | [net-policy-validation-report.md](net-policy-validation-report.md) | **真机验证报告**：VP 矩阵、fail-closed 证物、防火墙白名单模型（§0.8.2 = 唯一权威结论表） | 查「某结论有没有真机证据」 |
 | [net-policy-ui-redesign.md](net-policy-ui-redesign.md) | **UI 信息架构**：保护横幅状态机、历史结论 vs 实时状态分列 | 改前端展示前 |
+| [net-policy-capture-status.md](net-policy-capture-status.md) | **★ 抓包/解密落地状态总表**：Phase 1–4 进度、已落代码、真机验证、未决问题（P-1..P-7）、0.228 现状、下一步。**查「现在到哪了」先看这页** | 每次接手先看 |
+| [net-policy-capture-design.md](net-policy-capture-design.md) | **抓包设计**：在 TUN 咽喉位叠加 L2 协议嗅探 + L3 全量/定向 pcap（pktmon 内置引擎、进程/域名一键定向、导 Wireshark）+ §17–18 L4 HTTPS 解密（独立安全闸） | 做抓包功能前 |
+| [net-policy-capture-validation-report.md](net-policy-capture-validation-report.md) | **抓包 Phase 0 真机 spike 报告**（0.228）：pktmon→pcapng 管道验证（filter/start/stop/etl2pcap，pcapng 魔数合法），§15 验收矩阵状态 | 查抓包真机证据 |
+| [adr-2026-07-phase3-npcap-backend.md](adr-2026-07-phase3-npcap-backend.md) | **抓包 Phase 3 ADR**：暂不采用 npcap、维持 pktmon（需求未达门槛 + 驱动/许可成本）；含重开条件 | 想给抓包加 BPF/PID 前 |
+| [adr-2026-07-phase4-mitm-engine.md](adr-2026-07-phase4-mitm-engine.md) | **L4 引擎依赖 ADR**：锁定 mitmproxy 12.2.3（MIT，SHA-256 记录）；§6 记 0.228 真机——Defender 查杀已由安装程序加排除解决，`mitmdump --version` 跑通；引擎部署已进 `install-mitm-engine`。数据面/CA 仍待验 | 动 L4/引擎前 |
 
 ## 代码模块（四 crate + GUI）
 

@@ -103,6 +103,7 @@ fn rule_kind_value(r: &Rule) -> (&'static str, &str) {
         Rule::ProcessPath { value, .. } => ("process-path", value),
         Rule::ProcessName { value, .. } => ("process-name", value),
         Rule::DomainSuffix { value, .. } => ("domain-suffix", value),
+        Rule::DomainKeyword { value, .. } => ("domain-keyword", value),
         Rule::IpCidr { value, .. } => ("ip-cidr", value),
     }
 }
@@ -116,6 +117,7 @@ pub fn render_line(e: &RouteEntry) -> String {
         "process-path" => format!("  - PROCESS-PATH,{},{ob}", e.value),
         "process-name" => format!("  - PROCESS-NAME,{},{ob}", e.value),
         "domain-suffix" => format!("  - DOMAIN-SUFFIX,{},{ob}", e.value),
+        "domain-keyword" => format!("  - DOMAIN-KEYWORD,{},{ob}", e.value),
         _ => format!("  - MATCH,{ob}"),
     }
 }

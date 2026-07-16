@@ -17,6 +17,7 @@ members = [
     "crates/net-policy-client",
     "crates/net-policy-agent",
     "crates/net-policy-cli",
+    "crates/net-policy-mitm",
     "crates/orchestrator",
     "crates/egress-pool",
     "crates/egress-client",

@@ -97,6 +97,21 @@ pub fn domain(s: &str) -> Result<()> {
     Ok(())
 }
 
+/// 校验域名关键词（DOMAIN-KEYWORD 用）。它不是完整域名，只允许能安全写进 mihomo YAML 的短关键词。
+pub fn domain_keyword(s: &str) -> Result<()> {
+    no_meta(s)?;
+    if s.len() > 128 {
+        bail!("域名关键词过长：{s}");
+    }
+    if !s
+        .chars()
+        .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
+    {
+        bail!("非法域名关键词：{s}");
+    }
+    Ok(())
+}
+
 /// 校验进程名（如 `steam.exe`）。允许括号（少见但合法），拒注入元字符。
 pub fn process_name(s: &str) -> Result<()> {
     no_inject_path(s)?;

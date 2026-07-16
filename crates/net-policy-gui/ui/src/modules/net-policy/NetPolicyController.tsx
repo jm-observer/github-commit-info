@@ -46,6 +46,7 @@ interface NetPolicyControllerValue {
   changeDefaultRoute: (route: Route) => Promise<void>
   addRule: () => void | Promise<void>
   deleteRule: (rule: Rule) => Promise<void>
+  rerouteRule: (rule: Rule, target: string) => Promise<void>
   allowBlocked: (e: BlockedEntry, route: 'direct' | 'wg') => Promise<void>
   clearBlocked: () => Promise<void>
   runVerify: () => Promise<void>
@@ -64,6 +65,9 @@ export function NetPolicyControllerProvider({ children }: { children: React.Reac
   const [busy, setBusy] = useState(false)
   const [msg, setMsg] = useState<{ kind: 'ok' | 'err'; text: string } | null>(null)
   const [wgError, setWgError] = useState<string | null>(null)
+  // React state 要到下一次渲染才会生效；仅靠 busy 无法拦住同一帧内的连续点击。
+  // 所有写操作共用这个同步锁，既防出口按钮连点，也避免切出口与保存/规则热载交叉。
+  const actionInFlightRef = useRef(false)
 
   const [newRule, setNewRule] = useState<Rule>({ kind: 'process-name', value: '', route: 'direct' })
   const wgFileRef = useRef<HTMLInputElement>(null)
@@ -96,6 +100,8 @@ export function NetPolicyControllerProvider({ children }: { children: React.Reac
   }, [flash])
 
   const run = useCallback(async (label: string, fn: () => Promise<unknown>) => {
+    if (actionInFlightRef.current) return
+    actionInFlightRef.current = true
     setBusy(true)
     try {
       await fn()
@@ -103,6 +109,7 @@ export function NetPolicyControllerProvider({ children }: { children: React.Reac
     } catch (e) {
       flash('err', `${label}失败：${cleanErr(e)}`)
     } finally {
+      actionInFlightRef.current = false
       setBusy(false)
       void refresh()
     }
@@ -117,9 +124,11 @@ export function NetPolicyControllerProvider({ children }: { children: React.Reac
     try {
       await NetPolicyAPI.reload()
     } catch (e) {
-      throw new Error(`设置已保存，但引擎热载失败：${cleanErr(e)}——规则尚未生效，请重试或重新应用。`)
+      throw new Error(`设置已保存，但运行态更新未完整完成：${cleanErr(e)}；请重试热载或重新应用。`)
     }
   }, [status?.applied, status?.mihomo_running])
+
+  const curRoute: Route = settings?.default_route ?? status?.default_route ?? 'direct'
 
   const saveSettings = useCallback(() => {
     if (!settings) return
@@ -139,12 +148,14 @@ export function NetPolicyControllerProvider({ children }: { children: React.Reac
 
   // 默认出口三路切换
   const changeDefaultRoute = useCallback(async (route: Route) => {
-    if (!settings) return
+    if (!settings || route === curRoute || actionInFlightRef.current) return
     if (route === 'wg' && !status?.wg_configured) {
-      setWgError('尚未配置 WireGuard——请先在下方「高级 / 排障」填写 WG 出口后再切换。')
+      setWgError('尚未配置 WireGuard——请先到「WireGuard 设置」填写隧道配置后再切换。')
       setTimeout(() => setWgError(null), 6000)
       return
     }
+    actionInFlightRef.current = true
+    setBusy(true)
     setWgError(null)
     const next: Settings = { ...settings, default_route: route }
     setSettings(next)
@@ -152,18 +163,14 @@ export function NetPolicyControllerProvider({ children }: { children: React.Reac
       await NetPolicyAPI.saveSettings(next)
       await hotReloadIfApplied()
       void refreshFast()
-      // best-effort：切姿态后逼已建立的旧连接用新出口重连。引擎没跑就没意义，
-      // 且失败不应打断「切出口」这个已经成功的主流程——只 console.warn，不刷 toast。
-      if (status?.mihomo_running) {
-        NetPolicyAPI.resetConnections().catch((err) => {
-          console.warn('重置连接失败（旧连接可能仍走旧出口直到自然断开）：', err)
-        })
-      }
     } catch (e) {
       flash('err', `切换出口失败：${cleanErr(e)}`)
       void refresh() // 回滚显示
+    } finally {
+      actionInFlightRef.current = false
+      setBusy(false)
     }
-  }, [settings, status?.wg_configured, status?.mihomo_running, hotReloadIfApplied, refreshFast, flash, refresh])
+  }, [settings, curRoute, status?.wg_configured, hotReloadIfApplied, refreshFast, flash, refresh])
 
   const addRule = useCallback(() => {
     if (!newRule.value.trim()) return
@@ -178,6 +185,12 @@ export function NetPolicyControllerProvider({ children }: { children: React.Reac
   const deleteRule = useCallback((rule: Rule) =>
     run('删除规则', async () => {
       setRules(await NetPolicyAPI.deleteRule(rule))
+      await hotReloadIfApplied()
+    }), [run, hotReloadIfApplied])
+
+  const rerouteRule = useCallback((rule: Rule, target: string) =>
+    run(`改路 ${target}`, async () => {
+      setRules(await NetPolicyAPI.saveRule(rule))
       await hotReloadIfApplied()
     }), [run, hotReloadIfApplied])
 
@@ -199,8 +212,6 @@ export function NetPolicyControllerProvider({ children }: { children: React.Reac
   // 走标准 run()（有 busy/flash 反馈）。
   const resetConnections = useCallback(() =>
     run('重置连接', () => NetPolicyAPI.resetConnections()), [run])
-
-  const curRoute: Route = settings?.default_route ?? status?.default_route ?? 'direct'
 
   // 未提权时改路/放行会触发 reload（落防火墙/TUN），必然失败——未拿到 status 前默认放行交互，
   // 一旦拿到 status 且明确未提权，才禁用（platform_supported 前提下）。
@@ -228,6 +239,7 @@ export function NetPolicyControllerProvider({ children }: { children: React.Reac
     changeDefaultRoute,
     addRule,
     deleteRule,
+    rerouteRule,
     allowBlocked,
     clearBlocked,
     runVerify,

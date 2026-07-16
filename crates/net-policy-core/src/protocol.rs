@@ -11,7 +11,9 @@
 //! 请求（回 `VersionIncompatible`），只允许握手**；minor 不同按 capability 兼容（响应加字段兼容、
 //! 改删字段升 major）。
 
+use crate::capture::{CaptureOpts, CaptureSession, CaptureTarget};
 use crate::config::{NetPolicySettings, ProcessRef, Rule, RuleSet, WgConfig};
+use crate::decrypt::{CaStatus, DecryptArtifact, DecryptOpts, DecryptSession, DecryptTarget};
 use crate::operation::{ApplyProgress, OperationInfo, OperationResult};
 use crate::types::{
     BlockedEntry, ConnectionsSnapshot, DomainAssoc, LifecycleEvent, NetPolicyStatus,
@@ -28,8 +30,13 @@ pub const PIPE_NAME: &str = r"\\.\pipe\net-policy-agent";
 pub const PROTOCOL_MAJOR: u16 = 1;
 /// 协议次版本：仅加字段/加请求时 +1（向后兼容）。minor 1：`Repair` + `ResyncRequired`；
 /// minor 2：请求记录 / 进程树 / 路由视图 / 临时直连 / 生命周期事件；
-/// minor 3：`ResetConnections`（切姿态后强制旧连接重连新出口）+ `GetMihomoLog`（运行日志查看）。
-pub const PROTOCOL_MINOR: u16 = 3;
+/// minor 3：`ResetConnections`（切姿态后强制旧连接重连新出口）+ `GetMihomoLog`（运行日志查看）；
+/// minor 4：规则新增 `domain-keyword`（渲染为 mihomo `DOMAIN-KEYWORD`）；
+/// minor 5：抓包（Capture*，抓包设计 §10）+ `Hello.capabilities`（agent 探测通过才声明
+/// `capture_v1`）；
+/// minor 6：L4 应用明文（Decrypt*/DecryptCa*，抓包设计 §17.8）+ `decrypt_v1` 能力（CA/引擎/平台
+/// 探测通过才声明）。纯追加请求/响应/错误码，旧客户端忽略未知字段。
+pub const PROTOCOL_MINOR: u16 = 6;
 
 /// 单帧最大字节数（防超大帧拖垮提权 agent，设计 §3.1 DoS 防护）。
 pub const MAX_FRAME_LEN: u32 = 8 * 1024 * 1024;
@@ -74,10 +81,56 @@ pub enum ErrorKind {
     Unsupported,
     /// 其它内部错误。
     Internal,
+
+    // ── minor 5：抓包稳定错误码（抓包设计 §10）──────────────────────────────
+    /// agent 未声明抓包能力（pktmon 探测未通过 / 真实后端尚未实现）。
+    CaptureUnsupported,
+    /// pktmon 已有 capture/trace 在运行（机器级共享，绝不 stop 他人会话）。
+    CaptureEngineBusy,
+    /// pktmon 已存在其它过滤器（绝不 remove 他人过滤器）。
+    CaptureFiltersBusy,
+    /// 无法唯一定位 mihomo TUN 对应的 pktmon component。
+    CaptureComponentNotFound,
+    /// 定向目标解析出的端点为空（进程/域名当前无流量）。
+    CaptureTargetEmpty,
+    /// 去重后端点超过 pktmon 32 条过滤器上限（不静默退化全量）。
+    CaptureFilterLimit,
+    /// 抓包与 apply/reload/stop 等网络长操作冲突，需先停抓包。
+    CaptureConflict,
+    /// 会话 ID 不存在。
+    CaptureNotFound,
+    /// 会话处于运行态，Delete 拒绝（不隐式 Stop）。
+    CaptureBusy,
+    /// 存储配额 / 目标卷可用空间不足。
+    CaptureStorageFull,
+    /// ETL 转 pcapng 失败。
+    CaptureConvertFailed,
+
+    // ── minor 6：L4 应用明文稳定错误码（抓包设计 §17.8）──────────────────────
+    /// agent 未声明 L4 能力（CA/引擎/平台探测未通过 / 真实后端未实现，受 ADR 阻断）。
+    DecryptUnsupported,
+    /// 专用调试 CA 未创建。
+    DecryptCaMissing,
+    /// CA 私钥缺失 / 指纹不符 / 过期。
+    DecryptCaBroken,
+    /// 目标进程实例失配（PID 复用 / 路径或创建时间变化 / 已退出）。
+    DecryptTargetStale,
+    /// MITM 引擎健康检查失败。
+    DecryptEngineUnhealthy,
+    /// 与 L3 抓包 / apply/reload/stop 等互斥操作冲突。
+    DecryptConflict,
+    /// 达到会话数 / 配额上限。
+    DecryptLimitReached,
+    /// 客户端拒绝伪造叶子证书（pinning / 自带 CA bundle）。
+    DecryptClientRejectedCert,
+    /// QUIC/HTTP3 不解密（默认旁路）。
+    DecryptQuicNotSupported,
+    /// finalize（脱敏索引 / 产物校验 / 原子提交）失败。
+    DecryptFinalizeFailed,
 }
 
 /// 错误响应体。
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ProtocolError {
     pub kind: ErrorKind,
     pub message: String,
@@ -179,15 +232,80 @@ pub enum Request {
     GetMihomoLog {
         lines: u32,
     },
+
+    // ── minor 5：抓包（抓包设计 §10）────────────────────────────────────────
+    /// 开始抓包（单会话；参数与目标在开始前冻结）。
+    CaptureStart {
+        target: CaptureTarget,
+        opts: CaptureOpts,
+    },
+    /// 停止指定会话（仅 `running` 有效；其余幂等返回当前态）。
+    CaptureStop {
+        id: String,
+    },
+    /// 取单个会话状态。
+    CaptureGet {
+        id: String,
+    },
+    /// 列出全部会话。
+    CaptureList,
+    /// 删除会话（运行态返回 `capture_busy`，不隐式 Stop）。
+    CaptureDelete {
+        id: String,
+    },
+    /// 分块读取 `done` 会话的 pcapng（`len` 原始上限 512 KiB）。
+    CaptureRead {
+        id: String,
+        offset: u64,
+        len: u32,
+    },
+
+    // ── minor 6：L4 应用明文（抓包设计 §17.8）────────────────────────────────
+    /// 查 CA 信任状态。
+    DecryptCaStatus,
+    /// 生成专用调试 CA（只返回公钥指纹/句柄；私钥永不出管道）。
+    DecryptCaCreate,
+    /// GUI 在当前用户上下文安装公钥后，把指纹 + SID 交 agent 复核（与 Create 分开，§17.8）。
+    DecryptCaConfirmInstalled {
+        thumbprint: String,
+        owner_sid: String,
+    },
+    /// 按 thumbprint 精确删除本产品 CA。
+    DecryptCaRemove,
+    /// 开始明文会话（精确进程实例 + 必填域名 allowlist）。
+    DecryptStart {
+        target: DecryptTarget,
+        opts: DecryptOpts,
+    },
+    DecryptStop {
+        id: String,
+    },
+    DecryptGet {
+        id: String,
+    },
+    DecryptList,
+    DecryptDelete {
+        id: String,
+    },
+    /// 分块读取产物（artifact 用枚举，客户端不能传文件名；`len` 原始上限 512 KiB）。
+    DecryptRead {
+        id: String,
+        artifact: DecryptArtifact,
+        offset: u64,
+        len: u32,
+    },
 }
 
 /// agent → 客户端响应。逐 Request 定型（设计 §4：响应与今天前端各命令返回一致）。
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "resp", rename_all = "snake_case")]
 pub enum Response {
-    /// 握手回应（回 agent 自身版本）。
+    /// 握手回应（回 agent 自身版本 + 能力清单）。`capabilities` 为 minor 5 新增字段，
+    /// 旧客户端 `#[serde(default)]` 忽略；agent 仅在 pktmon 探测通过时声明 `capture_v1`。
     Hello {
         version: Version,
+        #[serde(default)]
+        capabilities: Vec<String>,
     },
     Status {
         status: NetPolicyStatus,
@@ -240,6 +358,46 @@ pub enum Response {
     /// mihomo 运行日志（最近 N 行）。
     MihomoLog {
         lines: Vec<String>,
+    },
+
+    // ── minor 5：抓包（抓包设计 §10）────────────────────────────────────────
+    /// 单会话（CaptureStart/Stop/Get/Delete 返回）。
+    CaptureSession {
+        session: CaptureSession,
+    },
+    /// 会话列表（CaptureList 返回）。
+    CaptureSessions {
+        sessions: Vec<CaptureSession>,
+    },
+    /// 一块 pcapng 数据（CaptureRead 返回；`data_base64` 是本块原始字节的 base64，
+    /// `eof` 表示已到文件末尾）。
+    CaptureChunk {
+        id: String,
+        offset: u64,
+        data_base64: String,
+        eof: bool,
+    },
+
+    // ── minor 6：L4 应用明文（抓包设计 §17.8）────────────────────────────────
+    /// CA 状态（DecryptCaStatus/Create/ConfirmInstalled/Remove 返回）。
+    DecryptCa {
+        status: CaStatus,
+    },
+    /// 单个明文会话（DecryptStart/Stop/Get/Delete 返回）。
+    DecryptSession {
+        session: DecryptSession,
+    },
+    /// 明文会话列表（DecryptList 返回）。
+    DecryptSessions {
+        sessions: Vec<DecryptSession>,
+    },
+    /// 一块产物数据（DecryptRead 返回）。
+    DecryptChunk {
+        id: String,
+        artifact: DecryptArtifact,
+        offset: u64,
+        data_base64: String,
+        eof: bool,
     },
     /// 无载荷成功（SaveSettings / ClearBlocked / SubscribeEvents 确认 / ResetConnections）。
     Ok,

@@ -51,6 +51,15 @@ pub fn generate_config(
         dns_bootstrap.clone()
     };
 
+    // L2 域名嗅探（抓包设计 §11 Phase 1）：仅在 `sniffer_enabled` 时输出 `sniffer` 块。
+    // override-destination 恒 false（顶层 + 协议级），只观察不改路由/目标；parse-pure-ip 只对
+    // 缺域名的连接尝试。端口取常见 HTTP/TLS/QUIC。默认关闭 → 不输出该块（mihomo 默认即不嗅探）。
+    let sniffer = if settings.sniffer_enabled {
+        "sniffer:\n  enable: true\n  parse-pure-ip: true\n  override-destination: false\n  sniff:\n    HTTP:\n      ports: [80, 8080-8880]\n    TLS:\n      ports: [443, 8443]\n    QUIC:\n      ports: [443, 8443]\n\n"
+    } else {
+        ""
+    };
+
     // WG 已配 → 输出 wg-out outbound；未配 → 空 proxies（黑洞/直连仍可运行，不强制 SBN）。
     let proxies = if wg.validate().is_ok() {
         // AmneziaWG 混淆：填了 amnezia 就追加 amnezia-wg-option 块，让 mihomo 以 AmneziaWG
@@ -120,7 +129,7 @@ tun:
   route-exclude-address:
 {lan_exclude}
 
-proxies:{proxies}
+{sniffer}proxies:{proxies}
 
 proxy-groups: []
 
@@ -240,12 +249,61 @@ mod tests {
     }
 
     #[test]
+    fn sniffer_absent_by_default() {
+        // 默认 sniffer_enabled=false → 不输出 sniffer 块（mihomo 默认即不嗅探）。
+        let cfg = generate_config(
+            &NetPolicySettings::default(),
+            &RuleSet::default(),
+            "s",
+            &crate::config::TempDirect::default(),
+        );
+        assert!(!cfg.contains("sniffer:"), "默认不应输出 sniffer 块");
+    }
+
+    #[test]
+    fn sniffer_block_rendered_when_enabled() {
+        let settings = NetPolicySettings {
+            sniffer_enabled: true,
+            ..Default::default()
+        };
+        let cfg = generate_config(
+            &settings,
+            &RuleSet::default(),
+            "s",
+            &crate::config::TempDirect::default(),
+        );
+        assert!(
+            cfg.contains("sniffer:\n  enable: true"),
+            "应输出 sniffer 块"
+        );
+        // §11 硬约束：只观察不改路由——override-destination 必须为 false。
+        assert!(
+            cfg.contains("override-destination: false"),
+            "sniffer 不得改路由/目标"
+        );
+        assert!(cfg.contains("parse-pure-ip: true"));
+        assert!(cfg.contains("    TLS:\n      ports: [443, 8443]"));
+        assert!(cfg.contains("    HTTP:\n      ports: [80, 8080-8880]"));
+        assert!(cfg.contains("    QUIC:\n      ports: [443, 8443]"));
+        // sniffer 块位于 tun 与 proxies 之间，proxies 仍在。
+        let s_idx = cfg.find("sniffer:").unwrap();
+        let p_idx = cfg.find("proxies:").unwrap();
+        assert!(s_idx < p_idx, "sniffer 应在 proxies 之前");
+    }
+
+    #[test]
     fn rule_lines_rendered_in_order() {
         let rules = RuleSet {
-            rules: vec![Rule::DomainSuffix {
-                value: "example.com".into(),
-                route: Route::Direct,
-            }],
+            rules: vec![
+                Rule::DomainSuffix {
+                    value: "example.com".into(),
+                    route: Route::Direct,
+                },
+                Rule::DomainKeyword {
+                    value: "ctrip".into(),
+                    route: Route::Direct,
+                },
+            ],
             groups: vec![],
         };
         let cfg = generate_config(
@@ -255,5 +313,6 @@ mod tests {
             &crate::config::TempDirect::default(),
         );
         assert!(cfg.contains("DOMAIN-SUFFIX,example.com,DIRECT"));
+        assert!(cfg.contains("DOMAIN-KEYWORD,ctrip,DIRECT"));
     }
 }

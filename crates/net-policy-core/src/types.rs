@@ -215,7 +215,7 @@ pub struct ProcessNode {
 pub struct RouteEntry {
     /// 优先级 = 在 mihomo 规则列表中的位置（0 起，越小越先匹配）。
     pub priority: usize,
-    /// 匹配维度：process-path / process-name / domain-suffix / ip-cidr / match。
+    /// 匹配维度：process-path / process-name / domain-suffix / domain-keyword / ip-cidr / match。
     pub kind: String,
     /// 匹配值（`match` 兜底为空）。
     pub value: String,

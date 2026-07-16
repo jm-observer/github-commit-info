@@ -12,6 +12,7 @@
 use crate::app_state::AppState;
 use anyhow::Result;
 use net_policy_client::Client;
+use net_policy_core::capture::{CaptureOpts, CaptureSession, CaptureTarget};
 use net_policy_core::config::{NetPolicySettings, ProcessRef, Rule, RuleSet, WgConfig};
 use net_policy_core::types::{
     BlockedEntry, ConnectionsSnapshot, DomainAssoc, LifecycleEvent, NetPolicyStatus,
@@ -264,4 +265,70 @@ pub async fn net_policy_reset_connections(_state: State<'_, AppState>) -> Result
 #[tauri::command]
 pub async fn net_policy_get_mihomo_log(lines: u32) -> Result<Vec<String>, String> {
     connect().await?.mihomo_log(lines).await.map_err(estr)
+}
+
+// ── 抓包（minor 5，抓包设计 §10/§12） ─────────────────────────────────────
+
+/// pcapng 分块（前端用浏览器原生 atob 解码组装 Blob 下载，避免走磁盘/新增依赖）。
+#[derive(serde::Serialize)]
+pub struct CaptureChunkDto {
+    pub offset: u64,
+    pub data_base64: String,
+    pub eof: bool,
+}
+
+/// 开始抓包（`All` 全 TUN，或定向 Process/Domain/Ip）。
+#[tauri::command]
+pub async fn net_policy_capture_start(
+    target: CaptureTarget,
+    opts: CaptureOpts,
+) -> Result<CaptureSession, String> {
+    connect()
+        .await?
+        .capture_start(target, opts)
+        .await
+        .map_err(estr)
+}
+
+/// 停止抓包（幂等）。
+#[tauri::command]
+pub async fn net_policy_capture_stop(id: String) -> Result<CaptureSession, String> {
+    connect().await?.capture_stop(id).await.map_err(estr)
+}
+
+/// 取单个会话当前态。
+#[tauri::command]
+pub async fn net_policy_capture_get(id: String) -> Result<CaptureSession, String> {
+    connect().await?.capture_get(id).await.map_err(estr)
+}
+
+/// 列出所有抓包会话。
+#[tauri::command]
+pub async fn net_policy_capture_list() -> Result<Vec<CaptureSession>, String> {
+    connect().await?.capture_list().await.map_err(estr)
+}
+
+/// 删除会话（运行态返回 capture_busy）。
+#[tauri::command]
+pub async fn net_policy_capture_delete(id: String) -> Result<(), String> {
+    connect().await?.capture_delete(id).await.map_err(estr)
+}
+
+/// 分块读取 done 会话 pcapng（前端循环调用直至 eof，组装保存）。
+#[tauri::command]
+pub async fn net_policy_capture_read(
+    id: String,
+    offset: u64,
+    len: u32,
+) -> Result<CaptureChunkDto, String> {
+    let (offset, data_base64, eof) = connect()
+        .await?
+        .capture_read(id, offset, len)
+        .await
+        .map_err(estr)?;
+    Ok(CaptureChunkDto {
+        offset,
+        data_base64,
+        eof,
+    })
 }

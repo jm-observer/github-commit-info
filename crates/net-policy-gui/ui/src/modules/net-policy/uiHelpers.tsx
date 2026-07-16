@@ -9,6 +9,7 @@ export const KIND_LABELS: Record<RuleKind, string> = {
   'process-path': '程序路径',
   'process-name': '程序名',
   'domain-suffix': '域名后缀',
+  'domain-keyword': '域名关键词',
   'ip-cidr': 'IP/CIDR',
 }
 

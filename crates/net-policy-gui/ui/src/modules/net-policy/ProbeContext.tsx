@@ -44,6 +44,8 @@ interface ProbeContextValue {
   verifyUpdatedAt: string | null
   /** verify 正在跑（用于按钮 loading）。 */
   probing: boolean
+  /** 快探测最近一次错误；连续失败后 status/conns 会清空，避免保留旧绿灯。 */
+  probeError: string | null
   /** 重拉 status + conns（便宜）。 */
   refreshFast: () => void
   /** 重跑 verify（贵 ~1s，HTTP）；返回最新报告供调用方继续处理。 */
@@ -66,17 +68,28 @@ export function NetPolicyProbeProvider({ children }: { children: React.ReactNode
   const [exitIpAt, setExitIpAt] = useState<string | null>(null)
   const [verifyUpdatedAt, setVerifyUpdatedAt] = useState<string | null>(null)
   const [probing, setProbing] = useState(false)
+  const [probeError, setProbeError] = useState<string | null>(null)
 
   // status 单飞合并：3s 轮询和手动 refresh 撞一起时只发一发请求。
   const statusInFlightRef = useRef<Promise<void> | null>(null)
   // verify 单飞合并：避免 App 挂载时和 NetPolicyPage 挂载时各跑一次。
   const verifyInFlightRef = useRef<Promise<VerifyReport | null> | null>(null)
+  const statusFailuresRef = useRef(0)
+  const connectionFailuresRef = useRef(0)
 
   const loadStatus = useCallback(() => {
     if (statusInFlightRef.current) return statusInFlightRef.current
     const req = NetPolicyAPI.getStatus()
-      .then((s) => setStatus(s))
-      .catch(() => {})
+      .then((s) => {
+        statusFailuresRef.current = 0
+        setProbeError(null)
+        setStatus(s)
+      })
+      .catch((error) => {
+        statusFailuresRef.current += 1
+        setProbeError(String(error))
+        if (statusFailuresRef.current >= 2) setStatus(null)
+      })
       .finally(() => {
         statusInFlightRef.current = null
       })
@@ -86,8 +99,14 @@ export function NetPolicyProbeProvider({ children }: { children: React.ReactNode
 
   const loadConns = useCallback(() => {
     return NetPolicyAPI.getConnections()
-      .then(setConns)
-      .catch(() => {})
+      .then((snapshot) => {
+        connectionFailuresRef.current = 0
+        setConns(snapshot)
+      })
+      .catch(() => {
+        connectionFailuresRef.current += 1
+        if (connectionFailuresRef.current >= 2) setConns(EMPTY_CONNS)
+      })
   }, [])
 
   const loadObserve = useCallback(() => {
@@ -162,6 +181,7 @@ export function NetPolicyProbeProvider({ children }: { children: React.ReactNode
     exitIpAt,
     verifyUpdatedAt,
     probing,
+    probeError,
     refreshFast,
     runVerify,
     setVerify,

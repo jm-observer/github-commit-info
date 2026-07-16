@@ -40,6 +40,17 @@
     "active": true,
     "targets": "nsis",
     "icon": ["icons/icon.ico"],
+    "resources": {
+      "bundle-resources/net-policy-agent.exe": "net-policy-agent.exe",
+      "bundle-resources/net-policy.exe": "net-policy.exe",
+      "bundle-resources/mihomo-windows-amd64.exe": "mihomo-windows-amd64.pending.exe"
+    },
+    "windows": {
+      "nsis": {
+        "installMode": "perMachine",
+        "installerHooks": "installer-hooks.nsh"
+      }
+    },
     "category": "DeveloperTool",
     "shortDescription": "Standalone network policy (egress control) desktop app.",
     "longDescription": "net-policy-gui is a standalone Tauri 2 shell hosting only the network policy (observer-first egress control) module, split out of zero-desktop."

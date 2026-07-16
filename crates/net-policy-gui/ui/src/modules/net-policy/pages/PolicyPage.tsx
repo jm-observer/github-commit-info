@@ -23,7 +23,7 @@ export function PolicyPage() {
         />
       </Section>
       <Section title="最终生效顺序" description="内置规则、临时例外、程序组、用户规则与兜底出口的合并结果">
-        <RoutesSection busy={busy} />
+        <RoutesSection busy={busy} onDeleteRule={deleteRule} />
       </Section>
     </div>
   )

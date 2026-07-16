@@ -37,7 +37,7 @@ export function RuleList({
           onChange={e => setNewRule({ ...newRule, kind: e.target.value as RuleKind })}>
           {Object.entries(KIND_LABELS).map(([k, v]) => <option key={k} value={k}>{v}</option>)}
         </select>
-        <input className="flex-1 rounded border px-2 py-1 dark:bg-gray-800 dark:border-gray-700" placeholder="值（如 steam.exe / example.cn / 1.2.3.0/24）"
+        <input className="flex-1 rounded border px-2 py-1 dark:bg-gray-800 dark:border-gray-700" placeholder="值（如 steam.exe / ctrip / example.cn / 1.2.3.0/24）"
           value={newRule.value} onChange={e => setNewRule({ ...newRule, value: e.target.value })}
           onKeyDown={e => e.key === 'Enter' && addRule()} />
         <select className="rounded border px-2 py-1 dark:bg-gray-800 dark:border-gray-700" value={newRule.route}
@@ -73,6 +73,7 @@ export function RuleList({
       </ul>
       <p className="mt-2 px-1 text-[11px] text-gray-500 dark:text-gray-400">
         提示：把某个程序设为直连，选「程序名」填可执行名（如 steam.exe）+「本地直连」；
+        多个同品牌域名可选「域名关键词」填关键词（如 ctrip）收成一条规则；
         近期有公网连接的进程可在「诊断 → 扫描进程」里查看。
       </p>
     </div>

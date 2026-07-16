@@ -84,7 +84,7 @@ export function BlockedFeed({
       )}
 
       <p className="text-[11px] text-gray-500 dark:text-gray-400">
-        域名目标会生成 DOMAIN-SUFFIX，裸 IP 会生成 IP-CIDR；按程序放行请前往“策略编排”。
+        域名目标会生成 DOMAIN-SUFFIX，裸 IP 会生成 IP-CIDR；同品牌多域名可在“策略编排”新增 DOMAIN-KEYWORD 收成一条。
       </p>
     </div>
   )
