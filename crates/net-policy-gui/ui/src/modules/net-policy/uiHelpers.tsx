@@ -70,6 +70,10 @@ export function btn(variant: 'primary' | 'danger' | 'ghost' = 'ghost') {
   return `${base} border border-gray-300 hover:bg-gray-100 dark:border-gray-700 dark:hover:bg-gray-800`
 }
 
+// 表单控件统一样式：下拉框 / 输入框等，各页面共用以保持一致外观（浅色 + 暗色）。
+export const controlCls =
+  'rounded-md border border-gray-300 bg-white px-2 py-1 text-xs text-gray-700 outline-none focus:border-blue-500 dark:border-gray-700 dark:bg-gray-900 dark:text-gray-200'
+
 // 三路按钮样式辅助
 export function segCls(active: boolean, danger = false) {
   const base = 'px-3 py-1.5 text-sm rounded-md border transition-colors disabled:opacity-50'

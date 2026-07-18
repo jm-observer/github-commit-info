@@ -11,14 +11,18 @@ pub mod frame;
 use anyhow::{bail, Context, Result};
 use net_policy_core::capture::{CaptureOpts, CaptureSession, CaptureTarget};
 use net_policy_core::config::{NetPolicySettings, ProcessRef, Rule, RuleSet, WgConfig};
+use net_policy_core::decrypt::{
+    CaStatus, DecryptArtifact, DecryptOpts, DecryptSession, DecryptTarget,
+};
+use net_policy_core::egress::{EgressFallback, EgressStatus};
 use net_policy_core::operation::OperationInfo;
 use net_policy_core::protocol::{
     ErrorKind, Event, Frame, ProtocolError, Request, Response, Version,
 };
 use net_policy_core::types::{
     BlockedEntry, ConnectionsSnapshot, DomainAssoc, LifecycleEvent, NetPolicyStatus,
-    ProcessCandidate, ProcessNode, RepairResult, RequestLogEntry, RouteEntry, TempDirectStatus,
-    VerifyReport,
+    ProcessCandidate, ProcessNode, ProxyNode, RepairResult, RequestLogEntry, RouteEntry,
+    TempDirectStatus, VerifyReport,
 };
 
 /// 控制面命名管道名（agent server 端建同名管道并挂 DACL）。
@@ -115,7 +119,7 @@ impl Client {
         frame::write_frame(&mut self.conn, &Frame::request(id, req)).await?;
         loop {
             match frame::read_frame(&mut self.conn).await? {
-                Frame::Response { id: rid, resp } if rid == id => return Ok(resp),
+                Frame::Response { id: rid, resp } if rid == id => return Ok(*resp),
                 Frame::Response { .. } => continue, // 非本请求的响应（不应发生），跳过
                 Frame::Event { .. } => continue,    // 请求连接上不应有事件；忽略
                 Frame::Request { .. } => bail!("agent 在请求连接上发来 Request 帧（协议错误）"),
@@ -162,6 +166,85 @@ impl Client {
         self.request(req).await
     }
 
+    /// minor 6 门控后再发请求（L4 `Decrypt*`/`DecryptCa*`）。
+    async fn request_v6(&mut self, req: Request) -> Result<Response> {
+        self.require_minor(6)?;
+        self.request(req).await
+    }
+
+    async fn request_v7(&mut self, req: Request) -> Result<Response> {
+        self.require_minor(7)?;
+        self.request(req).await
+    }
+
+    /// minor 8 门控后再发请求（统一出口 `Egress*`）。
+    async fn request_v8(&mut self, req: Request) -> Result<Response> {
+        self.require_minor(8)?;
+        self.request(req).await
+    }
+
+    // ── 出口生命周期（minor 8，出口设计 §8.8）───────────────────────────────
+    //
+    // 六个操作**语义互不重叠**：list 只读；probe 只测不改状态；start/stop 改生命周期；
+    // reconnect 重建会话；set_fallback 改不可用时的行为。改导流策略不在这里（走
+    // save_settings / save_rule）。全部回出口全量清单。
+
+    async fn egress_call(&mut self, req: Request) -> Result<Vec<EgressStatus>> {
+        match Client::expect_ok(self.request_v8(req).await?)? {
+            Response::Egresses { egresses } => Ok(egresses),
+            other => unexpected(other),
+        }
+    }
+
+    pub async fn egress_list(&mut self) -> Result<Vec<EgressStatus>> {
+        self.egress_call(Request::EgressList).await
+    }
+
+    /// 启动出口（渲染进配置 + 立即探测）。**不改变任何导流规则。**
+    pub async fn egress_start(&mut self, id: String) -> Result<Vec<EgressStatus>> {
+        self.egress_call(Request::EgressStart { id }).await
+    }
+
+    /// 停止出口（从配置摘除；指向它的规则按 fallback 处理，默认阻断）。
+    /// **与「停止管控」（[`Client::stop`]）是两件事。**
+    pub async fn egress_stop(&mut self, id: String) -> Result<Vec<EgressStatus>> {
+        self.egress_call(Request::EgressStop { id }).await
+    }
+
+    pub async fn egress_reconnect(&mut self, id: String) -> Result<Vec<EgressStatus>> {
+        self.egress_call(Request::EgressReconnect { id }).await
+    }
+
+    /// 仅测试连接：探测一次，不改生命周期也不改导流。
+    pub async fn egress_probe(&mut self, id: String) -> Result<Vec<EgressStatus>> {
+        self.egress_call(Request::EgressProbe { id }).await
+    }
+
+    pub async fn egress_set_fallback(
+        &mut self,
+        id: String,
+        fallback: EgressFallback,
+    ) -> Result<Vec<EgressStatus>> {
+        self.egress_call(Request::EgressSetFallback { id, fallback })
+            .await
+    }
+
+    /// 刷新代理订阅（只刷配置来源，不重连节点、不打断当前可用连接）。
+    pub async fn egress_refresh_subscription(&mut self, id: String) -> Result<Vec<EgressStatus>> {
+        self.egress_call(Request::EgressRefreshSubscription { id })
+            .await
+    }
+
+    /// 切换代理订阅当前节点（影响此后新建立的连接）。
+    pub async fn egress_select_node(
+        &mut self,
+        id: String,
+        node: String,
+    ) -> Result<Vec<EgressStatus>> {
+        self.egress_call(Request::EgressSelectNode { id, node })
+            .await
+    }
+
     // ── 逐操作 typed 便捷方法（对应今天前端 NetPolicyAPI 的 17 个 invoke） ─────────────
 
     pub async fn status(&mut self) -> Result<NetPolicyStatus> {
@@ -173,13 +256,18 @@ impl Client {
 
     pub async fn get_settings(&mut self) -> Result<NetPolicySettings> {
         match Client::expect_ok(self.request(Request::GetSettings).await?)? {
-            Response::Settings { settings } => Ok(settings),
+            Response::Settings { settings } => Ok(*settings),
             other => unexpected(other),
         }
     }
 
     pub async fn save_settings(&mut self, settings: NetPolicySettings) -> Result<()> {
-        Client::expect_ok(self.request(Request::SaveSettings { settings }).await?)?;
+        Client::expect_ok(
+            self.request(Request::SaveSettings {
+                settings: Box::new(settings),
+            })
+            .await?,
+        )?;
         Ok(())
     }
 
@@ -221,6 +309,20 @@ impl Client {
     pub async fn connections(&mut self) -> Result<ConnectionsSnapshot> {
         match Client::expect_ok(self.request(Request::GetConnections).await?)? {
             Response::Connections { snapshot } => Ok(snapshot),
+            other => unexpected(other),
+        }
+    }
+
+    pub async fn proxy_nodes(&mut self) -> Result<Vec<ProxyNode>> {
+        match Client::expect_ok(self.request_v7(Request::GetProxyNodes).await?)? {
+            Response::ProxyNodes { nodes } => Ok(nodes),
+            other => unexpected(other),
+        }
+    }
+
+    pub async fn test_proxy_node(&mut self, name: String) -> Result<ProxyNode> {
+        match Client::expect_ok(self.request_v7(Request::TestProxyNode { name }).await?)? {
+            Response::ProxyNode { node } => Ok(node),
             other => unexpected(other),
         }
     }
@@ -396,7 +498,10 @@ impl Client {
         target: CaptureTarget,
         opts: CaptureOpts,
     ) -> Result<CaptureSession> {
-        match Client::expect_ok(self.request_v5(Request::CaptureStart { target, opts }).await?)? {
+        match Client::expect_ok(
+            self.request_v5(Request::CaptureStart { target, opts })
+                .await?,
+        )? {
             Response::CaptureSession { session } => Ok(session),
             other => unexpected(other),
         }
@@ -442,6 +547,102 @@ impl Client {
         let req = Request::CaptureRead { id, offset, len };
         match Client::expect_ok(self.request_v5(req).await?)? {
             Response::CaptureChunk {
+                offset,
+                data_base64,
+                eof,
+                ..
+            } => Ok((offset, data_base64, eof)),
+            other => unexpected(other),
+        }
+    }
+
+    // ── minor 6：L4 应用明文（Decrypt*/DecryptCa*，抓包设计 §17.8）───────────────
+
+    async fn decrypt_ca(&mut self, req: Request) -> Result<CaStatus> {
+        match Client::expect_ok(self.request_v6(req).await?)? {
+            Response::DecryptCa { status } => Ok(status),
+            other => unexpected(other),
+        }
+    }
+    /// CA 信任状态。
+    pub async fn decrypt_ca_status(&mut self) -> Result<CaStatus> {
+        self.decrypt_ca(Request::DecryptCaStatus).await
+    }
+    /// 生成专用调试 CA（不装信任库；GUI 在用户上下文安装公钥后再 confirm）。
+    pub async fn decrypt_ca_create(&mut self) -> Result<CaStatus> {
+        self.decrypt_ca(Request::DecryptCaCreate).await
+    }
+    /// GUI 安装公钥后把指纹 + owner SID 交 agent 复核。
+    pub async fn decrypt_ca_confirm(
+        &mut self,
+        thumbprint: String,
+        owner_sid: String,
+    ) -> Result<CaStatus> {
+        self.decrypt_ca(Request::DecryptCaConfirmInstalled {
+            thumbprint,
+            owner_sid,
+        })
+        .await
+    }
+    /// 移除本产品 CA（文件 + 安装记录）。
+    pub async fn decrypt_ca_remove(&mut self) -> Result<CaStatus> {
+        self.decrypt_ca(Request::DecryptCaRemove).await
+    }
+    /// 导出 CA 公钥证书 PEM（供 GUI 在用户上下文装 `CurrentUser\Root`；私钥永不出管道）。
+    pub async fn decrypt_ca_export_public(&mut self) -> Result<String> {
+        match Client::expect_ok(self.request_v6(Request::DecryptCaExportPublic).await?)? {
+            Response::DecryptCaPublic { cert_pem } => Ok(cert_pem),
+            other => unexpected(other),
+        }
+    }
+
+    async fn decrypt_session(&mut self, req: Request) -> Result<DecryptSession> {
+        match Client::expect_ok(self.request_v6(req).await?)? {
+            Response::DecryptSession { session } => Ok(session),
+            other => unexpected(other),
+        }
+    }
+    /// 开始解密会话（精确进程实例 + 必填域名 allowlist）。
+    pub async fn decrypt_start(
+        &mut self,
+        target: DecryptTarget,
+        opts: DecryptOpts,
+    ) -> Result<DecryptSession> {
+        self.decrypt_session(Request::DecryptStart { target, opts })
+            .await
+    }
+    pub async fn decrypt_stop(&mut self, id: String) -> Result<DecryptSession> {
+        self.decrypt_session(Request::DecryptStop { id }).await
+    }
+    pub async fn decrypt_get(&mut self, id: String) -> Result<DecryptSession> {
+        self.decrypt_session(Request::DecryptGet { id }).await
+    }
+    pub async fn decrypt_list(&mut self) -> Result<Vec<DecryptSession>> {
+        match Client::expect_ok(self.request_v6(Request::DecryptList).await?)? {
+            Response::DecryptSessions { sessions } => Ok(sessions),
+            other => unexpected(other),
+        }
+    }
+    pub async fn decrypt_delete(&mut self, id: String) -> Result<()> {
+        Client::expect_ok(self.request_v6(Request::DecryptDelete { id }).await?)?;
+        Ok(())
+    }
+    /// 分块读产物（manifest / http.jsonl）。返回 `(offset, data_base64, eof)`。
+    pub async fn decrypt_read(
+        &mut self,
+        id: String,
+        artifact: DecryptArtifact,
+        offset: u64,
+        len: u32,
+    ) -> Result<(u64, String, bool)> {
+        let req = Request::DecryptRead {
+            id,
+            artifact,
+            offset,
+            len,
+        };
+        match Client::expect_ok(self.request_v6(req).await?)? {
+            Response::DecryptChunk {
                 offset,
                 data_base64,
                 eof,
@@ -497,7 +698,7 @@ async fn read_response<C: tokio::io::AsyncRead + Unpin>(
 ) -> Result<Response> {
     loop {
         match frame::read_frame(conn).await? {
-            Frame::Response { id, resp } if id == want_id => return Ok(resp),
+            Frame::Response { id, resp } if id == want_id => return Ok(*resp),
             Frame::Response { .. } => continue,
             other => bail!("握手阶段收到非 Response 帧：{other:?}"),
         }
@@ -556,5 +757,11 @@ fn kind_str(k: ErrorKind) -> &'static str {
         ErrorKind::DecryptClientRejectedCert => "decrypt_client_rejected_cert",
         ErrorKind::DecryptQuicNotSupported => "decrypt_quic_not_supported",
         ErrorKind::DecryptFinalizeFailed => "decrypt_finalize_failed",
+        ErrorKind::EgressNotFound => "egress_not_found",
+        ErrorKind::EgressUnconfigured => "egress_unconfigured",
+        ErrorKind::EgressConflict => "egress_conflict",
+        ErrorKind::EgressApplyFailed => "egress_apply_failed",
+        ErrorKind::EgressProbeFailed => "egress_probe_failed",
+        ErrorKind::EgressSubscriptionFailed => "egress_subscription_failed",
     }
 }

@@ -14,9 +14,14 @@ use anyhow::Result;
 use net_policy_client::Client;
 use net_policy_core::capture::{CaptureOpts, CaptureSession, CaptureTarget};
 use net_policy_core::config::{NetPolicySettings, ProcessRef, Rule, RuleSet, WgConfig};
+use net_policy_core::decrypt::{
+    CaStatus, DecryptArtifact, DecryptOpts, DecryptSession, DecryptTarget,
+};
+use net_policy_core::egress::{EgressFallback, EgressStatus};
 use net_policy_core::types::{
     BlockedEntry, ConnectionsSnapshot, DomainAssoc, LifecycleEvent, NetPolicyStatus,
-    ProcessCandidate, ProcessNode, RequestLogEntry, RouteEntry, TempDirectStatus, VerifyReport,
+    ProcessCandidate, ProcessNode, ProxyNode, RequestLogEntry, RouteEntry, TempDirectStatus,
+    VerifyReport,
 };
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -24,6 +29,10 @@ use tauri::{Emitter, State};
 
 /// 前端 `listen('net-policy://apply-progress')` 订阅的频道名（与既有前端约定一致）。
 pub const APPLY_PROGRESS_EVENT: &str = "net-policy://apply-progress";
+
+/// 前端 `listen('net-policy://egress-changed')` 订阅的频道名（minor 8，出口生命周期变迁）。
+/// **与 [`APPLY_PROGRESS_EVENT`] 分开推送**：前端不得由其一推断另一个（出口设计 §8.8 末段）。
+pub const EGRESS_CHANGED_EVENT: &str = "net-policy://egress-changed";
 
 /// 模块状态：瘦客户端下几乎无状态（保留结构以维持 AppState 装配不变）。
 #[allow(dead_code)]
@@ -63,6 +72,9 @@ pub fn setup(app: &tauri::AppHandle, _state: Arc<NetPolicyState>) -> Result<()> 
                         Ok(net_policy_core::protocol::Event::ApplyProgress { progress }) => {
                             let _ = app.emit(APPLY_PROGRESS_EVENT, progress);
                         }
+                        Ok(net_policy_core::protocol::Event::EgressChanged { egress }) => {
+                            let _ = app.emit(EGRESS_CHANGED_EVENT, egress);
+                        }
                         Ok(_) => {} // OperationFinished / ResyncRequired：前端以真实态对齐
                         Err(_) => break,
                     }
@@ -84,6 +96,7 @@ pub fn gen_artifacts(workspace: &std::path::Path) -> Result<(String, String)> {
         &rules,
         "<runtime-secret>",
         &net_policy_core::config::TempDirect::default(),
+        &net_policy_core::config::DecryptDivert::default(),
     );
     let note = "（防火墙脚本现由 net-policy-agent 提权生成/应用；预览仅 mihomo 配置）".to_string();
     Ok((cfg, note))
@@ -101,6 +114,19 @@ pub async fn net_policy_connections(
     _state: State<'_, AppState>,
 ) -> Result<ConnectionsSnapshot, String> {
     connect().await?.connections().await.map_err(estr)
+}
+
+#[tauri::command]
+pub async fn net_policy_proxy_nodes(_state: State<'_, AppState>) -> Result<Vec<ProxyNode>, String> {
+    connect().await?.proxy_nodes().await.map_err(estr)
+}
+
+#[tauri::command]
+pub async fn net_policy_test_proxy_node(
+    _state: State<'_, AppState>,
+    name: String,
+) -> Result<ProxyNode, String> {
+    connect().await?.test_proxy_node(name).await.map_err(estr)
 }
 
 #[tauri::command]
@@ -331,4 +357,213 @@ pub async fn net_policy_capture_read(
         data_base64,
         eof,
     })
+}
+
+// ============ L4 应用明文（Decrypt*/DecryptCa*，抓包设计 §17）============
+
+/// 查 CA 信任状态。
+#[tauri::command]
+pub async fn net_policy_decrypt_ca_status() -> Result<CaStatus, String> {
+    connect().await?.decrypt_ca_status().await.map_err(estr)
+}
+
+/// 生成专用调试 CA（agent 侧生成 + DPAPI 私钥保护；此步**不装信任库**）。
+#[tauri::command]
+pub async fn net_policy_decrypt_ca_create() -> Result<CaStatus, String> {
+    connect().await?.decrypt_ca_create().await.map_err(estr)
+}
+
+/// 把 CA 公钥装进当前用户 `CurrentUser\Root`（弹 Windows 确认框），实查验证后把指纹 + SID 交回 agent
+/// 复核（§17.4/§17.8）。返回复核后的 CA 状态。
+#[tauri::command]
+pub async fn net_policy_decrypt_ca_install() -> Result<CaStatus, String> {
+    let mut client = connect().await?;
+    // 1. 取 agent 侧 CA 指纹（DER SHA-256）与公钥 PEM。
+    let status = client.decrypt_ca_status().await.map_err(estr)?;
+    let thumbprint = status
+        .thumbprint
+        .ok_or_else(|| "CA 尚未创建（先点『创建调试 CA』）".to_string())?;
+    let cert_pem = client.decrypt_ca_export_public().await.map_err(estr)?;
+    // 2. 在当前用户上下文装信任库 + 实查验证（阻塞调用放 spawn_blocking）。
+    let tp = thumbprint.clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        crate::ca_trust::install_current_user_root(&cert_pem, &tp)
+    })
+    .await
+    .map_err(|e| format!("安装任务失败：{e}"))?
+    .map_err(estr)?;
+    // 3. 取当前用户 SID。
+    let sid = tauri::async_runtime::spawn_blocking(crate::ca_trust::current_user_sid)
+        .await
+        .map_err(|e| format!("取 SID 任务失败：{e}"))?
+        .map_err(estr)?;
+    // 4. 交回 agent 复核（指纹须与 agent 本地一致）。
+    client
+        .decrypt_ca_confirm(thumbprint, sid)
+        .await
+        .map_err(estr)
+}
+
+/// 移除本产品 CA：先从 `CurrentUser\Root` 精确删证书（best-effort），再让 agent 删私钥/记录。
+#[tauri::command]
+pub async fn net_policy_decrypt_ca_remove() -> Result<CaStatus, String> {
+    let mut client = connect().await?;
+    // 先拿指纹以便精确删信任库证书。
+    if let Ok(status) = client.decrypt_ca_status().await {
+        if let Some(tp) = status.thumbprint {
+            let _ = tauri::async_runtime::spawn_blocking(move || {
+                crate::ca_trust::remove_current_user_root(&tp)
+            })
+            .await;
+        }
+    }
+    client.decrypt_ca_remove().await.map_err(estr)
+}
+
+/// 开始明文会话（精确进程实例 + 必填域名 allowlist）。
+#[tauri::command]
+pub async fn net_policy_decrypt_start(
+    target: DecryptTarget,
+    opts: DecryptOpts,
+) -> Result<DecryptSession, String> {
+    connect()
+        .await?
+        .decrypt_start(target, opts)
+        .await
+        .map_err(estr)
+}
+
+/// 停止明文会话（幂等）。
+#[tauri::command]
+pub async fn net_policy_decrypt_stop(id: String) -> Result<DecryptSession, String> {
+    connect().await?.decrypt_stop(id).await.map_err(estr)
+}
+
+/// 取单个会话当前态（含每域名计数）。
+#[tauri::command]
+pub async fn net_policy_decrypt_get(id: String) -> Result<DecryptSession, String> {
+    connect().await?.decrypt_get(id).await.map_err(estr)
+}
+
+/// 列出所有明文会话。
+#[tauri::command]
+pub async fn net_policy_decrypt_list() -> Result<Vec<DecryptSession>, String> {
+    connect().await?.decrypt_list().await.map_err(estr)
+}
+
+/// 删除会话（运行态返回冲突）。
+#[tauri::command]
+pub async fn net_policy_decrypt_delete(id: String) -> Result<(), String> {
+    connect().await?.decrypt_delete(id).await.map_err(estr)
+}
+
+/// 分块读取 done 会话产物（manifest / http.jsonl）。
+#[tauri::command]
+pub async fn net_policy_decrypt_read(
+    id: String,
+    artifact: DecryptArtifact,
+    offset: u64,
+    len: u32,
+) -> Result<CaptureChunkDto, String> {
+    let (offset, data_base64, eof) = connect()
+        .await?
+        .decrypt_read(id, artifact, offset, len)
+        .await
+        .map_err(estr)?;
+    Ok(CaptureChunkDto {
+        offset,
+        data_base64,
+        eof,
+    })
+}
+
+// ============ 统一出口（Egress*，minor 8，出口设计 §8.8）============
+//
+// 六个操作语义互不重叠：list 只读；probe 只测不改状态；start/stop 改生命周期；reconnect
+// 重建会话；set_fallback 改不可用时的行为。改导流策略（谁用哪个出口）不在这里，走既有的
+// `net_policy_save_settings` / `net_policy_save_rule`。全部回出口全量清单，供前端整表刷新。
+
+/// 出口全量清单（生命周期与策略选中分两个字段，前端不得由其一推断另一个）。
+#[tauri::command]
+pub async fn net_policy_egress_list(
+    _state: State<'_, AppState>,
+) -> Result<Vec<EgressStatus>, String> {
+    connect().await?.egress_list().await.map_err(estr)
+}
+
+/// 启动出口（渲染进配置 + 立即探测）。**不改变任何导流规则。**
+#[tauri::command]
+pub async fn net_policy_egress_start(
+    _state: State<'_, AppState>,
+    id: String,
+) -> Result<Vec<EgressStatus>, String> {
+    connect().await?.egress_start(id).await.map_err(estr)
+}
+
+/// 停止出口（从配置摘除；指向它的规则按 fallback 处理，默认阻断）。
+#[tauri::command]
+pub async fn net_policy_egress_stop(
+    _state: State<'_, AppState>,
+    id: String,
+) -> Result<Vec<EgressStatus>, String> {
+    connect().await?.egress_stop(id).await.map_err(estr)
+}
+
+/// 立即重连（重建会话，不改导流）。
+#[tauri::command]
+pub async fn net_policy_egress_reconnect(
+    _state: State<'_, AppState>,
+    id: String,
+) -> Result<Vec<EgressStatus>, String> {
+    connect().await?.egress_reconnect(id).await.map_err(estr)
+}
+
+/// 仅测试连接：探测一次，不改生命周期也不改导流策略。
+#[tauri::command]
+pub async fn net_policy_egress_probe(
+    _state: State<'_, AppState>,
+    id: String,
+) -> Result<Vec<EgressStatus>, String> {
+    connect().await?.egress_probe(id).await.map_err(estr)
+}
+
+/// 设置出口不可用时的处理方式（阻断 / 明确允许回落直连）。
+#[tauri::command]
+pub async fn net_policy_egress_set_fallback(
+    _state: State<'_, AppState>,
+    id: String,
+    fallback: EgressFallback,
+) -> Result<Vec<EgressStatus>, String> {
+    connect()
+        .await?
+        .egress_set_fallback(id, fallback)
+        .await
+        .map_err(estr)
+}
+
+/// 刷新当前代理订阅，不主动重连当前节点。
+#[tauri::command]
+pub async fn net_policy_egress_refresh_subscription(
+    _state: State<'_, AppState>,
+    id: String,
+) -> Result<Vec<EgressStatus>, String> {
+    connect()
+        .await?
+        .egress_refresh_subscription(id)
+        .await
+        .map_err(estr)
+}
+
+/// 切换当前代理订阅节点。
+#[tauri::command]
+pub async fn net_policy_egress_select_node(
+    _state: State<'_, AppState>,
+    id: String,
+    node: String,
+) -> Result<Vec<EgressStatus>, String> {
+    connect()
+        .await?
+        .egress_select_node(id, node)
+        .await
+        .map_err(estr)
 }

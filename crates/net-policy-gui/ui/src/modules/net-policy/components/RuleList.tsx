@@ -1,6 +1,7 @@
 import { Plus, Trash2 } from 'lucide-react'
 import type { ConnectionsSnapshot, Route, Rule, RuleKind, RuleSet } from '../api/tauri-client'
 import { btn, KIND_LABELS } from '../uiHelpers'
+import { EgressSelect } from './EgressSelect'
 
 /** 规则页的新增表单与用户规则列表。 */
 export function RuleList({
@@ -26,10 +27,10 @@ export function RuleList({
     <div className="space-y-4">
       <div className="flex flex-wrap items-center justify-between gap-2 text-xs text-gray-500">
         <span>
-          命中规则走指定出口；未命中默认{curRoute === 'wg' ? '走海外' : curRoute === 'blackhole' ? '阻断' : '直连'}。
+          命中规则走指定出口；未命中默认{curRoute === 'wg' ? '走海外' : curRoute === 'proxy' ? '走代理订阅' : curRoute === 'blackhole' ? '阻断' : '直连'}。
         </span>
         <span className="text-xs text-gray-500">
-          活跃：直连 {conns.direct_count} · 海外 {conns.wg_count}
+          活跃：直连 {conns.direct_count} · 海外 {conns.wg_count} · 代理 {conns.proxy_count}
         </span>
       </div>
       <div className="flex flex-wrap items-end gap-2 rounded-lg bg-gray-100 p-3 text-sm dark:bg-gray-800/50">
@@ -40,18 +41,17 @@ export function RuleList({
         <input className="flex-1 rounded border px-2 py-1 dark:bg-gray-800 dark:border-gray-700" placeholder="值（如 steam.exe / ctrip / example.cn / 1.2.3.0/24）"
           value={newRule.value} onChange={e => setNewRule({ ...newRule, value: e.target.value })}
           onKeyDown={e => e.key === 'Enter' && addRule()} />
-        <select className="rounded border px-2 py-1 dark:bg-gray-800 dark:border-gray-700" value={newRule.route}
-          onChange={e => setNewRule({ ...newRule, route: e.target.value as Route })}>
-          <option value="direct">本地直连</option>
-          <option value="wg">走 VPN</option>
-          <option value="blackhole">阻断</option>
-        </select>
+        <EgressSelect
+          className="rounded border px-2 py-1 dark:bg-gray-800 dark:border-gray-700"
+          value={newRule.route}
+          onChange={(route) => setNewRule({ ...newRule, route })}
+        />
         <button className={btn('primary')} onClick={addRule} disabled={busy}><Plus size={14} /> 添加</button>
       </div>
       <ul className="divide-y divide-gray-200 rounded-lg border border-gray-200 bg-white px-3 text-sm dark:divide-gray-800 dark:border-gray-800 dark:bg-gray-900">
         {rules.rules.length === 0 && (
           <li className="py-2 text-gray-500">
-            暂无规则——未命中流量全部{curRoute === 'wg' ? '走海外 VPN' : curRoute === 'blackhole' ? '被阻断（空出口）' : '原样直连（观察）'}。
+            暂无规则——未命中流量全部{curRoute === 'wg' ? '走海外 VPN' : curRoute === 'proxy' ? '走代理订阅' : curRoute === 'blackhole' ? '被阻断（空出口）' : '原样直连（观察）'}。
           </li>
         )}
         {rules.rules.map((r, i) => (
@@ -61,9 +61,10 @@ export function RuleList({
             <span className={`rounded px-1.5 py-0.5 text-xs ${
               r.route === 'direct' ? 'bg-gray-100 text-gray-700' :
               r.route === 'wg' ? 'bg-blue-100 text-blue-800' :
+              r.route === 'proxy' ? 'bg-violet-100 text-violet-800' :
               'bg-red-100 text-red-700'
             }`}>
-              {r.route === 'direct' ? '直连' : r.route === 'wg' ? 'VPN' : '阻断'}
+              {r.route === 'direct' ? '直连' : r.route === 'wg' ? 'VPN' : r.route === 'proxy' ? '代理订阅' : '阻断'}
             </span>
             <button className="text-gray-400 hover:text-red-600" onClick={() => deleteRule(r)} disabled={busy} title="删除">
               <Trash2 size={14} />

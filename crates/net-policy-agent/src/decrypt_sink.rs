@@ -141,6 +141,28 @@ impl FlowSink for DecryptSink {
         );
         self.emit(frame.domain, &ev);
     }
+
+    /// 未拦截透传（allowlist miss）：只记 per-domain passthrough，不落任何明文（§17.9）。
+    fn on_passthrough(&self, domain: &str) {
+        if let Ok(mut inner) = self.inner.lock() {
+            inner
+                .per_domain
+                .entry(domain.to_string())
+                .or_default()
+                .passthrough += 1;
+        }
+    }
+
+    /// 客户端拒绝伪造叶子证书（pinning/自带 CA/mTLS，§17.7）：记 per-domain pinned，诚实不宣称解密。
+    fn on_client_cert_rejected(&self, domain: &str) {
+        if let Ok(mut inner) = self.inner.lock() {
+            inner
+                .per_domain
+                .entry(domain.to_string())
+                .or_default()
+                .pinned += 1;
+        }
+    }
 }
 
 /// L4 MITM 数据面 spike（方案 B 验证）：前台起一个 loopback 显式 MITM 代理，上游按域名链到 mihomo，
@@ -193,6 +215,7 @@ pub fn run_mitm_spike(
         cert_cache,
         sink,
         should_intercept,
+        expected_proxy_authorization: None,
     };
     let upstream = Arc::new(Upstream::parse(upstream).context("--upstream 解析失败")?);
     let shutdown = ShutdownToken::new();
@@ -245,6 +268,26 @@ mod tests {
         // 每域名计数
         let pd = sink.per_domain();
         assert_eq!(pd.get("api.example.com").unwrap().decrypted, 2);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn passthrough_and_pinned_counters_no_plaintext() {
+        let path = tmp("audit.jsonl");
+        let _ = std::fs::remove_file(&path);
+        let sink = DecryptSink::create(&path, DecryptOpts::default()).unwrap();
+        // allowlist miss（透传）与 pinning 拒证：只记计数，绝不落明文行。
+        sink.on_passthrough("cdn.example.com");
+        sink.on_passthrough("cdn.example.com");
+        sink.on_client_cert_rejected("pinned.example.com");
+        let pd = sink.per_domain();
+        assert_eq!(pd.get("cdn.example.com").unwrap().passthrough, 2);
+        assert_eq!(pd.get("cdn.example.com").unwrap().decrypted, 0);
+        assert_eq!(pd.get("pinned.example.com").unwrap().pinned, 1);
+        assert_eq!(pd.get("pinned.example.com").unwrap().decrypted, 0);
+        // http.jsonl 不因审计事件产生任何行。
+        let content = std::fs::read_to_string(&path).unwrap_or_default();
+        assert!(content.is_empty(), "审计事件不落明文");
         let _ = std::fs::remove_file(&path);
     }
 

@@ -47,11 +47,26 @@ const MAX_DETAIL: usize = 200;
 fn classify(chains: &[String]) -> &'static str {
     if chains.iter().any(|c| c.eq_ignore_ascii_case("wg-out")) {
         "wg-out"
+    } else if chains
+        .iter()
+        .any(|c| c.eq_ignore_ascii_case("subscription-out"))
+    {
+        "subscription-out"
     } else if chains.iter().any(|c| c.eq_ignore_ascii_case("DIRECT")) {
         "DIRECT"
     } else {
         "other"
     }
+}
+
+fn is_mihomo_process(name: &str, path: &str) -> bool {
+    let process = name.trim().trim_matches('"');
+    if process.eq_ignore_ascii_case("mihomo") || process.eq_ignore_ascii_case("mihomo.exe") {
+        return true;
+    }
+    path.rsplit(['\\', '/']).next().is_some_and(|file| {
+        file.eq_ignore_ascii_case("mihomo.exe") || file.eq_ignore_ascii_case("mihomo")
+    })
 }
 
 /// 拉取活跃连接快照。失败一律返回空快照，不报错。
@@ -75,9 +90,13 @@ async fn fetch_inner(secret: &str) -> anyhow::Result<ConnectionsSnapshot> {
     let mut snap = ConnectionsSnapshot::empty();
     snap.available = true;
     for rc in raw.connections {
+        if is_mihomo_process(&rc.metadata.process, &rc.metadata.process_path) {
+            continue;
+        }
         let outbound = classify(&rc.chains);
         match outbound {
             "wg-out" => snap.wg_count += 1,
+            "subscription-out" => snap.proxy_count += 1,
             "DIRECT" => snap.direct_count += 1,
             _ => snap.other_count += 1,
         }
@@ -102,6 +121,32 @@ async fn fetch_inner(secret: &str) -> anyhow::Result<ConnectionsSnapshot> {
             });
         }
     }
-    snap.total = snap.wg_count + snap.direct_count + snap.other_count;
+    snap.total = snap.wg_count + snap.proxy_count + snap.direct_count + snap.other_count;
     Ok(snap)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{classify, is_mihomo_process};
+
+    #[test]
+    fn classify_subscription_out_separately() {
+        assert_eq!(
+            classify(&["node-a".into(), "subscription-out".into()]),
+            "subscription-out"
+        );
+    }
+
+    #[test]
+    fn mihomo_self_connections_are_filtered() {
+        assert!(is_mihomo_process("mihomo", ""));
+        assert!(is_mihomo_process(
+            "",
+            r"C:\Program Files\net-policy\mihomo.exe"
+        ));
+        assert!(!is_mihomo_process(
+            "chrome.exe",
+            r"C:\Program Files\Google\Chrome\chrome.exe"
+        ));
+    }
 }

@@ -3,7 +3,7 @@ import type { Status, ConnectionsSnapshot, Settings } from '../api/tauri-client'
 
 /**
  * 数据通路全景图（设计 §3.1）：
- *   本机应用 → TUN(Meta) → DNS 劫持(fake-ip) → 规则引擎 → DIRECT / wg-out 双分支
+ *   本机应用 → TUN(Meta) → DNS 劫持(fake-ip) → 规则引擎 → DIRECT / wg-out / subscription-out
  *            → 物理网卡(kill-switch 围栏) → 海外出口 IP
  *
  * 节点按实时状态点亮（绿=正常 / 黄=就绪中或降级 / 灰=未起 / 红=阻断）。
@@ -126,6 +126,7 @@ export function FlowTopology({
   const engineState: NodeState = running ? 'on' : 'off'
   const wgState: NodeState = conns.wg_count > 0 ? 'on' : running ? 'warn' : 'off'
   const directState: NodeState = conns.direct_count > 0 ? 'on' : running ? 'warn' : 'off'
+  const proxyState: NodeState = conns.proxy_count > 0 ? 'on' : running && settings?.proxy_subscriptions.active != null ? 'warn' : 'off'
   // 围栏：默认 Block 生效（fail-closed）= block 色；未生效（预览）= warn；未应用 = off。
   const fenceState: NodeState = fwActive && ruleCount > 0 ? 'block' : status.applied ? 'warn' : 'off'
   const exitState: NodeState = conns.wg_count > 0 && tun ? 'on' : running ? 'warn' : 'off'
@@ -158,8 +159,8 @@ export function FlowTopology({
 
         <div className="flex justify-center"><VArrow /></div>
 
-        {/* 双分支 */}
-        <div className="grid grid-cols-2 gap-3">
+        {/* 出口分支 */}
+        <div className="grid grid-cols-1 gap-3 sm:grid-cols-3">
           <Node
             icon={<Network size={18} />}
             title="DIRECT 本地直连"
@@ -174,6 +175,13 @@ export function FlowTopology({
             state={wgState}
             prov="applied"
           />
+          <Node
+            icon={<Globe2 size={18} />}
+            title="subscription-out 代理订阅"
+            sub={settings?.proxy_subscriptions.active != null ? `${conns.proxy_count} 活跃连接 · 订阅 ${settings.proxy_subscriptions.active + 1}` : '未激活订阅'}
+            state={proxyState}
+            prov="applied"
+          />
         </div>
 
         {/* 默认出口（未命中任何规则的兜底 MATCH）——直连=灰/原样观察，海外=蓝/全走 SBN，黑洞=红/空出口。 */}
@@ -184,6 +192,8 @@ export function FlowTopology({
                 ? 'border-red-300 bg-red-50 text-red-700 dark:border-red-500/50 dark:bg-red-950/40 dark:text-red-300'
                 : status.default_route === 'wg'
                   ? 'border-blue-300 bg-blue-50 text-blue-700 dark:border-blue-500/50 dark:bg-blue-950/40 dark:text-blue-300'
+                  : status.default_route === 'proxy'
+                    ? 'border-violet-300 bg-violet-50 text-violet-700 dark:border-violet-500/50 dark:bg-violet-950/40 dark:text-violet-300'
                   : 'border-gray-300 bg-gray-50 text-gray-600 dark:border-gray-600 dark:bg-gray-800/40 dark:text-gray-300'
             }`}
             title="未命中任何分流规则时的兜底出口"
@@ -194,6 +204,8 @@ export function FlowTopology({
                 ? '⛔ 阻断 · 空出口（未放行的一律上不去）'
                 : status.default_route === 'wg'
                   ? '🌐 海外 · 全走 SBN'
+                  : status.default_route === 'proxy'
+                    ? '☁ 代理订阅 · 当前激活节点组'
                   : '↪ 直连 · 原样观察（不改流量）'}
             </span>
           </div>

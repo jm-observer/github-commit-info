@@ -45,7 +45,26 @@ async fn run_operation<F>(
 where
     F: FnOnce(Arc<AgentState>) -> WorkFut + Send + 'static,
 {
-    let id = match state.try_begin_op(kind) {
+    run_operation_ex(state, kind, false, work).await
+}
+
+/// 与 [`run_operation`] 相同，但 `internal=true` 时用 [`AgentState::try_begin_op_internal`]——
+/// 会话生命周期内部触发的 reload（自动导流）不因自身活跃会话而 conflict。
+async fn run_operation_ex<F>(
+    state: Arc<AgentState>,
+    kind: OperationKind,
+    internal: bool,
+    work: F,
+) -> Result<NetPolicyStatus, OpError>
+where
+    F: FnOnce(Arc<AgentState>) -> WorkFut + Send + 'static,
+{
+    let begin = if internal {
+        state.try_begin_op_internal(kind)
+    } else {
+        state.try_begin_op(kind)
+    };
+    let id = match begin {
         Some(i) => i,
         None => return Err(OpError::Conflict),
     };
@@ -80,6 +99,17 @@ pub async fn run_stop_operation(state: Arc<AgentState>) -> Result<NetPolicyStatu
 /// 热重载。
 pub async fn run_reload_operation(state: Arc<AgentState>) -> Result<NetPolicyStatus, OpError> {
     run_operation(state, OperationKind::Reload, |st| Box::pin(do_reload(st))).await
+}
+
+/// 会话生命周期内部热重载（L4 自动导流用）：不因自身活跃解密会话而 conflict（见
+/// [`AgentState::try_begin_op_internal`]）。仍与并发的用户长操作互斥（拿不到 → Conflict，由调用方重试）。
+pub async fn run_reload_operation_internal(
+    state: Arc<AgentState>,
+) -> Result<NetPolicyStatus, OpError> {
+    run_operation_ex(state, OperationKind::Reload, true, |st| {
+        Box::pin(do_reload(st))
+    })
+    .await
 }
 
 /// 主开关（开→apply、关→stop；失败回滚 enabled）。
@@ -160,6 +190,118 @@ pub async fn run_clear_temp_direct(state: Arc<AgentState>) -> Result<TempDirectS
     }
     state.record_event("temp_direct_off", "manual");
     Ok(state.temp_status())
+}
+
+// ── 出口生命周期操作（出口设计 §4/§5.2）────────────────────────────────────
+//
+// 关键约束：**这些操作只动出口，不动导流规则**。切换策略走 SaveSettings/规则接口，两者分开
+// （设计 §8.3：「启动并连接」「测试连接」「设为默认出口」是三个不同操作）。
+
+/// 把当前出口偏好落盘（决议 §7.3：启停意图与 fallback 必须跨重启存活）。
+///
+/// 失败只记日志不阻断操作：本次运行的行为已经正确，丢的只是「下次开机能否记住」，
+/// 为此让用户的停用操作整个失败反而更糟。
+fn persist_egress_prefs(state: &AgentState) {
+    let mut settings = match config::try_load_settings(&state.workspace) {
+        Ok(s) => s,
+        Err(e) => {
+            log::warn!("出口偏好落盘失败（读设置）：{e:#}");
+            return;
+        }
+    };
+    settings.egress_prefs = state.egress.prefs();
+    if let Err(e) = config::save_settings(&state.workspace, &settings) {
+        log::warn!("出口偏好落盘失败（写设置）：{e:#}");
+    }
+}
+
+/// 设置某出口不可用时的 fallback 行为，并持久化。
+pub fn set_egress_fallback(
+    state: &AgentState,
+    id: &str,
+    fallback: net_policy_core::egress::EgressFallback,
+) -> Result<(), OpError> {
+    if state.egress.set_fallback(id, fallback).is_none() {
+        return Err(OpError::Failed(format!("未知出口：{id}")));
+    }
+    persist_egress_prefs(state);
+    state.record_event("egress_fallback", &format!("{id}={fallback:?}"));
+    state.publish_egress(id);
+    Ok(())
+}
+
+/// 启动 / 停止一个出口——**事务化**：改运行态 → reload 让配置真的生效；reload 失败即回滚，
+/// 不制造「UI 说停了、mihomo 还在用」的分裂。启动后立刻主动探测一次（不等下一个探活周期）。
+pub async fn run_set_egress_up(state: Arc<AgentState>, id: &str, up: bool) -> Result<(), OpError> {
+    let Some(prev) = state.egress.set_desired_up(id, up) else {
+        return Err(OpError::Failed(format!("未知出口：{id}")));
+    };
+    let needs_start_recovery = up
+        && prev == up
+        && state
+            .egress
+            .lifecycle(id)
+            .is_some_and(|lifecycle| !lifecycle.accepts_traffic());
+    if prev == up && !needs_start_recovery {
+        return Ok(()); // 幂等：状态没变且出口仍可承载流量时不必 reload。
+    }
+    if let Err(err) = run_reload_operation_internal(state.clone()).await {
+        let primary = err.to_string();
+        state.egress.set_desired_up(id, prev);
+        return Err(OpError::Failed(with_rollback(
+            primary,
+            run_reload_operation_internal(state.clone())
+                .await
+                .map(|_| ())
+                .map_err(|e| e.to_string()),
+        )));
+    }
+    persist_egress_prefs(&state);
+    state.record_event(if up { "egress_start" } else { "egress_stop" }, id);
+    if up {
+        probe_and_publish(state, id.to_string()).await;
+    } else {
+        state.publish_egress(id);
+    }
+    Ok(())
+}
+
+/// 立即重连：重置该出口上的存量连接后重新探测。**只影响这一个出口**，不碰导流策略，
+/// 也不重启 mihomo。
+pub async fn run_egress_reconnect(state: Arc<AgentState>, id: &str) -> Result<(), OpError> {
+    if !state.egress.exists(id) {
+        return Err(OpError::Failed(format!("未知出口：{id}")));
+    }
+    if !state.egress.desired_up(id) {
+        return Err(OpError::Failed("出口已停止，请先启动它".into()));
+    }
+    state.egress.bump_reconnect(id);
+    state.publish_egress(id);
+    let secret = { state.rt.lock().unwrap().secret.clone() };
+    if let (Some(secret), Some(outbound)) = (
+        secret.filter(|s| !s.is_empty()),
+        net_policy_core::egress::egress_id_route(id).map(|r| r.outbound()),
+    ) {
+        // best-effort：连接重置失败不该阻止重新探测（探测本身就会重建隧道）。
+        if let Err(e) = crate::egress::reset_egress_connections(&secret, outbound).await {
+            log::warn!("重置出口 {id} 的连接失败：{e:#}");
+        }
+    }
+    probe_and_publish(state, id.to_string()).await;
+    Ok(())
+}
+
+/// 执行一次探测并推进状态机，变迁时推 `EgressChanged` 事件。
+pub async fn probe_and_publish(state: Arc<AgentState>, id: String) {
+    let settings = match config::try_load_settings(&state.workspace) {
+        Ok(s) => s,
+        Err(_) => return,
+    };
+    let secret = { state.rt.lock().unwrap().secret.clone() };
+    let outcome = crate::egress::probe(&id, &settings, secret.as_deref()).await;
+    if state.egress.record_probe(&id, &outcome) {
+        state.publish_egress(&id);
+    }
 }
 
 /// 过期还原：仅当未被后续 set/clear 取代（gen 未变）时执行；reload 带重试，持续失败则记危险事件
@@ -320,7 +462,17 @@ async fn do_apply(state: Arc<AgentState>) -> Result<(), String> {
             // 本次不需要 kill-switch，但可能残留上次 Blackhole/Wg 的痕迹（含半残留），主动撤掉。
             let _ = firewall::remove(&ws);
         }
-        if let Err(err) = engine::write_config(&ws, &settings, &rules, &secret, &temp) {
+        if let Err(err) =
+            engine::write_config(
+                &ws,
+                &settings,
+                &rules,
+                &secret,
+                &temp,
+                &state.decrypt.active_divert(),
+                &state.egress_view(),
+            )
+        {
             state.emit_progress(1, "fail", Some(format!("{}{rollback_note}", e(&err))));
             return Err(with_rollback(
                 format!("write mihomo config：{}{rollback_note}", e(err)),
@@ -447,6 +599,14 @@ async fn do_stop(state: Arc<AgentState>) -> Result<(), String> {
         rt.secret = None;
         rt.firewall_signature = None;
     }
+    state.egress.mark_engine_stopped();
+    for id in [
+        net_policy_core::egress::EGRESS_DIRECT,
+        net_policy_core::egress::EGRESS_WG,
+        net_policy_core::egress::EGRESS_PROXY,
+    ] {
+        state.publish_egress(id);
+    }
     // 手动停止 → 清 enabled（下次启动不自动恢复）。
     if let Ok(mut s) = config::try_load_settings(&state.workspace) {
         if s.enabled {
@@ -500,9 +660,21 @@ async fn do_reload(state: Arc<AgentState>) -> Result<(), String> {
         if firewall_needs_sync {
             firewall::apply_base(&ws, &settings, &bin).map_err(e)?;
         }
-        if let Err(err) = engine::write_config(&ws, &settings, &rules, &secret, &temp)
-            .and_then(|_| engine::reload(&ws, &secret))
-        {
+        if let Err(err) = engine::write_config(
+            &ws,
+            &settings,
+            &rules,
+            &secret,
+            &temp,
+            &state.decrypt.active_divert(),
+            &state.egress_view(),
+        )
+        .and_then(|_| {
+            // reload 会重建 mihomo 的 outbound（决议 §4 承认的已知边界）。开静默窗口，免得
+            // 重建期间的探测失败被状态机读成「出口掉线并重连」（§7.2）。
+            state.egress.begin_reload_quiet_window();
+            engine::reload(&ws, &secret)
+        }) {
             if want && !up {
                 let _ = firewall::remove(&ws);
             }

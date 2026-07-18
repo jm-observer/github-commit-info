@@ -253,6 +253,9 @@ export function CurrentStateSection({
             <span className="rounded bg-blue-100 px-2 py-1 text-blue-800 dark:bg-blue-950/50 dark:text-blue-300">
               WG {conns.wg_count}
             </span>
+            <span className="rounded bg-violet-100 px-2 py-0.5 text-violet-700 dark:bg-violet-950/40 dark:text-violet-300">
+              代理 {conns.proxy_count}
+            </span>
             {conns.other_count > 0 && (
               <span className="rounded bg-gray-100 px-2 py-1 dark:bg-gray-800">其它 {conns.other_count}</span>
             )}

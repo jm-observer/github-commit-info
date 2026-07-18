@@ -53,7 +53,11 @@ impl MitmSession {
     }
 
     #[cfg(test)]
-    pub(super) fn new_for_test(domain: String, session_id: String, sink: Arc<dyn FlowSink>) -> Self {
+    pub(super) fn new_for_test(
+        domain: String,
+        session_id: String,
+        sink: Arc<dyn FlowSink>,
+    ) -> Self {
         Self {
             domain,
             session_id,

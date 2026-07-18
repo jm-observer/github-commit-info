@@ -92,7 +92,7 @@ function resolveState(s: Status): BannerState {
   return {
     name: '受保护 · fail-closed',
     tone: 'green',
-    meaning: '未知流量默认走海外；引擎/隧道断开则物理网卡全阻断，不泄漏。',
+    meaning: '未知流量默认走所选受控出口；引擎或出口断开时物理网卡全阻断，不泄漏。',
     next: '正常运行中。可用「一键验证」抽查出口 IP / DNS 劫持。',
     Icon: ShieldCheck,
   }

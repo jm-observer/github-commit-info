@@ -97,8 +97,8 @@ export function LiveStatusPanel({
   const ksOn = ksRules > 0
   const tun = status.tun_ready
   const route = status.default_route
-  const routeLabel = route === 'wg' ? '海外 · 全 VPN' : route === 'blackhole' ? '阻断 · 收紧' : '直连 · 观察'
-  const routeTone: Tone = route === 'wg' ? 'blue' : route === 'blackhole' ? 'block' : 'gray'
+  const routeLabel = route === 'wg' ? '海外 · 全 VPN' : route === 'proxy' ? '代理订阅' : route === 'blackhole' ? '阻断 · 收紧' : '直连 · 观察'
+  const routeTone: Tone = route === 'wg' || route === 'proxy' ? 'blue' : route === 'blackhole' ? 'block' : 'gray'
 
   const dnsCase = verify?.cases?.find((c) => c.id === 'dns-hijack')
   const dnsValue = dnsCase ? (dnsCase.status === 'passed' ? '通过' : dnsCase.status === 'failed' ? '失败' : dnsCase.status) : '未自检'

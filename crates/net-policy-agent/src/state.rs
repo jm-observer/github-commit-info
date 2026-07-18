@@ -70,8 +70,13 @@ pub struct AgentState {
     pub store: Arc<Store>,
     /// 临时直连（限时应急）运行态。
     temp: Mutex<TempState>,
-    /// 抓包会话管理（单会话；真实 pktmon 后端，抓包设计 §7）。独立锁，与 op_flag 不共用。
+    /// 抓包会话管理（单会话；真实 pktmon 后端，抓包设计 §7）。入口与 op_flag/L4 做互斥检查。
     pub capture: crate::capture::CaptureManager,
+    /// L4 解密会话 + CA 管理（单会话；自研 net-policy-mitm 引擎，抓包设计 §17）。
+    pub decrypt: crate::decrypt_manager::DecryptManager,
+    /// 出口生命周期（Direct/WireGuard/Proxy）。**独立于流量导流**：出口是否连着与是否被策略
+    /// 选中是两个维度（出口设计 §2.1）。
+    pub egress: crate::egress::EgressManager,
 }
 
 impl AgentState {
@@ -79,6 +84,7 @@ impl AgentState {
         let (events, _) = broadcast::channel(EVENT_CHANNEL_CAP);
         let store = Arc::new(Store::open_or_memory(&workspace));
         let capture = crate::capture::CaptureManager::new(&workspace);
+        let decrypt = crate::decrypt_manager::DecryptManager::new(&workspace);
         Self {
             workspace,
             dev,
@@ -92,6 +98,31 @@ impl AgentState {
             store,
             temp: Mutex::new(TempState::default()),
             capture,
+            decrypt,
+            egress: crate::egress::EgressManager::new(),
+        }
+    }
+
+    /// 配置生成用的出口运行态视图（被显式停用的出口 + 各自 fallback）。
+    pub fn egress_view(&self) -> net_policy_core::egress::EgressRuntimeView {
+        self.egress.view()
+    }
+
+    /// 当前出口清单（合并磁盘上的 settings/rules 与运行态）。设置损坏时退回默认值——
+    /// 出口面是只读观测，不该因配置损坏而整个不可见。
+    pub fn egress_list(&self) -> Vec<net_policy_core::egress::EgressStatus> {
+        let settings = config::try_load_settings(&self.workspace).unwrap_or_default();
+        let rules = config::try_load_rules(&self.workspace).unwrap_or_default();
+        self.egress.list(&settings, &rules)
+    }
+
+    /// 推送单个出口的生命周期变迁。**与策略事件分开**：前端收到它只更新出口卡片，
+    /// 不得据此推断导流已变（出口设计 §8.8）。
+    pub fn publish_egress(&self, id: &str) {
+        if let Some(egress) = self.egress_list().into_iter().find(|e| e.id == id) {
+            self.emit(ProtoEvent::EgressChanged {
+                egress: Box::new(egress),
+            });
         }
     }
 
@@ -204,10 +235,26 @@ impl AgentState {
 
     // ── operation 作业追踪 ───────────────────────────────────────────────────
 
-    /// 尝试开始一个长操作。返回 `Some(id)` 表示占用成功；`None` = 已有操作在跑（立即 conflict）。
+    /// 尝试开始一个长操作。返回 `Some(id)` 表示占用成功；`None` = 已有操作在跑或有活跃抓包/解密会话
+    /// （立即 conflict）。用户发起的 apply/reload/stop 走这个（§7：不干扰活跃会话）。
     pub fn try_begin_op(&self, kind: OperationKind) -> Option<u64> {
+        self.try_begin_op_inner(kind, false)
+    }
+
+    /// **会话生命周期内部**用（如 L4 解密起停时的自动导流 reload）：只与其它长操作互斥，**不**因
+    /// 自身的活跃抓包/解密会话而 conflict——否则 reload 会被它要服务的那个会话挡死（§17.3 导流）。
+    pub fn try_begin_op_internal(&self, kind: OperationKind) -> Option<u64> {
+        self.try_begin_op_inner(kind, true)
+    }
+
+    fn try_begin_op_inner(&self, kind: OperationKind, allow_active_session: bool) -> Option<u64> {
         let mut flag = self.op_flag.lock().unwrap();
         if *flag {
+            return None;
+        }
+        if !allow_active_session
+            && (self.capture.active_id().is_some() || self.decrypt.active_id().is_some())
+        {
             return None;
         }
         *flag = true;
@@ -412,6 +459,26 @@ pub fn setup(state: std::sync::Arc<AgentState>) {
                     if !s.is_empty() {
                         let snap = crate::connections::fetch(&s).await;
                         st.obs.ingest_connections(&snap.connections);
+                        // 出口的「使用状态」层（决议 §3.4）：此刻真的有多少连接在走它。
+                        // 与「策略选中」严格区分——规则指了但没人访问时这里就是 0。
+                        st.egress.set_active_connections(
+                            [
+                                (
+                                    net_policy_core::egress::EGRESS_WG.to_string(),
+                                    snap.wg_count,
+                                ),
+                                (
+                                    net_policy_core::egress::EGRESS_PROXY.to_string(),
+                                    snap.proxy_count,
+                                ),
+                                (
+                                    net_policy_core::egress::EGRESS_DIRECT.to_string(),
+                                    snap.direct_count,
+                                ),
+                            ]
+                            .into_iter()
+                            .collect(),
+                        );
                         let ts = now_ms();
                         for c in &snap.connections {
                             if c.host.trim().is_empty() && c.destination_ip.trim().is_empty() {
@@ -452,6 +519,12 @@ pub fn setup(state: std::sync::Arc<AgentState>) {
         }
     }
 
+    // 出口偏好回填（决议 §7.3）：必须在自动 apply **之前**，否则首次生成的配置会带上被用户
+    // 停用的出口，等于开机瞬间恢复了一条用户已经关掉的出口。
+    if let Ok(s) = config::try_load_settings(&state.workspace) {
+        state.egress.hydrate(&s.egress_prefs);
+    }
+
     let auto_apply = match config::try_load_settings(&state.workspace) {
         Ok(s) => s.enabled,
         Err(e) => {
@@ -464,6 +537,64 @@ pub fn setup(state: std::sync::Arc<AgentState>) {
         tokio::spawn(async move {
             if let Err(e) = crate::ops::run_apply_operation(st).await {
                 log::warn!("net-policy 启动自动应用失败：{e}");
+            }
+        });
+    }
+
+    // 常驻**出口探活循环**（决议 §3.3）：与策略是否选中该出口无关，解决 mihomo userspace WG
+    // 「没流量就不握手」导致的误判——切到直连后 WG 仍会被定期探测，状态不会假性掉线。
+    //
+    // **只探周期探活有意义的出口**（[`EgressKind::probe_on_schedule`]）：
+    // - WG：隧道可保活，周期探测正是它的价值所在；
+    // - Direct：探的是本机物理网络，不建立任何远端会话，成本可忽略；
+    // - Proxy：**排除**。决议 §3.4 明确「没有业务流量时，不应为了展示在线而强行维持每个代理
+    //   节点的连接」——周期打 `/proxies/subscription-out/delay` 恰恰是在强行建连。代理出口改为
+    //   按需探测（用户点「探测节点」/ 切换节点 / 启动出口时各探一次）。
+    {
+        let st = state.clone();
+        tokio::spawn(async move {
+            loop {
+                tokio::time::sleep(crate::egress::PROBE_INTERVAL).await;
+                let settings = match config::try_load_settings(&st.workspace) {
+                    Ok(s) => s,
+                    Err(_) => continue,
+                };
+                let secret = { st.rt.lock().unwrap().secret.clone() };
+                let engine_up = secret.as_deref().is_some_and(|s| !s.is_empty());
+
+                // 订阅状态采样（决议 §3.4 的「订阅层 / 节点层」）：**纯读 mihomo 已有信息**，
+                // 不做 delay 探测、不触发任何节点连接——代理订阅是配置来源，不是持续隧道。
+                if engine_up && settings.proxy_subscriptions.active_subscription().is_some() {
+                    if let Some(s) = secret.as_deref() {
+                        st.egress.set_subscription(
+                            crate::egress::subscription_snapshot(s, &settings).await,
+                        );
+                    }
+                }
+
+                for d in net_policy_core::egress::catalog(&settings) {
+                    // 未配置 / 已停用 / 不适合周期探活的出口一律跳过（不制造无意义的失败噪声，
+                    // 也不为了「看起来在线」而替代理订阅强行建连）。
+                    if !d.configured || !d.kind.probe_on_schedule() || !st.egress.desired_up(&d.id)
+                    {
+                        continue;
+                    }
+                    // 隧道类出口的数据面由 mihomo 承载：引擎没跑就是 Stopped，不是 Failed
+                    // ——把「没启动」误报成「连不上」会把用户引向错误的排查方向。
+                    if !engine_up && d.kind != net_policy_core::egress::EgressKind::Direct {
+                        if st
+                            .egress
+                            .set_lifecycle(&d.id, net_policy_core::egress::EgressLifecycle::Stopped)
+                        {
+                            st.publish_egress(&d.id);
+                        }
+                        continue;
+                    }
+                    let outcome = crate::egress::probe(&d.id, &settings, secret.as_deref()).await;
+                    if st.egress.record_probe(&d.id, &outcome) {
+                        st.publish_egress(&d.id);
+                    }
+                }
             }
         });
     }

@@ -1,12 +1,16 @@
 use anyhow::{bail, Context, Result};
-use tokio::io::{AsyncBufReadExt, BufReader};
+use tokio::io::AsyncReadExt;
 use tokio::net::TcpStream;
+
+const MAX_CONNECT_LINE: usize = 8 * 1024;
+const MAX_CONNECT_HEADERS: usize = 32 * 1024;
 
 /// A parsed CONNECT request.
 #[derive(Debug)]
 pub struct ConnectRequest {
     pub host: String,
     pub port: u16,
+    pub proxy_authorization: Option<String>,
 }
 
 /// Read and parse a CONNECT request from the client stream.
@@ -20,12 +24,8 @@ pub struct ConnectRequest {
 ///
 /// Returns an error for non-CONNECT methods or malformed requests.
 pub async fn parse_connect_request(stream: &mut TcpStream) -> Result<ConnectRequest> {
-    let mut reader = BufReader::new(&mut *stream);
-
-    // Read the request line
-    let mut request_line = String::new();
-    reader
-        .read_line(&mut request_line)
+    // 逐字节读，既能硬限制内存，也避免 BufReader 预读并在 drop 时吞掉紧随 headers 的 TLS 字节。
+    let request_line = read_limited_line(stream, MAX_CONNECT_LINE)
         .await
         .context("Reading CONNECT request line")?;
 
@@ -43,15 +43,44 @@ pub async fn parse_connect_request(stream: &mut TcpStream) -> Result<ConnectRequ
     let (host, port) = parse_authority(authority)?;
 
     // Consume remaining headers until \r\n\r\n
+    let mut header_bytes = 0usize;
+    let mut proxy_authorization = None;
     loop {
-        let mut line = String::new();
-        reader.read_line(&mut line).await?;
+        let line = read_limited_line(stream, MAX_CONNECT_LINE).await?;
+        header_bytes = header_bytes.saturating_add(line.len());
+        if header_bytes > MAX_CONNECT_HEADERS {
+            bail!("CONNECT headers exceed {MAX_CONNECT_HEADERS} bytes");
+        }
         if line == "\r\n" || line == "\n" || line.is_empty() {
             break;
         }
+        if let Some((name, value)) = line.trim_end().split_once(':') {
+            if name.eq_ignore_ascii_case("proxy-authorization") {
+                proxy_authorization = Some(value.trim().to_string());
+            }
+        }
     }
 
-    Ok(ConnectRequest { host, port })
+    Ok(ConnectRequest {
+        host,
+        port,
+        proxy_authorization,
+    })
+}
+
+async fn read_limited_line(stream: &mut TcpStream, limit: usize) -> Result<String> {
+    let mut bytes = Vec::with_capacity(128);
+    loop {
+        let byte = stream.read_u8().await.context("read CONNECT line")?;
+        bytes.push(byte);
+        if bytes.len() > limit {
+            bail!("CONNECT line exceeds {limit} bytes");
+        }
+        if byte == b'\n' {
+            break;
+        }
+    }
+    String::from_utf8(bytes).context("CONNECT line is not UTF-8")
 }
 
 /// Parse "host:port" authority string.
@@ -76,6 +105,8 @@ fn parse_authority(authority: &str) -> Result<(String, u16)> {
 
 /// The HTTP response to send when the method is not CONNECT.
 pub const METHOD_NOT_ALLOWED: &[u8] = b"HTTP/1.1 405 Method Not Allowed\r\n\r\n";
+pub const PROXY_AUTH_REQUIRED: &[u8] =
+    b"HTTP/1.1 407 Proxy Authentication Required\r\nProxy-Authenticate: Basic realm=\"net-policy\"\r\n\r\n";
 /// The HTTP response to send when the upstream connection fails.
 pub const BAD_GATEWAY: &[u8] = b"HTTP/1.1 502 Bad Gateway\r\n\r\n";
 /// The HTTP response to send on successful tunnel establishment.
@@ -129,8 +160,30 @@ mod tests {
         let req = parse_connect_request(&mut server_stream).await.unwrap();
         assert_eq!(req.host, "httpbin.org");
         assert_eq!(req.port, 443);
+        assert!(req.proxy_authorization.is_none());
 
         client_handle.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_parse_proxy_authorization() {
+        use tokio::io::AsyncWriteExt;
+        use tokio::net::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let mut stream = tokio::net::TcpStream::connect(addr).await.unwrap();
+            stream
+                .write_all(
+                    b"CONNECT example.com:443 HTTP/1.1\r\nProxy-Authorization: Basic dTpw\r\n\r\n",
+                )
+                .await
+                .unwrap();
+        });
+        let (mut stream, _) = listener.accept().await.unwrap();
+        let request = parse_connect_request(&mut stream).await.unwrap();
+        assert_eq!(request.proxy_authorization.as_deref(), Some("Basic dTpw"));
     }
 
     #[tokio::test]

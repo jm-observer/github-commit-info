@@ -15,7 +15,10 @@ use crate::cert::site::CertCache;
 use crate::shutdown::ShutdownToken;
 use crate::sink::FlowSink;
 use crate::upstream::Upstream;
-use connect::{parse_connect_request, BAD_GATEWAY, CONNECTION_ESTABLISHED, METHOD_NOT_ALLOWED};
+use connect::{
+    parse_connect_request, BAD_GATEWAY, CONNECTION_ESTABLISHED, METHOD_NOT_ALLOWED,
+    PROXY_AUTH_REQUIRED,
+};
 
 /// Shared runtime handed to every proxy connection.
 ///
@@ -31,6 +34,8 @@ pub struct ProxyRuntime {
     pub sink: Arc<dyn FlowSink>,
     /// Domain -> whether to MITM-intercept (false = plain TCP tunnel passthrough).
     pub should_intercept: Arc<dyn Fn(&str) -> bool + Send + Sync>,
+    /// 完整的 Proxy-Authorization 值；`Some` 时不匹配即 407，防止其它本地进程借代理绕过策略。
+    pub expected_proxy_authorization: Option<String>,
 }
 
 /// Run the proxy server: accept connections and handle CONNECT + MITM TLS.
@@ -42,7 +47,17 @@ pub async fn run_proxy(
     shutdown: ShutdownToken,
 ) -> Result<()> {
     let listener = TcpListener::bind((host, port)).await?;
-    info!("Proxy listening on {host}:{port}");
+    run_proxy_on(listener, upstream, runtime, shutdown).await
+}
+
+/// 使用调用方已成功 bind 的 listener 运行代理；用于需要在返回“会话已启动”前确认端口可用的编排。
+pub async fn run_proxy_on(
+    listener: TcpListener,
+    upstream: Arc<Upstream>,
+    runtime: ProxyRuntime,
+    shutdown: ShutdownToken,
+) -> Result<()> {
+    info!("Proxy listening on {}", listener.local_addr()?);
 
     let mut connections = JoinSet::new();
 
@@ -86,9 +101,10 @@ pub async fn run_proxy(
     }
 
     info!(
-        "proxy accept loop exited, waiting for {} active connections",
+        "proxy accept loop exited, cancelling {} active connections",
         connections.len()
     );
+    connections.abort_all();
 
     let mut had_error = false;
     while let Some(result) = connections.join_next().await {
@@ -127,6 +143,12 @@ async fn handle_connection(
 
     info!("[{client_addr}] CONNECT {}:{}", req.host, req.port);
 
+    if runtime.expected_proxy_authorization.as_deref() != req.proxy_authorization.as_deref() {
+        warn!("[{client_addr}] rejected unauthenticated CONNECT");
+        let _ = client_stream.write_all(PROXY_AUTH_REQUIRED).await;
+        return;
+    }
+
     // 2. Connect through upstream proxy (passes domain name, no DNS resolution)
     let mut upstream_stream = match upstream.connect(&req.host, req.port).await {
         Ok(s) => s,
@@ -152,6 +174,8 @@ async fn handle_connection(
             "[{client_addr}] {} — not intercepted, plain TCP tunnel",
             req.host
         );
+        // Honest per-domain audit (§17.9): relayed opaque, no plaintext produced.
+        runtime.sink.on_passthrough(&req.host);
         match tunnel::relay(&mut client_stream, &mut upstream_stream).await {
             Ok((up, down)) => {
                 debug!(
@@ -170,6 +194,8 @@ async fn handle_connection(
     }
 
     // 5. Intercepted domains: MITM TLS interception
+    // sink 在 handle_mitm 拿走 runtime 所有权前克隆，供拒证审计回调用（§17.7）。
+    let sink = runtime.sink.clone();
     match mitm::handle_mitm(
         client_stream,
         upstream_stream,
@@ -187,6 +213,22 @@ async fn handle_connection(
         }
         Err(e) => {
             let err_msg = format!("{e:#}");
+            // Client refused our forged leaf cert: pinning / bundled CA / mTLS
+            // (§17.7). These are TLS alerts the client sends back during our
+            // server-side handshake. Report honestly — never claim decryption.
+            let is_cert_rejected = err_msg.contains("CertificateUnknown")
+                || err_msg.contains("BadCertificate")
+                || err_msg.contains("UnknownCA")
+                || err_msg.contains("unknown_ca")
+                || err_msg.contains("bad_certificate")
+                || err_msg.contains("certificate_unknown")
+                || err_msg.contains("AccessDenied")
+                || err_msg.contains("access_denied")
+                || err_msg.contains("HandshakeFailure")
+                || err_msg.contains("handshake_failure");
+            if is_cert_rejected {
+                sink.on_client_cert_rejected(&req.host);
+            }
             let is_benign = e.chain().any(|cause| {
                 cause
                     .downcast_ref::<std::io::Error>()
@@ -203,7 +245,7 @@ async fn handle_connection(
             }) || err_msg.contains("close_notify")
                 || err_msg.contains("handshake eof")
                 || err_msg.contains("tls handshake eof")
-                || err_msg.contains("CertificateUnknown");
+                || is_cert_rejected;
 
             if is_benign {
                 warn!(

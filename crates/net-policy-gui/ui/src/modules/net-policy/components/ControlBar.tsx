@@ -1,6 +1,7 @@
 import { OctagonX, Power, Zap } from 'lucide-react'
-import type { Route, Status } from '../api/tauri-client'
+import { egressAcceptsTraffic, type Route, type Status } from '../api/tauri-client'
 import { btn, segCls } from '../uiHelpers'
+import { egressForRoute, useEgressList, useGuardedRouteChange } from './EgressSelect'
 
 /**
  * 概览页控制卡：三路默认出口选择器 + wgError 提示 + 未提权警告 + 主开关 + 紧急停止。
@@ -25,6 +26,14 @@ export function ControlBar({
   onEmergencyStop: () => void
   onResetConnections?: () => void
 }) {
+  // 默认出口也是「匹配条件（兜底）-> 出口」的一种，同样受决议 §6.5 约束：选中 failed/stopped
+  // 的出口时不能静默回落直连，必须弹确认。四个按钮保留原有分段控件外观，只是把点击换成
+  // `requestChange`（未命中确认门槛时透明直通，行为与原来一致）。
+  const egresses = useEgressList()
+  const { requestChange, modal } = useGuardedRouteChange(egresses, onChangeRoute)
+  const wgWarn = (() => { const e = egressForRoute('wg', egresses); return !!e && !egressAcceptsTraffic(e.lifecycle) })()
+  const proxyWarn = (() => { const e = egressForRoute('proxy', egresses); return !!e && !egressAcceptsTraffic(e.lifecycle) })()
+
   return (
     <section className="rounded-xl border border-gray-200 bg-white p-4 dark:border-gray-800 dark:bg-gray-900 space-y-4">
       {/* 三路默认出口选择器 */}
@@ -34,7 +43,7 @@ export function ControlBar({
           <button
             className={segCls(curRoute === 'direct')}
             disabled={busy}
-            onClick={() => onChangeRoute('direct')}
+            onClick={() => requestChange('direct')}
             title="原样直连——不改流量，只观察谁在连"
           >
             直连·观察
@@ -42,15 +51,23 @@ export function ControlBar({
           <button
             className={segCls(curRoute === 'wg')}
             disabled={busy}
-            onClick={() => onChangeRoute('wg')}
+            onClick={() => requestChange('wg')}
             title="未命中规则的流量全走 WireGuard 海外出口（需先配好 WG）"
           >
-            海外·全VPN
+            {wgWarn && <span className="mr-1">⚠</span>}海外·全VPN
+          </button>
+          <button
+            className={segCls(curRoute === 'proxy')}
+            disabled={busy}
+            onClick={() => requestChange('proxy')}
+            title="未命中规则的流量走当前激活的代理订阅节点组"
+          >
+            {proxyWarn && <span className="mr-1">⚠</span>}代理订阅
           </button>
           <button
             className={segCls(curRoute === 'blackhole', true)}
             disabled={busy}
-            onClick={() => onChangeRoute('blackhole')}
+            onClick={() => requestChange('blackhole')}
             title="未命中规则的流量全部阻断（空出口）"
           >
             阻断·收紧
@@ -64,6 +81,7 @@ export function ControlBar({
         <p className="text-[11px] text-gray-400 dark:text-gray-500">
           {curRoute === 'direct' && '不改流量，只看谁在连、连到哪、走哪个出口。'}
           {curRoute === 'wg' && '未命中规则的流量走 WireGuard 海外出口，需配好 WG。'}
+          {curRoute === 'proxy' && '未命中规则的流量走当前激活的代理订阅节点组。'}
           {curRoute === 'blackhole' && '未命中规则的流量全阻断——在下方观察主表逐行放行。'}
         </p>
       </div>
@@ -106,6 +124,7 @@ export function ControlBar({
             : '引擎未启动'}
         </span>
       </div>
+      {modal}
     </section>
   )
 }

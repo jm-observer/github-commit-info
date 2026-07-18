@@ -79,6 +79,30 @@ pub fn ip_or_cidr(s: &str) -> Result<()> {
     }
 }
 
+/// 校验 mihomo 出站代理服务器地址（IP 或域名）。
+pub fn host(s: &str) -> Result<()> {
+    if s.parse::<Ipv4Addr>().is_ok() || s.parse::<Ipv6Addr>().is_ok() {
+        return ip(s);
+    }
+    domain(s)
+}
+
+/// 校验 mihomo 订阅地址。订阅由 mihomo 自己下载，因此这里只接受 HTTP(S)，并拒绝
+/// 会改变 YAML 或跨权限命令语义的控制字符/引号。
+pub fn http_url(s: &str) -> Result<()> {
+    if s.len() > 2048
+        || s.is_empty()
+        || s.chars()
+            .any(|c| c.is_control() || "\r\n\\\"'`<>".contains(c))
+    {
+        bail!("订阅地址非法");
+    }
+    if !(s.starts_with("http://") || s.starts_with("https://")) {
+        bail!("订阅地址必须以 http:// 或 https:// 开头");
+    }
+    Ok(())
+}
+
 /// 校验域名（DOMAIN-SUFFIX 用）。
 pub fn domain(s: &str) -> Result<()> {
     no_meta(s)?;

@@ -81,9 +81,9 @@ mod imp {
         .map_err(|e| anyhow::anyhow!("上报 StartPending 失败：{e}"))?;
 
         // 机器级 workspace（服务不属任何用户 profile）。
-        let ws = crate::paths::service_workspace()
-            .to_string_lossy()
-            .into_owned();
+        let workspace = crate::paths::service_workspace();
+        crate::security::harden_machine_data_dir(&workspace)?;
+        let ws = workspace.to_string_lossy().into_owned();
 
         // 只有收到“管道已创建”后才向 SCM 报 Running；启动失败则进程非零退出，让 failure action 重启。
         let (ready_tx, ready_rx) = mpsc::sync_channel(1);

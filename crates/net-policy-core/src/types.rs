@@ -74,10 +74,24 @@ pub struct ConnectionsSnapshot {
     pub available: bool,
     pub total: usize,
     pub wg_count: usize,
+    #[serde(default)]
+    pub proxy_count: usize,
     pub direct_count: usize,
     pub other_count: usize,
     pub by_process: BTreeMap<String, usize>,
     pub connections: Vec<Connection>,
+}
+
+/// 当前激活代理订阅中的一个节点（不含订阅 URL、认证信息等秘密）。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ProxyNode {
+    pub name: String,
+    #[serde(rename = "type")]
+    pub kind: String,
+    #[serde(default)]
+    pub alive: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub delay_ms: Option<u32>,
 }
 
 impl ConnectionsSnapshot {
@@ -87,6 +101,7 @@ impl ConnectionsSnapshot {
             available: false,
             total: 0,
             wg_count: 0,
+            proxy_count: 0,
             direct_count: 0,
             other_count: 0,
             by_process: BTreeMap::new(),
@@ -219,8 +234,13 @@ pub struct RouteEntry {
     pub kind: String,
     /// 匹配值（`match` 兜底为空）。
     pub value: String,
-    /// 命中后出口。
+    /// 命中后出口（**策略计划**的出口）。
     pub route: Route,
+    /// **实际生效**的出口。出口被停用/不可用时按 fallback 改写（默认阻断），与 [`Self::route`]
+    /// 不等即说明发生了降级——设计 §8.6 要求 UI 区分「规则计划的出口」与「实际使用的出口」。
+    /// `None` = 与 `route` 相同（旧客户端可忽略）。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub applied_route: Option<Route>,
     /// 来源：builtin_lan / temp_except / group / rule / default。
     pub source: String,
     /// 是否可删（用户规则可删；内置 LAN / 兜底 MATCH / temp 不可直接删）。

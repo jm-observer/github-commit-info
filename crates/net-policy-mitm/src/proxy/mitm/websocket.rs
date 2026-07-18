@@ -108,9 +108,13 @@ where
             frame.payload.len()
         );
 
-        if let Some((is_text, payload)) =
-            process_ws_frame(&frame, ws_ctx.ws_compressed, domain, &mut frag_buf, &mut frag_opcode)
-        {
+        if let Some((is_text, payload)) = process_ws_frame(
+            &frame,
+            ws_ctx.ws_compressed,
+            domain,
+            &mut frag_buf,
+            &mut frag_opcode,
+        ) {
             ws_ctx.session.record_ws_frame(&FlowWsFrame {
                 domain,
                 direction,
@@ -168,8 +172,7 @@ fn process_ws_frame(
                 frame.payload.len(),
                 frame.rsv1
             );
-            let payload =
-                maybe_decompress_ws(&frame.payload, ws_compressed && frame.rsv1, domain);
+            let payload = maybe_decompress_ws(&frame.payload, ws_compressed && frame.rsv1, domain);
             Some((frame.is_text(), payload))
         } else {
             *frag_opcode = frame.opcode;
@@ -243,8 +246,8 @@ mod tests {
     use tokio::io::AsyncWrite;
     use tokio::io::BufReader;
 
-    use crate::sink::test_support::CollectingSink;
     use crate::http::websocket::WsFrame;
+    use crate::sink::test_support::CollectingSink;
 
     use super::{pump_ws_direction, MitmSession, WsDirection, WsRelayContext};
 
@@ -334,9 +337,14 @@ mod tests {
         let mut frag_opcode = 0;
         let mut frag_buf = Vec::new();
 
-        let (is_text, payload) =
-            super::process_ws_frame(&frame, false, "api.example.com", &mut frag_buf, &mut frag_opcode)
-                .unwrap();
+        let (is_text, payload) = super::process_ws_frame(
+            &frame,
+            false,
+            "api.example.com",
+            &mut frag_buf,
+            &mut frag_opcode,
+        )
+        .unwrap();
 
         assert!(is_text);
         assert_eq!(payload, br#"{"hello":"world"}"#);
@@ -361,13 +369,23 @@ mod tests {
         let mut frag_opcode = 0;
         let mut frag_buf = Vec::new();
 
-        let first_result =
-            super::process_ws_frame(&first, false, "api.example.com", &mut frag_buf, &mut frag_opcode);
+        let first_result = super::process_ws_frame(
+            &first,
+            false,
+            "api.example.com",
+            &mut frag_buf,
+            &mut frag_opcode,
+        );
         assert!(first_result.is_none());
 
-        let (is_text, payload) =
-            super::process_ws_frame(&last, false, "api.example.com", &mut frag_buf, &mut frag_opcode)
-                .unwrap();
+        let (is_text, payload) = super::process_ws_frame(
+            &last,
+            false,
+            "api.example.com",
+            &mut frag_buf,
+            &mut frag_opcode,
+        )
+        .unwrap();
         assert!(is_text);
         assert_eq!(payload, b"hello");
     }

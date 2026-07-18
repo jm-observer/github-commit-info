@@ -11,9 +11,10 @@ function routeBadge(r: Route) {
   const map: Record<Route, string> = {
     direct: 'bg-emerald-100 text-emerald-700 dark:bg-emerald-950/40 dark:text-emerald-300',
     wg: 'bg-blue-100 text-blue-700 dark:bg-blue-950/40 dark:text-blue-300',
+    proxy: 'bg-violet-100 text-violet-700 dark:bg-violet-950/40 dark:text-violet-300',
     blackhole: 'bg-rose-100 text-rose-700 dark:bg-rose-950/40 dark:text-rose-300',
   }
-  const label: Record<Route, string> = { direct: '直连', wg: '海外', blackhole: '阻断' }
+  const label: Record<Route, string> = { direct: '直连', wg: '海外', proxy: '代理订阅', blackhole: '阻断' }
   return <span className={`rounded px-1.5 py-0.5 text-[11px] ${map[r]}`}>{label[r]}</span>
 }
 
@@ -106,7 +107,21 @@ export function RoutesSection({ busy, onDeleteRule }: { busy: boolean; onDeleteR
                   <td className="px-2 py-1 text-gray-400">{r.priority}</td>
                   <td className="px-2 py-1 font-mono text-gray-600 dark:text-gray-400">{r.kind}</td>
                   <td className="px-2 py-1 font-mono">{r.value || <span className="text-gray-400">（全部）</span>}</td>
-                  <td className="px-2 py-1">{routeBadge(r.route)}</td>
+                  {/* 计划出口 vs 实际出口：出口被停用时二者不同，必须都看得见（出口设计 §8.6）。 */}
+                  <td className="px-2 py-1">
+                    {r.applied_route && r.applied_route !== r.route ? (
+                      <span
+                        className="inline-flex items-center gap-1"
+                        title={`该出口当前不可用，实际按 fallback 走「${r.applied_route === 'blackhole' ? '阻断' : '直连'}」`}
+                      >
+                        <span className="line-through opacity-50">{routeBadge(r.route)}</span>
+                        <span className="text-amber-600 dark:text-amber-400">→</span>
+                        {routeBadge(r.applied_route)}
+                      </span>
+                    ) : (
+                      routeBadge(r.route)
+                    )}
+                  </td>
                   <td className="px-2 py-1">{sourceBadge(r.source)}</td>
                   <td className="px-2 py-1 text-right">
                     {r.deletable ? (
@@ -129,6 +144,7 @@ export function RoutesSection({ busy, onDeleteRule }: { busy: boolean; onDeleteR
         </div>
         <p className="mt-2 px-1 text-[11px] text-gray-500 dark:text-gray-400">
           优先级 = mihomo 匹配顺序，首个命中即生效。只有用户规则可删除；引擎运行中会自动热加载。
+          出口列显示「计划出口 → 实际出口」时，说明该出口已被停用，流量按其 fallback 策略处理。
         </p>
       </div>
     </div>

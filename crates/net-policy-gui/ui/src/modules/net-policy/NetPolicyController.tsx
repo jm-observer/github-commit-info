@@ -40,7 +40,7 @@ interface NetPolicyControllerValue {
   flash: (kind: 'ok' | 'err', text: string) => void
   refresh: () => void
   importWgConf: (file: File) => Promise<void>
-  saveSettings: () => void | Promise<void>
+  saveSettings: () => Promise<boolean>
   emergencyStop: () => Promise<void>
   toggleEnabled: (enabled: boolean) => Promise<void>
   changeDefaultRoute: (route: Route) => Promise<void>
@@ -99,15 +99,17 @@ export function NetPolicyControllerProvider({ children }: { children: React.Reac
     }
   }, [flash])
 
-  const run = useCallback(async (label: string, fn: () => Promise<unknown>) => {
-    if (actionInFlightRef.current) return
+  const run = useCallback(async (label: string, fn: () => Promise<unknown>): Promise<boolean> => {
+    if (actionInFlightRef.current) return false
     actionInFlightRef.current = true
     setBusy(true)
     try {
       await fn()
       flash('ok', `${label}成功`)
+      return true
     } catch (e) {
       flash('err', `${label}失败：${cleanErr(e)}`)
+      return false
     } finally {
       actionInFlightRef.current = false
       setBusy(false)
@@ -130,27 +132,34 @@ export function NetPolicyControllerProvider({ children }: { children: React.Reac
 
   const curRoute: Route = settings?.default_route ?? status?.default_route ?? 'direct'
 
-  const saveSettings = useCallback(() => {
-    if (!settings) return
+  const saveSettings = useCallback(async (): Promise<boolean> => {
+    if (!settings) return false
     return run('保存设置', async () => {
       await NetPolicyAPI.saveSettings(settings)
       await hotReloadIfApplied()
     })
   }, [settings, run, hotReloadIfApplied])
 
-  const emergencyStop = useCallback(() => run('紧急停止', () => NetPolicyAPI.emergencyStop()), [run])
-
-  // 主开关：开 → setEnabled(true)（触发 apply，同时后端发 6 步 apply-progress 事件）；关 → setEnabled(false)（触发 stop）。
-  const toggleEnabled = useCallback((enabled: boolean) => {
-    if (enabled) setShowApplyStepper(true)
-    return run(enabled ? '开始观察' : '停止观察', () => NetPolicyAPI.setEnabled(enabled))
+  const emergencyStop = useCallback(async () => {
+    await run('紧急停止', () => NetPolicyAPI.emergencyStop())
   }, [run])
 
-  // 默认出口三路切换
+  // 主开关：开 → setEnabled(true)（触发 apply，同时后端发 6 步 apply-progress 事件）；关 → setEnabled(false)（触发 stop）。
+  const toggleEnabled = useCallback(async (enabled: boolean) => {
+    if (enabled) setShowApplyStepper(true)
+    await run(enabled ? '开始观察' : '停止观察', () => NetPolicyAPI.setEnabled(enabled))
+  }, [run])
+
+  // 默认出口切换（直连 / WireGuard / 代理订阅 / 阻断）。
   const changeDefaultRoute = useCallback(async (route: Route) => {
     if (!settings || route === curRoute || actionInFlightRef.current) return
     if (route === 'wg' && !status?.wg_configured) {
       setWgError('尚未配置 WireGuard——请先到「WireGuard 设置」填写隧道配置后再切换。')
+      setTimeout(() => setWgError(null), 6000)
+      return
+    }
+    if (route === 'proxy' && settings.proxy_subscriptions.active == null) {
+      setWgError('尚未激活代理订阅——请先到「代理订阅」填写 URL、激活并保存。')
       setTimeout(() => setWgError(null), 6000)
       return
     }
@@ -172,9 +181,9 @@ export function NetPolicyControllerProvider({ children }: { children: React.Reac
     }
   }, [settings, curRoute, status?.wg_configured, hotReloadIfApplied, refreshFast, flash, refresh])
 
-  const addRule = useCallback(() => {
+  const addRule = useCallback(async () => {
     if (!newRule.value.trim()) return
-    return run('新增规则', async () => {
+    await run('新增规则', async () => {
       const rs = await NetPolicyAPI.saveRule({ ...newRule, value: newRule.value.trim() })
       setRules(rs)
       setNewRule({ ...newRule, value: '' })
@@ -182,36 +191,43 @@ export function NetPolicyControllerProvider({ children }: { children: React.Reac
     })
   }, [newRule, run, hotReloadIfApplied])
 
-  const deleteRule = useCallback((rule: Rule) =>
-    run('删除规则', async () => {
+  const deleteRule = useCallback(async (rule: Rule) => {
+    await run('删除规则', async () => {
       setRules(await NetPolicyAPI.deleteRule(rule))
       await hotReloadIfApplied()
-    }), [run, hotReloadIfApplied])
+    })
+  }, [run, hotReloadIfApplied])
 
-  const rerouteRule = useCallback((rule: Rule, target: string) =>
-    run(`改路 ${target}`, async () => {
+  const rerouteRule = useCallback(async (rule: Rule, target: string) => {
+    await run(`改路 ${target}`, async () => {
       setRules(await NetPolicyAPI.saveRule(rule))
       await hotReloadIfApplied()
-    }), [run, hotReloadIfApplied])
+    })
+  }, [run, hotReloadIfApplied])
 
-  const allowBlocked = useCallback((e: BlockedEntry, route: 'direct' | 'wg') =>
-    run('放行', async () => {
+  const allowBlocked = useCallback(async (e: BlockedEntry, route: 'direct' | 'wg') => {
+    await run('放行', async () => {
       const rule: Rule = e.dest_ip
         ? { kind: 'ip-cidr', value: `${e.dest_ip}/${e.dest_ip.includes(':') ? 128 : 32}`, route }
         : { kind: 'domain-suffix', value: e.host, route }
       setRules(await NetPolicyAPI.saveRule(rule))
       await hotReloadIfApplied()
-    }), [run, hotReloadIfApplied])
+    })
+  }, [run, hotReloadIfApplied])
 
-  const clearBlocked = useCallback(() => run('清空被阻断记录', () => NetPolicyAPI.clearBlocked()), [run])
+  const clearBlocked = useCallback(async () => {
+    await run('清空被阻断记录', () => NetPolicyAPI.clearBlocked())
+  }, [run])
 
-  const runVerify = useCallback(() =>
-    run('验证', async () => { await runVerifyProbe() }), [run, runVerifyProbe])
+  const runVerify = useCallback(async () => {
+    await run('验证', async () => { await runVerifyProbe() })
+  }, [run, runVerifyProbe])
 
   // 手动「重置连接」：与 changeDefaultRoute 里的 best-effort 调用不同，这里是用户主动触发，
   // 走标准 run()（有 busy/flash 反馈）。
-  const resetConnections = useCallback(() =>
-    run('重置连接', () => NetPolicyAPI.resetConnections()), [run])
+  const resetConnections = useCallback(async () => {
+    await run('重置连接', () => NetPolicyAPI.resetConnections())
+  }, [run])
 
   // 未提权时改路/放行会触发 reload（落防火墙/TUN），必然失败——未拿到 status 前默认放行交互，
   // 一旦拿到 status 且明确未提权，才禁用（platform_supported 前提下）。

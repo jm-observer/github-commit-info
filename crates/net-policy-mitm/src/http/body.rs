@@ -163,13 +163,26 @@ where
 fn decompress_gzip(data: &[u8]) -> Result<Vec<u8>> {
     let mut decoder = flate2::read::GzDecoder::new(Cursor::new(data));
     let mut output = Vec::new();
-    decoder.read_to_end(&mut output)?;
+    decoder
+        .by_ref()
+        .take((MAX_BODY_SIZE + 1) as u64)
+        .read_to_end(&mut output)?;
+    if output.len() > MAX_BODY_SIZE {
+        bail!("decompressed gzip body exceeds {MAX_BODY_SIZE} bytes");
+    }
     Ok(output)
 }
 
 fn decompress_brotli(data: &[u8]) -> Result<Vec<u8>> {
     let mut output = Vec::new();
-    brotli::BrotliDecompress(&mut Cursor::new(data), &mut output)?;
+    let mut decoder = brotli::Decompressor::new(Cursor::new(data), 4096);
+    decoder
+        .by_ref()
+        .take((MAX_BODY_SIZE + 1) as u64)
+        .read_to_end(&mut output)?;
+    if output.len() > MAX_BODY_SIZE {
+        bail!("decompressed brotli body exceeds {MAX_BODY_SIZE} bytes");
+    }
     Ok(output)
 }
 

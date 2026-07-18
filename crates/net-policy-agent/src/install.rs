@@ -128,12 +128,17 @@ if ($old) {{
         Stop-Service -Name '{TASK_NAME}' -Force
         $old.WaitForStatus([System.ServiceProcess.ServiceControllerStatus]::Stopped, [TimeSpan]::FromSeconds(30))
     }}
-    sc.exe config '{TASK_NAME}' binPath= $bin start= auto DisplayName= 'Net Policy Agent' | Out-Null
-    if ($LASTEXITCODE -ne 0) {{ throw "更新 net-policy-agent 服务失败（sc.exe config 返回 $LASTEXITCODE）" }}
-    sc.exe description '{TASK_NAME}' '网络出口策略守护（mihomo / 防火墙 / TUN；开机自启，Session 0 常驻）' | Out-Null
-}} else {{
-    New-Service -Name '{TASK_NAME}' -BinaryPathName $bin -DisplayName 'Net Policy Agent' -StartupType Automatic -Description '网络出口策略守护（mihomo / 防火墙 / TUN；开机自启，Session 0 常驻）' | Out-Null
+    sc.exe delete '{TASK_NAME}' | Out-Null
+    if ($LASTEXITCODE -ne 0) {{ throw "删除旧 net-policy-agent 服务失败（sc.exe delete 返回 $LASTEXITCODE）" }}
+    $deleteDeadline = (Get-Date).AddSeconds(30)
+    while ((Get-Date) -lt $deleteDeadline -and (Get-Service -Name '{TASK_NAME}' -ErrorAction SilentlyContinue)) {{
+        Start-Sleep -Milliseconds 300
+    }}
+    if (Get-Service -Name '{TASK_NAME}' -ErrorAction SilentlyContinue) {{
+        throw '旧 net-policy-agent 服务仍处于删除中，无法重新创建'
+    }}
 }}
+New-Service -Name '{TASK_NAME}' -BinaryPathName $bin -DisplayName 'Net Policy Agent' -StartupType Automatic -Description '网络出口策略守护（mihomo / 防火墙 / TUN；开机自启，Session 0 常驻）' | Out-Null
 sc.exe failure '{TASK_NAME}' reset= 0 actions= restart/5000/restart/5000/restart/5000 | Out-Null
 if ($LASTEXITCODE -ne 0) {{ throw "配置 net-policy-agent 恢复策略失败（sc.exe failure 返回 $LASTEXITCODE）" }}
 Start-Service -Name '{TASK_NAME}'

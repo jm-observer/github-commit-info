@@ -6,7 +6,8 @@
 > pcapng 抓包**。仅 Windows。
 >
 > **状态：Phase 1（sniffer）完整；Phase 2a 全 TUN 抓包真机 E2E 已跑通（core→agent→协议→client→CLI→
-> 合法 pcapng）；Phase 2b 定向解析+GUI 已落地（定向 E2E 待补）；Phase 4 真实解密数据面仍待真机。**
+> 合法 pcapng）；Phase 2b 定向解析+GUI 已落地（定向 E2E 待补）；Phase 4 引擎 spike 已验证，但产品能力
+> 自动导流、调用者 SID 绑定、代理会话认证和 CA 私钥保护已闭环；仍需完成 §18 真机回归矩阵。**
 > - Phase 1 已在 `net-policy-core` 落地（`NetPolicySettings::sniffer_enabled` 开关 + `generate_config`
 >   输出 `sniffer` 块 + YAML 单测 + GUI 设置页开关，**默认关闭**）。
 > - Phase 0 真机 spike 已过（0.228，见 [validation-report](net-policy-capture-validation-report.md)）：
@@ -20,13 +21,16 @@
 >   定向抓包（fake-ip 端点解析）+ GUI；agent 崩溃恢复（租约/orphaned）。
 > - 真机验证 sniffer DNS/fake-ip 回填、纯 IP、TLS、QUIC、ECH/无 SNI 降级仍待做，未验证前不改新安装默认。
 >
-> - **Phase 4（L4 MITM）**：引擎依赖 ADR 已落 [adr-2026-07-phase4-mitm-engine.md](adr-2026-07-phase4-mitm-engine.md)
->   （用户批准；锁定 mitmproxy 12.2.3，SHA-256 已记录，MIT 许可）；协议升到 **1.6**（`Decrypt*`/`DecryptCa*`
->   + 10 个 `decrypt_*` 错误码 + `decrypt_v1` 能力，§17.8）；机器无关逻辑 `net_policy_core::decrypt` 已落地
->   （会话/CA/目标 DTO + §17.5 参数/目标校验 + **§17.6 脱敏 golden 测试** + 状态机）。**引擎部署已进安装
->   程序**（`install-mitm-engine`：Defender 放行 + SHA-256 + 解压到 ProgramFiles，真机 `mitmdump --version`
->   跑通）；**但真实解密未启用**——CA 生命周期 + Local Capture 数据面 + 与 gVisor TUN 共存待验（ADR §6.2），
->   agent 对 Decrypt* 仍返回 `decrypt_unsupported`、不声明 `decrypt_v1`。
+> - **Phase 4（L4 MITM）**：引擎/data-plane ADR 已落 [adr-2026-07-phase4-mitm-engine.md](adr-2026-07-phase4-mitm-engine.md)；
+>   协议 **1.6**（`Decrypt*`/`DecryptCa*` + `DecryptCaExportPublic` + 10 个 `decrypt_*` 错误码 + `decrypt_v1`
+>   能力，§17.8）；机器无关逻辑 `net_policy_core::decrypt` 已落地（会话/CA/目标 DTO + §17.5 校验 + **§17.6
+>   脱敏 golden** + 状态机）。自研 `net-policy-mitm` 方案 B spike 已真实解密。**四项后续开发已落代码 + 单测**：
+>   ① mihomo 自动导流 config-gen（`DecryptDivert`/`divert_lines`/`active_divert`，§17.3 方案 B）；② CA 私钥
+>   **DPAPI machine-scope 保护**（`private/ca.key.dpapi`，磁盘永不明文）+ GUI **真装 `CurrentUser\Root`**（certutil
+>   + PowerShell DER SHA-256 实查）；③ GUI **应用明文页**（每域名计数 + Raw 红标）；④ **QUIC/pinning 降级审计**
+>   （透传/拒证 per-domain 计数 + force-TCP REJECT，§17.7/§17.9）；④ 命名管道客户端 token SID 与 CA owner
+>   强绑定；⑤ loopback CONNECT 使用随机会话 Basic Auth，凭据只注入 mihomo outbound。不存在环境变量绕过。
+>   §18 真机矩阵尚未完成的组合会作为验证状态记录，不再用不安全开关绕过安全边界。
 >
 > 文中的 pktmon 命令已按当前开发机帮助文本及 Microsoft 文档校正；TUN 组件定位、fake-ip 包面地址、过滤器
 > 运行期行为仍必须按 §15 在目标 Windows 真机验证，未验证项不得作为产品承诺。
@@ -704,6 +708,20 @@ DecryptRead   { id: String, artifact: DecryptArtifact, offset: u64, len: u32 }
 - 会话中显示每域名 `decrypted / passthrough / pinned / quic / failed` 计数，不能只显示总“成功”。
 - 明文详情默认折叠敏感头和正文，查看 Raw 内容需临时二次确认且不写前端持久缓存。
 - 停止按钮始终可见；网络姿态切换时提示先停止明文会话，不能由 GUI 在后台自动替用户确认。
+
+### 17.10 WireGuard 代理订阅（双槽位）
+
+为支持 WireGuard 出口所在网络封锁外层 UDP、但允许通过代理访问订阅节点的场景，net-policy 内置
+mihomo 订阅管理，不再依赖 Clash Verge 常驻进程：
+
+- 设置中固定两个订阅槽位（名称、HTTP(S) URL、更新间隔）和一个激活槽位；保存后运行中的 mihomo 热加载。
+- WireGuard 上游代理来源可选“手工 SOCKS5/HTTP”或“订阅”。订阅模式生成 `proxy-providers`、`wg-dialer`
+  选择组，并将 WG outbound 的 `dialer-proxy` 指向该组；mihomo 负责拉取订阅、解析节点和自动更新。
+- 任意时刻只生成当前激活订阅 provider，切换只改变 provider 引用，不修改 WireGuard 密钥和路由规则。
+- URL 仅接受 `http://`/`https://`，名称、更新间隔和槽位引用在 agent 保存前校验。订阅凭据和节点内容不写日志，
+  配置只保留订阅 URL；订阅下载失败由 mihomo 报告，策略保持 fail-closed。
+- 订阅模式仍要求 WireGuard endpoint 可校验；没有激活订阅时可回退到该代理槽位，未配置代理则保持直连/原有
+  WireGuard 行为。
 
 ## 18. L4 实施与验收门槛
 

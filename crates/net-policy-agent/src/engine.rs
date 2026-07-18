@@ -5,8 +5,10 @@
 
 use crate::win::run_ps;
 use anyhow::{bail, Context, Result};
-use net_policy_core::config::{mihomo_config_path, NetPolicySettings, RuleSet, TempDirect};
-use net_policy_core::mihomo::{generate_config, CONTROLLER};
+use net_policy_core::config::{
+    mihomo_config_path, DecryptDivert, NetPolicySettings, RuleSet, TempDirect,
+};
+use net_policy_core::mihomo::{generate_config_with, CONTROLLER};
 use std::io::{Read, Write};
 use std::net::{SocketAddr, TcpStream};
 use std::path::{Path, PathBuf};
@@ -39,13 +41,18 @@ pub fn write_config(
     rules: &RuleSet,
     secret: &str,
     temp: &TempDirect,
+    divert: &DecryptDivert,
+    egress: &net_policy_core::egress::EgressRuntimeView,
 ) -> Result<PathBuf> {
     let path = mihomo_config_path(workspace);
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent).ok();
     }
-    std::fs::write(&path, generate_config(settings, rules, secret, temp))
-        .with_context(|| format!("write {}", path.display()))?;
+    std::fs::write(
+        &path,
+        generate_config_with(settings, rules, secret, temp, divert, egress),
+    )
+    .with_context(|| format!("write {}", path.display()))?;
     Ok(path)
 }
 

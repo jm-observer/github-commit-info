@@ -1,6 +1,7 @@
 import { useState, useMemo } from 'react'
 import { Loader2, Pin, Search } from 'lucide-react'
 import type { Connection, DomainAssoc, Rule, RuleSet } from '../api/tauri-client'
+import { EgressSelect } from './EgressSelect'
 
 /**
  * 观察主表：将活跃连接按 host/IP 聚合，叠加现有规则（pinned 行置顶），
@@ -10,11 +11,12 @@ import type { Connection, DomainAssoc, Rule, RuleSet } from '../api/tauri-client
  * 写操作统一交给页面 controller，和其它规则操作共享同步锁与错误反馈。
  */
 
-type RouteLabel = 'direct' | 'wg' | 'blackhole'
+type RouteLabel = 'direct' | 'wg' | 'proxy' | 'blackhole'
 
 function outboundToRoute(outbound: string): RouteLabel {
   if (outbound === 'DIRECT') return 'direct'
   if (outbound === 'wg-out' || outbound.toLowerCase().includes('wg')) return 'wg'
+  if (outbound === 'subscription-out') return 'proxy'
   return 'blackhole'
 }
 
@@ -26,6 +28,10 @@ const ROUTE_BADGE: Record<RouteLabel, { cls: string; label: string }> = {
   wg: {
     cls: 'bg-blue-100 text-blue-700 dark:bg-blue-950/50 dark:text-blue-300',
     label: 'VPN',
+  },
+  proxy: {
+    cls: 'bg-violet-100 text-violet-700 dark:bg-violet-950/50 dark:text-violet-300',
+    label: '代理订阅',
   },
   blackhole: {
     cls: 'bg-red-100 text-red-700 dark:bg-red-950/50 dark:text-red-300',
@@ -108,7 +114,7 @@ function buildRows(connections: Connection[], rules: Rule[], dnsMap: DomainAssoc
         host: r.kind === 'ip-cidr' ? '' : r.value,
         ip: r.kind === 'ip-cidr' ? key : '',
         processes: [],
-        outbound: r.route === 'direct' ? 'DIRECT' : r.route === 'wg' ? 'wg-out' : 'REJECT-DROP',
+        outbound: r.route === 'direct' ? 'DIRECT' : r.route === 'wg' ? 'wg-out' : r.route === 'proxy' ? 'subscription-out' : 'REJECT-DROP',
         pinned: true,
         isRawIp: r.kind === 'ip-cidr',
         assocDomain: r.kind === 'ip-cidr' ? ipToDomain.get(key) ?? '' : '',
@@ -207,9 +213,9 @@ export function ObserverTable({
         )}
         {/* 出口过滤（兼作图例）：点击按当前出口筛选 */}
         <div className="ml-auto flex items-center gap-1">
-          {(['all', 'direct', 'wg', 'blackhole'] as const).map((rf) => {
-            const label = rf === 'all' ? '全部' : rf === 'direct' ? '直连' : rf === 'wg' ? 'VPN' : '阻断'
-            const dot = rf === 'direct' ? 'bg-gray-400' : rf === 'wg' ? 'bg-blue-500' : rf === 'blackhole' ? 'bg-red-500' : ''
+          {(['all', 'direct', 'wg', 'proxy', 'blackhole'] as const).map((rf) => {
+            const label = rf === 'all' ? '全部' : rf === 'direct' ? '直连' : rf === 'wg' ? 'VPN' : rf === 'proxy' ? '代理' : '阻断'
+            const dot = rf === 'direct' ? 'bg-gray-400' : rf === 'wg' ? 'bg-blue-500' : rf === 'proxy' ? 'bg-violet-500' : rf === 'blackhole' ? 'bg-red-500' : ''
             const active = routeFilter === rf
             return (
               <button
@@ -317,22 +323,14 @@ export function ObserverTable({
                       )}
                     </td>
                     <td className="px-2 py-2 align-top">
-                      <select
+                      <EgressSelect
                         className="rounded border px-1.5 py-0.5 text-xs dark:border-gray-700 dark:bg-gray-800"
                         value=""
+                        placeholder="改路…"
                         disabled={rerouteDisabled}
                         title={rerouteTitle}
-                        onChange={(e) => {
-                          const v = e.target.value as RouteLabel
-                          if (v) void reroute(row, v)
-                          e.target.value = ''
-                        }}
-                      >
-                        <option value="">改路…</option>
-                        <option value="direct">直连</option>
-                        <option value="wg">走VPN</option>
-                        <option value="blackhole">阻断</option>
-                      </select>
+                        onChange={(route) => void reroute(row, route)}
+                      />
                     </td>
                   </tr>
                 )

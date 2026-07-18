@@ -42,6 +42,12 @@ impl CertAuthority {
         })
     }
 
+    /// The CA certificate in DER form (for computing a SHA-256 thumbprint, or feeding a
+    /// platform trust-store install API that wants DER).
+    pub fn ca_cert_der(&self) -> Vec<u8> {
+        self.ca_cert.der().as_ref().to_vec()
+    }
+
     /// Load an existing CA from PEM files in the given directory.
     pub fn load(ca_dir: &Path) -> Result<Self> {
         let cert_path = ca_dir.join("ca.crt");
@@ -62,6 +68,28 @@ impl CertAuthority {
             ca_key_pair: key_pair,
             ca_cert,
         })
+    }
+
+    /// Construct a `CertAuthority` from in-memory PEM strings, without touching disk.
+    ///
+    /// This is what net-policy's agent uses so the CA **private key never lands on
+    /// disk in plaintext**: at rest the key is DPAPI-encrypted (machine scope, §17.4);
+    /// at session start the agent decrypts it in memory and builds the authority here.
+    pub fn from_pem(ca_cert_pem: &str, ca_key_pem: &str) -> Result<Self> {
+        let key_pair = KeyPair::from_pem(ca_key_pem)?;
+        let params = CertificateParams::from_ca_cert_pem(ca_cert_pem)?;
+        let ca_cert = params.self_signed(&key_pair)?;
+        Ok(Self {
+            ca_cert_pem: ca_cert_pem.to_string(),
+            ca_key_pair: key_pair,
+            ca_cert,
+        })
+    }
+
+    /// The CA private key serialized as PEM. Callers that persist this **must**
+    /// protect it (DPAPI + ACL on Windows); it is secret material.
+    pub fn ca_key_pem(&self) -> String {
+        self.ca_key_pair.serialize_pem()
     }
 
     /// Save the CA certificate and key to PEM files in the given directory.

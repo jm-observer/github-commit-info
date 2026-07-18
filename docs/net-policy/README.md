@@ -17,6 +17,7 @@
 | [net-policy-capture-validation-report.md](net-policy-capture-validation-report.md) | **抓包 Phase 0 真机 spike 报告**（0.228）：pktmon→pcapng 管道验证（filter/start/stop/etl2pcap，pcapng 魔数合法），§15 验收矩阵状态 | 查抓包真机证据 |
 | [adr-2026-07-phase3-npcap-backend.md](adr-2026-07-phase3-npcap-backend.md) | **抓包 Phase 3 ADR**：暂不采用 npcap、维持 pktmon（需求未达门槛 + 驱动/许可成本）；含重开条件 | 想给抓包加 BPF/PID 前 |
 | [adr-2026-07-phase4-mitm-engine.md](adr-2026-07-phase4-mitm-engine.md) | **L4 引擎依赖 ADR**：锁定 mitmproxy 12.2.3（MIT，SHA-256 记录）；§6 记 0.228 真机——Defender 查杀已由安装程序加排除解决，`mitmdump --version` 跑通；引擎部署已进 `install-mitm-engine`。数据面/CA 仍待验 | 动 L4/引擎前 |
+| [net-policy-wg-egress-design.md](net-policy-wg-egress-design.md) | **统一出口（Egress）模型**（第一阶段已落地，真机 E2E 未做）：Direct/WireGuard/Proxy 同层，各自 health/probe/reconnect + fail-closed 停用（不隐式回落直连）；前端分开展示「生命周期」与「当前策略」。**注意 §12.1 的定性：本阶段是「独立健康状态管理」而非「独立出口生命周期」——数据面仍由 mihomo 承载，停掉引擎出口即消失，§9 后三条验收点不成立**；§12.2 有逐条对照表，第二阶段主线是把 WG 挪到独立引擎 | 想让 WG 独立常驻 / 看出口状态语义前 |
 
 ## 代码模块（四 crate + GUI）
 

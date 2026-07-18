@@ -14,11 +14,12 @@
 use crate::capture::{CaptureOpts, CaptureSession, CaptureTarget};
 use crate::config::{NetPolicySettings, ProcessRef, Rule, RuleSet, WgConfig};
 use crate::decrypt::{CaStatus, DecryptArtifact, DecryptOpts, DecryptSession, DecryptTarget};
+use crate::egress::{EgressFallback, EgressStatus};
 use crate::operation::{ApplyProgress, OperationInfo, OperationResult};
 use crate::types::{
     BlockedEntry, ConnectionsSnapshot, DomainAssoc, LifecycleEvent, NetPolicyStatus,
-    ProcessCandidate, ProcessNode, RepairResult, RequestLogEntry, RouteEntry, TempDirectStatus,
-    VerifyReport,
+    ProcessCandidate, ProcessNode, ProxyNode, RepairResult, RequestLogEntry, RouteEntry,
+    TempDirectStatus, VerifyReport,
 };
 use anyhow::{bail, Context, Result};
 use serde::{Deserialize, Serialize};
@@ -36,7 +37,10 @@ pub const PROTOCOL_MAJOR: u16 = 1;
 /// `capture_v1`）；
 /// minor 6：L4 应用明文（Decrypt*/DecryptCa*，抓包设计 §17.8）+ `decrypt_v1` 能力（CA/引擎/平台
 /// 探测通过才声明）。纯追加请求/响应/错误码，旧客户端忽略未知字段。
-pub const PROTOCOL_MINOR: u16 = 6;
+/// minor 7：代理订阅节点列表与单节点测速。
+/// minor 8：统一出口生命周期（`Egress*` + `egress_v1` 能力，出口设计 §4/§8.8）。出口的
+/// 启停/探活/重连与流量导流解耦；`RouteEntry.applied_route` 同步补充「计划出口 vs 实际出口」。
+pub const PROTOCOL_MINOR: u16 = 8;
 
 /// 单帧最大字节数（防超大帧拖垮提权 agent，设计 §3.1 DoS 防护）。
 pub const MAX_FRAME_LEN: u32 = 8 * 1024 * 1024;
@@ -127,6 +131,20 @@ pub enum ErrorKind {
     DecryptQuicNotSupported,
     /// finalize（脱敏索引 / 产物校验 / 原子提交）失败。
     DecryptFinalizeFailed,
+
+    // ── minor 8：统一出口生命周期（出口设计 §4）─────────────────────────────
+    /// 出口 id 不存在。
+    EgressNotFound,
+    /// 出口配置不完整（WG 校验未过 / 订阅未激活），不能启动。
+    EgressUnconfigured,
+    /// 出口操作与 apply/reload/stop 等网络长操作冲突。
+    EgressConflict,
+    /// 出口启停触发的配置重载失败（已回滚到操作前的出口状态）。
+    EgressApplyFailed,
+    /// 探测失败（出口不可达）。
+    EgressProbeFailed,
+    /// 订阅刷新失败（拉取 / 解析）。
+    EgressSubscriptionFailed,
 }
 
 /// 错误响应体。
@@ -156,7 +174,7 @@ pub enum Request {
     GetStatus,
     GetSettings,
     SaveSettings {
-        settings: NetPolicySettings,
+        settings: Box<NetPolicySettings>,
     },
     /// 解析 wg-quick 文本（纯函数，不落盘）。
     ParseWgConf {
@@ -173,6 +191,12 @@ pub enum Request {
     },
     ListProcessCandidates,
     GetConnections,
+    /// 获取当前激活订阅已加载的节点列表。
+    GetProxyNodes,
+    /// 测试当前激活订阅中的一个节点延迟（毫秒）。
+    TestProxyNode {
+        name: String,
+    },
     Blocked,
     ClearBlocked,
     DnsMap,
@@ -272,6 +296,9 @@ pub enum Request {
     },
     /// 按 thumbprint 精确删除本产品 CA。
     DecryptCaRemove,
+    /// 导出 CA **公钥证书 PEM**（非秘密），供 GUI 在当前用户上下文装进 `CurrentUser\Root`（§17.4/§17.8）。
+    /// 私钥永不出管道；此请求只返回公钥证书。
+    DecryptCaExportPublic,
     /// 开始明文会话（精确进程实例 + 必填域名 allowlist）。
     DecryptStart {
         target: DecryptTarget,
@@ -294,6 +321,43 @@ pub enum Request {
         offset: u64,
         len: u32,
     },
+
+    // ── minor 8：统一出口生命周期（出口设计 §8.8）───────────────────────────
+    /// 列出全部出口及其生命周期（与流量策略分离的两个维度）。
+    EgressList,
+    /// 启动出口：渲染进 mihomo 配置并立刻主动探测，**不改变任何导流规则**。
+    EgressStart {
+        id: String,
+    },
+    /// 停止出口：从 mihomo 配置摘除，指向它的规则按 fallback 处理（默认阻断）。
+    /// **不等于「停止管控」**（后者是 `Stop`）。
+    EgressStop {
+        id: String,
+    },
+    /// 立即重连（重置该出口的存量连接 + 重新握手/探测），不影响其它出口与导流。
+    EgressReconnect {
+        id: String,
+    },
+    /// 仅测试连接：执行一次主动探测并回报延迟，**不改变生命周期，也不改变导流策略**
+    /// （设计 §8.3：三者必须是不同操作）。
+    EgressProbe {
+        id: String,
+    },
+    /// 设置该出口不可用时的行为（阻断 / 明确允许回落直连）。
+    EgressSetFallback {
+        id: String,
+        fallback: EgressFallback,
+    },
+    /// 刷新代理订阅（**只刷配置来源**）。决议 §3.4/§6.3：刷新订阅与重连节点是两个动作，
+    /// 刷新不应无条件打断当前可用节点。
+    EgressRefreshSubscription {
+        id: String,
+    },
+    /// 切换代理订阅当前节点。会影响之后新建立的连接。
+    EgressSelectNode {
+        id: String,
+        node: String,
+    },
 }
 
 /// agent → 客户端响应。逐 Request 定型（设计 §4：响应与今天前端各命令返回一致）。
@@ -311,7 +375,7 @@ pub enum Response {
         status: NetPolicyStatus,
     },
     Settings {
-        settings: NetPolicySettings,
+        settings: Box<NetPolicySettings>,
     },
     Rules {
         rules: RuleSet,
@@ -324,6 +388,12 @@ pub enum Response {
     },
     Connections {
         snapshot: ConnectionsSnapshot,
+    },
+    ProxyNodes {
+        nodes: Vec<ProxyNode>,
+    },
+    ProxyNode {
+        node: ProxyNode,
     },
     Blocked {
         entries: Vec<BlockedEntry>,
@@ -383,6 +453,10 @@ pub enum Response {
     DecryptCa {
         status: CaStatus,
     },
+    /// CA 公钥证书 PEM（DecryptCaExportPublic 返回；非秘密，私钥永不出管道）。
+    DecryptCaPublic {
+        cert_pem: String,
+    },
     /// 单个明文会话（DecryptStart/Stop/Get/Delete 返回）。
     DecryptSession {
         session: DecryptSession,
@@ -398,6 +472,12 @@ pub enum Response {
         offset: u64,
         data_base64: String,
         eof: bool,
+    },
+    // ── minor 8：统一出口生命周期（出口设计 §8.8）───────────────────────────
+    /// 出口清单（EgressList/Start/Stop/Reconnect/Probe/SetFallback 都回全量清单——出口间
+    /// 状态相互影响，回全量可让 GUI 一次对齐，无需再补拉）。
+    Egresses {
+        egresses: Vec<EgressStatus>,
     },
     /// 无载荷成功（SaveSettings / ClearBlocked / SubscribeEvents 确认 / ResetConnections）。
     Ok,
@@ -419,6 +499,12 @@ pub enum Event {
     /// 订阅端落后（broadcast Lagged）：可能已丢事件，客户端应重新以 `GetCurrentOperation` +
     /// `GetStatus` 的真实态对齐；agent 发此帧后**关闭订阅连接**（设计评审点 8）。
     ResyncRequired,
+    /// 出口生命周期变迁（minor 8）。**与策略事件分开推送**：收到它只更新出口卡片，
+    /// 不得据此推断导流策略变化（出口设计 §8.8 末段）。
+    /// 装箱：`EgressStatus` 比其它事件载荷大一个数量级，内联会让每个 `Frame` 都按它的大小分配。
+    EgressChanged {
+        egress: Box<EgressStatus>,
+    },
 }
 
 /// 线上单帧（请求/响应配对用 `id`；事件无 id）。
@@ -426,7 +512,7 @@ pub enum Event {
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum Frame {
     Request { id: u64, req: Request },
-    Response { id: u64, resp: Response },
+    Response { id: u64, resp: Box<Response> },
     Event { ev: Event },
 }
 
@@ -435,7 +521,10 @@ impl Frame {
         Frame::Request { id, req }
     }
     pub fn response(id: u64, resp: Response) -> Frame {
-        Frame::Response { id, resp }
+        Frame::Response {
+            id,
+            resp: Box::new(resp),
+        }
     }
     pub fn event(ev: Event) -> Frame {
         Frame::Event { ev }
@@ -491,14 +580,50 @@ mod tests {
         );
         let bytes = encode(&f).unwrap();
         let back = decode(&bytes[4..]).unwrap();
-        if let Frame::Response {
-            resp: Response::Error { error },
-            ..
-        } = back
-        {
-            assert_eq!(error.kind, ErrorKind::OperationConflict);
+        if let Frame::Response { resp, .. } = back {
+            match *resp {
+                Response::Error { error } => assert_eq!(error.kind, ErrorKind::OperationConflict),
+                _ => panic!("wrong response"),
+            }
         } else {
             panic!("wrong");
+        }
+    }
+
+    #[test]
+    fn egress_requests_are_additive_and_wire_stable() {
+        // minor 8 是纯追加：major 不变，旧客户端仍可握手。
+        assert_eq!(
+            PROTOCOL_MAJOR, 1,
+            "Egress 面不得改动既有字段，major 必须不变"
+        );
+        let json = serde_json::to_string(&Frame::request(
+            1,
+            Request::EgressStop {
+                id: crate::egress::EGRESS_WG.into(),
+            },
+        ))
+        .unwrap();
+        assert!(json.contains("\"op\":\"egress_stop\""), "{json}");
+        assert!(json.contains("\"id\":\"wg\""), "{json}");
+
+        let f = Frame::request(
+            2,
+            Request::EgressSetFallback {
+                id: crate::egress::EGRESS_WG.into(),
+                fallback: EgressFallback::Direct,
+            },
+        );
+        let back = decode(&encode(&f).unwrap()[4..]).unwrap();
+        match back {
+            Frame::Request {
+                req: Request::EgressSetFallback { id, fallback },
+                ..
+            } => {
+                assert_eq!(id, "wg");
+                assert_eq!(fallback, EgressFallback::Direct);
+            }
+            _ => panic!("wrong frame"),
         }
     }
 

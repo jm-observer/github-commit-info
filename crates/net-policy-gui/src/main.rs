@@ -4,12 +4,15 @@
 )]
 
 mod app_state;
+mod ca_trust;
 mod net_policy;
+mod system_routes;
 
 use anyhow::{Context, Result};
 use app_state::AppState;
 use clap::{Parser, Subcommand};
 use log::LevelFilter::Info;
+use serde::Serialize;
 use std::path::PathBuf;
 
 const REPO_OWNER: &str = "jm-observer";
@@ -40,6 +43,32 @@ enum Command {
         #[arg(long, default_value = "config")]
         what: String,
     },
+}
+
+#[derive(Debug, Serialize)]
+struct BuildInfo {
+    version: &'static str,
+    commit: &'static str,
+    build_time: &'static str,
+}
+
+#[tauri::command]
+fn net_policy_build_info() -> BuildInfo {
+    BuildInfo {
+        version: env!("CARGO_PKG_VERSION"),
+        commit: env!("NET_POLICY_GIT_COMMIT"),
+        build_time: env!("NET_POLICY_BUILD_TIME"),
+    }
+}
+
+/// 直接读取 Windows 路由表；不依赖 net-policy-agent 或网络策略状态。
+#[tauri::command]
+async fn net_policy_system_routes() -> std::result::Result<Vec<system_routes::SystemRoute>, String>
+{
+    tokio::task::spawn_blocking(system_routes::read)
+        .await
+        .map_err(|_| "系统路由表读取任务异常".to_string())?
+        .map_err(|error| format!("{error:#}"))
 }
 
 /// 启用 trace-hub 全链路追踪——仅当设置了环境变量 `TRACE_HUB_ENDPOINT` 时生效；
@@ -113,9 +142,13 @@ fn run_gui(workspace: PathBuf) -> Result<()> {
     tauri::Builder::default()
         .manage(state.clone())
         .invoke_handler(tauri::generate_handler![
+            net_policy_build_info,
+            net_policy_system_routes,
             // net-policy 模块
             net_policy::net_policy_get_status,
             net_policy::net_policy_connections,
+            net_policy::net_policy_proxy_nodes,
+            net_policy::net_policy_test_proxy_node,
             net_policy::net_policy_get_settings,
             net_policy::net_policy_save_settings,
             net_policy::net_policy_parse_wg_conf,
@@ -148,6 +181,24 @@ fn run_gui(workspace: PathBuf) -> Result<()> {
             net_policy::net_policy_capture_list,
             net_policy::net_policy_capture_delete,
             net_policy::net_policy_capture_read,
+            net_policy::net_policy_decrypt_ca_status,
+            net_policy::net_policy_decrypt_ca_create,
+            net_policy::net_policy_decrypt_ca_install,
+            net_policy::net_policy_decrypt_ca_remove,
+            net_policy::net_policy_decrypt_start,
+            net_policy::net_policy_decrypt_stop,
+            net_policy::net_policy_decrypt_get,
+            net_policy::net_policy_decrypt_list,
+            net_policy::net_policy_decrypt_delete,
+            net_policy::net_policy_decrypt_read,
+            net_policy::net_policy_egress_list,
+            net_policy::net_policy_egress_start,
+            net_policy::net_policy_egress_stop,
+            net_policy::net_policy_egress_reconnect,
+            net_policy::net_policy_egress_probe,
+            net_policy::net_policy_egress_set_fallback,
+            net_policy::net_policy_egress_refresh_subscription,
+            net_policy::net_policy_egress_select_node,
         ])
         .setup(move |app| {
             net_policy::setup(app.handle(), state.net_policy.clone())

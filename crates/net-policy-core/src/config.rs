@@ -10,9 +10,8 @@ use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 
-/// 出口路由。作为**单条规则**的命中出口时取 `Direct`/`Wg`（把程序/域名/IP 白名单到直连，
-/// 或显式指向 SBN 海外）；作为**默认出口**（`NetPolicySettings::default_route`，未命中任何规则的
-/// 兜底）时取 `Direct`（默认，观察模式，原样直连）、`Wg`（全走海外）或 `Blackhole`（全阻断）。
+/// 出口路由。作为**单条规则**的命中出口时可取 `Direct`/`Wg`/`Proxy`；作为**默认出口**
+/// （`NetPolicySettings::default_route`，未命中任何规则的兜底）时还可取 `Blackhole`（全阻断）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "lowercase")]
 pub enum Route {
@@ -21,6 +20,8 @@ pub enum Route {
     /// 走 WireGuard 海外出口（默认 per-rule 出口）。
     #[default]
     Wg,
+    /// 走当前激活的代理订阅节点组。
+    Proxy,
     /// 黑洞：静默丢弃（mihomo `REJECT-DROP`）。"空出口"——什么都上不去，不依赖任何 SBN。
     Blackhole,
 }
@@ -31,6 +32,7 @@ impl Route {
         match self {
             Route::Direct => "DIRECT",
             Route::Wg => "wg-out",
+            Route::Proxy => "subscription-out",
             // REJECT-DROP：静默丢包（真"空出口"），比 REJECT（回 RST）更贴"网络什么都上不去"。
             Route::Blackhole => "REJECT-DROP",
         }
@@ -165,6 +167,9 @@ pub struct WgConfig {
     /// **客户端与服务端必须用完全相同的一组参数**，否则握手失败。留空 = 标准 WireGuard。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub amnezia: Option<AmneziaConfig>,
+    /// 可选的 WireGuard endpoint 上游代理。启用后，mihomo 通过该代理发起 WG 握手。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dialer_proxy: Option<WgDialerProxy>,
 }
 
 fn default_mtu() -> u32 {
@@ -204,6 +209,178 @@ pub struct AmneziaConfig {
     pub h2: u32,
     pub h3: u32,
     pub h4: u32,
+}
+
+/// WireGuard endpoint 的底层代理。SOCKS5 才支持 UDP relay；HTTP 仅用于 mihomo
+/// 支持的 TCP 代理场景，因此默认关闭 UDP。
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct WgDialerProxy {
+    #[serde(rename = "type")]
+    pub kind: WgDialerProxyKind,
+    pub server: String,
+    pub port: u16,
+    #[serde(default)]
+    pub username: String,
+    #[serde(default)]
+    pub password: String,
+    #[serde(default)]
+    pub udp: bool,
+    /// 可选：使用订阅槽位中的 mihomo 节点组；设置后忽略手工 server/port。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub subscription_slot: Option<u8>,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum WgDialerProxyKind {
+    Socks5,
+    Http,
+}
+
+impl WgDialerProxy {
+    pub fn validate(&self) -> Result<()> {
+        if let Some(slot) = self.subscription_slot {
+            if slot > 1 {
+                anyhow::bail!("订阅槽位只能是 0 或 1");
+            }
+            return Ok(());
+        }
+        valid::host(&self.server).context("WG 上游代理地址非法")?;
+        if self.port == 0 {
+            anyhow::bail!("WG 上游代理端口非法");
+        }
+        if self.udp && self.kind != WgDialerProxyKind::Socks5 {
+            anyhow::bail!("HTTP 上游代理不支持 UDP relay，请改用 SOCKS5 或关闭 UDP");
+        }
+        for (name, value) in [("用户名", &self.username), ("密码", &self.password)] {
+            if value.chars().any(|c| c.is_control() || "\r\n".contains(c)) {
+                anyhow::bail!("WG 上游代理{name}不能包含换行");
+            }
+        }
+        Ok(())
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ProxySubscription {
+    pub name: String,
+    pub url: String,
+    #[serde(default = "default_subscription_interval")]
+    pub interval_secs: u64,
+}
+
+fn default_subscription_interval() -> u64 {
+    3600
+}
+
+impl Default for ProxySubscription {
+    fn default() -> Self {
+        Self {
+            name: String::new(),
+            url: String::new(),
+            interval_secs: default_subscription_interval(),
+        }
+    }
+}
+
+impl ProxySubscription {
+    pub fn validate(&self) -> Result<()> {
+        if self.name.trim().is_empty() || self.name.len() > 128 {
+            anyhow::bail!("订阅名称不能为空且不能超过 128 字符");
+        }
+        if self
+            .name
+            .chars()
+            .any(|c| c.is_control() || "\r\n\\\"'`<>".contains(c))
+        {
+            anyhow::bail!("订阅名称包含非法字符");
+        }
+        valid::http_url(&self.url)?;
+        if !(60..=86_400).contains(&self.interval_secs) {
+            anyhow::bail!("订阅更新间隔应在 60~86400 秒之间");
+        }
+        Ok(())
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+pub struct ProxySubscriptions {
+    #[serde(default)]
+    pub first: Option<ProxySubscription>,
+    #[serde(default)]
+    pub second: Option<ProxySubscription>,
+    /// 当前激活槽位：0=第一条，1=第二条；None 表示未选择。
+    #[serde(default)]
+    pub active: Option<u8>,
+}
+
+/// mihomo 暴露给本机应用使用的显式代理监听端口。HTTP 端口通过 CONNECT 承载 HTTPS，
+/// 并不是 TLS 加密的本地监听端口；两个端口都只监听 loopback（`allow-lan: false`）。
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct LocalProxyListeners {
+    #[serde(default = "default_socks_port")]
+    pub socks_port: u16,
+    #[serde(default = "default_http_port")]
+    pub http_port: u16,
+}
+
+fn default_socks_port() -> u16 {
+    7891
+}
+
+fn default_http_port() -> u16 {
+    7890
+}
+
+impl Default for LocalProxyListeners {
+    fn default() -> Self {
+        Self {
+            socks_port: default_socks_port(),
+            http_port: default_http_port(),
+        }
+    }
+}
+
+impl LocalProxyListeners {
+    pub fn validate(&self) -> Result<()> {
+        if self.socks_port == 0 || self.http_port == 0 {
+            anyhow::bail!("本地代理监听端口必须在 1~65535 之间");
+        }
+        if self.socks_port == self.http_port {
+            anyhow::bail!("SOCKS5 与 HTTP CONNECT 监听端口不能相同");
+        }
+        Ok(())
+    }
+}
+
+impl ProxySubscriptions {
+    pub fn get(&self, slot: u8) -> Option<&ProxySubscription> {
+        match slot {
+            0 => self.first.as_ref(),
+            1 => self.second.as_ref(),
+            _ => None,
+        }
+    }
+
+    pub fn active_subscription(&self) -> Option<(u8, &ProxySubscription)> {
+        let slot = self.active?;
+        self.get(slot).map(|subscription| (slot, subscription))
+    }
+
+    pub fn validate(&self) -> Result<()> {
+        if let Some(sub) = &self.first {
+            sub.validate().context("第一条订阅非法")?;
+        }
+        if let Some(sub) = &self.second {
+            sub.validate().context("第二条订阅非法")?;
+        }
+        if let Some(active) = self.active {
+            if active > 1 || self.get(active).is_none() {
+                anyhow::bail!("激活订阅槽位不存在");
+            }
+        }
+        Ok(())
+    }
 }
 
 impl AmneziaConfig {
@@ -399,6 +576,7 @@ impl WgConfig {
             pre_shared_key,
             mtu: mtu.unwrap_or_else(default_mtu),
             amnezia,
+            dialer_proxy: None,
         })
     }
 
@@ -423,6 +601,9 @@ impl WgConfig {
         }
         if let Some(a) = &self.amnezia {
             a.validate().context("AmneziaWG 混淆参数非法")?;
+        }
+        if let Some(proxy) = &self.dialer_proxy {
+            proxy.validate()?;
         }
         Ok(())
     }
@@ -459,6 +640,53 @@ pub struct NetPolicySettings {
     /// 路由或实际目标。
     #[serde(default)]
     pub sniffer_enabled: bool,
+    /// 最多两条 mihomo 订阅，可作为独立默认出口，也可供 WireGuard dialer-proxy 选择。
+    #[serde(default)]
+    pub proxy_subscriptions: ProxySubscriptions,
+    /// 本机应用可连接的 SOCKS5 / HTTP CONNECT 监听端口。
+    #[serde(default)]
+    pub local_proxy: LocalProxyListeners,
+    /// **出口的持久化意图**（出口决议 §7.3）：启停意图与 fallback 策略必须跨 agent 重启存活
+    /// ——否则用户「停掉 WG 并要求阻断」的决定会在下次开机静默失效，那是安全语义倒退。
+    #[serde(default)]
+    pub egress_prefs: EgressPrefs,
+}
+
+/// 单个出口的持久化偏好。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct EgressPref {
+    /// 用户是否希望该出口在线。false = 显式停用，配置生成时摘除其 outbound。
+    #[serde(default = "default_true")]
+    pub up: bool,
+    /// 该出口不可用时指向它的规则如何处理。**默认阻断**（fail-closed，决议 §5）。
+    #[serde(default)]
+    pub fallback: crate::egress::EgressFallback,
+}
+
+impl Default for EgressPref {
+    fn default() -> Self {
+        Self {
+            up: true,
+            fallback: crate::egress::EgressFallback::Block,
+        }
+    }
+}
+
+/// 各出口的持久化偏好（按出口 id 索引；缺项取 [`EgressPref::default`]）。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub struct EgressPrefs {
+    #[serde(flatten)]
+    pub by_id: std::collections::BTreeMap<String, EgressPref>,
+}
+
+impl EgressPrefs {
+    pub fn get(&self, id: &str) -> EgressPref {
+        self.by_id.get(id).copied().unwrap_or_default()
+    }
+
+    pub fn set(&mut self, id: &str, pref: EgressPref) {
+        self.by_id.insert(id.to_string(), pref);
+    }
 }
 
 /// 默认出口缺省值 = 直连·观察（observer-first：进页即可观察流量，不改路由，不依赖 SBN）。
@@ -494,6 +722,9 @@ impl Default for NetPolicySettings {
             default_route: Route::Direct,
             enabled: false,
             sniffer_enabled: false,
+            proxy_subscriptions: ProxySubscriptions::default(),
+            local_proxy: LocalProxyListeners::default(),
+            egress_prefs: EgressPrefs::default(),
         }
     }
 }
@@ -505,12 +736,26 @@ impl NetPolicySettings {
     /// 允许通过（纯黑洞，不依赖 SBN）。「某条规则指向海外但 WG 缺失」的跨表一致性在 apply/reload
     /// 时由 `validate_combined` 再查（此处拿不到 rules）。
     pub fn validate(&self) -> Result<()> {
+        self.proxy_subscriptions.validate()?;
+        self.local_proxy.validate()?;
+        if self.default_route == Route::Proxy
+            && self.proxy_subscriptions.active_subscription().is_none()
+        {
+            anyhow::bail!("默认出口=代理订阅，但尚未配置并激活订阅");
+        }
         if self.default_route == Route::Wg {
             self.wg
                 .validate()
                 .context("默认出口=海外(SBN)，需有效的 WireGuard 配置")?;
         } else if !self.wg.is_blank() {
             self.wg.validate()?;
+        }
+        if let Some(proxy) = &self.wg.dialer_proxy {
+            if let Some(slot) = proxy.subscription_slot {
+                if self.proxy_subscriptions.get(slot).is_none() {
+                    anyhow::bail!("WireGuard 引用的订阅槽位不存在");
+                }
+            }
         }
         // IPv6 旁路防护：mihomo 配置 `ipv6:false` 时 TUN 不接管 v6 路由，v6 的封锁完全靠
         // 防火墙 KS-IPv6Block（仅 block_ipv6=true 时创建）。若姿态是黑洞/海外却关掉 block_ipv6，
@@ -539,6 +784,45 @@ impl NetPolicySettings {
 pub struct TempDirect {
     pub active: bool,
     pub except: Vec<ProcessRef>,
+}
+
+/// L4 解密自动导流（抓包设计 §17.3 方案 B）：有活跃解密会话时，把**目标进程的 TCP HTTP(S)**
+/// 通过最高优先级规则送往 loopback MITM outbound（`http://127.0.0.1:<mitm_port>`），MITM 上游再链回
+/// mihomo（保留原出口语义），域名 allowlist 由 MITM 引擎在 TLS 层执行。这是 agent 的**运行态**，
+/// 不落 settings.json；配置生成时传入。
+///
+/// **防环**：导流只匹配目标进程；MITM 的上游连接由 agent 进程发起，不匹配该进程规则，不会再被导流。
+/// **QUIC（§17.7）**：默认只导流 `NETWORK,tcp`，UDP/443（QUIC）不动、不解密（诚实旁路）；仅当
+/// `force_tcp_for_quic` 时对目标进程 + allowlist 域名的 UDP/443 加 REJECT 规则逼其回退 TCP。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DecryptDivert {
+    pub active: bool,
+    /// 目标进程（精确路径优先，名兜底）。
+    pub targets: Vec<ProcessRef>,
+    /// allowlist 域名（仅 `force_tcp_for_quic` 生成 UDP/443 REJECT 规则时用；导流本身不按域名，
+    /// 域名过滤在 MITM 引擎里做）。
+    pub domains: Vec<String>,
+    /// loopback MITM 监听端口（固定单会话，见 `decrypt_manager::MITM_PORT`）。
+    pub mitm_port: u16,
+    /// 逼 QUIC 回退 TCP（§17.7）：对目标进程 + allowlist 域名的 UDP/443 加 REJECT。默认 false。
+    pub force_tcp_for_quic: bool,
+    /// loopback 代理 Basic Auth 用户名/密码；仅存在于内存和生成配置，绝不进入会话 DTO。
+    pub proxy_username: String,
+    pub proxy_password: String,
+}
+
+impl Default for DecryptDivert {
+    fn default() -> Self {
+        Self {
+            active: false,
+            targets: Vec::new(),
+            domains: Vec::new(),
+            mitm_port: 18081,
+            force_tcp_for_quic: false,
+            proxy_username: String::new(),
+            proxy_password: String::new(),
+        }
+    }
 }
 
 /// 规则集合（与 settings 分文件存）。
@@ -625,12 +909,27 @@ pub fn validate_combined(settings: &NetPolicySettings, rules: &RuleSet) -> Resul
     if wg_needed && settings.wg.validate().is_err() {
         anyhow::bail!("有「默认出口/规则」指向海外(SBN)，但 WireGuard 未配置或无效——请先配置 SBN，或把它们改为「阻断/直连」");
     }
+    let proxy_needed = settings.default_route == Route::Proxy
+        || rules.rules.iter().any(|r| r.route() == Route::Proxy)
+        || rules.groups.iter().any(|g| g.route == Route::Proxy);
+    if proxy_needed && settings.proxy_subscriptions.active_subscription().is_none() {
+        anyhow::bail!("有「默认出口/规则」指向代理订阅，但尚未配置并激活订阅");
+    }
     Ok(())
 }
 
 /// net-policy workspace 子目录。
 pub fn net_policy_dir(workspace: &Path) -> PathBuf {
-    workspace.join("net-policy")
+    // 服务模式传入的 workspace 已经是 `%ProgramData%\\net-policy`；避免再追加一层。
+    // 用户模式仍使用 `<workspace>/net-policy` 的既有布局。
+    if workspace
+        .file_name()
+        .is_some_and(|name| name == "net-policy")
+    {
+        workspace.to_path_buf()
+    } else {
+        workspace.join("net-policy")
+    }
 }
 
 fn settings_path(workspace: &Path) -> PathBuf {
@@ -955,6 +1254,29 @@ Endpoint = 1.2.3.4:51820
         s.default_route = Route::Direct;
         s.block_ipv6 = false;
         s.validate().expect("直连观察姿态允许关 block_ipv6");
+    }
+
+    #[test]
+    fn proxy_route_requires_active_subscription() {
+        let settings = NetPolicySettings {
+            default_route: Route::Proxy,
+            ..Default::default()
+        };
+        let error = settings.validate().expect_err("无激活订阅必须拒绝代理出口");
+        assert!(error.to_string().contains("尚未配置并激活订阅"));
+    }
+
+    #[test]
+    fn local_proxy_listener_ports_must_be_distinct() {
+        let settings = NetPolicySettings {
+            local_proxy: LocalProxyListeners {
+                socks_port: 7890,
+                http_port: 7890,
+            },
+            ..Default::default()
+        };
+        let error = settings.validate().expect_err("重复监听端口必须拒绝");
+        assert!(error.to_string().contains("不能相同"));
     }
 
     #[test]

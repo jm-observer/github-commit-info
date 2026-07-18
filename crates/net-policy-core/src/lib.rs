@@ -12,11 +12,13 @@
 //! - [`operation`]：长操作状态机与进度模型。
 //! - [`capture`]：抓包纯逻辑（协议 DTO / 参数校验 / 过滤器预算 / 状态机；真实 pktmon 后端在 agent）。
 //! - [`decrypt`]：L4 应用明文纯逻辑（会话/CA/目标 DTO / 脱敏 / 状态机；真实 MITM 引擎在 agent，受 ADR 阻断）。
+//! - [`egress`]：统一出口模型（生命周期状态机 / 出口清单派生 / 停用出口的 fail-closed 解析）。
 //! - [`protocol`]：版本化 typed 管道线协议（client/agent 共用；即 `net-policy-core::protocol`）。
 
 pub mod capture;
 pub mod config;
 pub mod decrypt;
+pub mod egress;
 pub mod mihomo;
 pub mod operation;
 pub mod protocol;

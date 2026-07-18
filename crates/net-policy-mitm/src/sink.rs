@@ -57,6 +57,22 @@ pub trait FlowSink: Send + Sync {
     fn on_request(&self, req: &FlowRequest);
     fn on_response(&self, resp: &FlowResponse);
     fn on_ws_frame(&self, frame: &FlowWsFrame);
+
+    /// A CONNECT for `domain` was **not** intercepted (allowlist miss) and relayed
+    /// as an opaque TCP tunnel — no plaintext was produced. Default: no-op.
+    ///
+    /// Consumers use this for the honest "passthrough" per-domain counter
+    /// (net-policy §17.9): a domain the user targeted may still show up here if it
+    /// didn't match the allowlist, and the UI must not report it as "decrypted".
+    fn on_passthrough(&self, _domain: &str) {}
+
+    /// The client **rejected** the forged leaf certificate during the MITM TLS
+    /// handshake (certificate pinning / a bundled CA / mTLS refusal). No plaintext
+    /// was obtained. Default: no-op.
+    ///
+    /// This is the honest "pinned / client_rejected_cert" signal (net-policy
+    /// §17.7): the engine must never claim a pinned connection was decrypted.
+    fn on_client_cert_rejected(&self, _domain: &str) {}
 }
 
 /// A [`FlowSink`] that does nothing. Useful when the engine should only decrypt

@@ -21,6 +21,16 @@ custom-utils = { workspace = true, features = ["updater", "trace"] }
 net-policy-core = { path = "../net-policy-core" }
 net-policy-client = { path = "../net-policy-client" }
 
+# 系统路由表：原生 IP Helper API 直读（GetIpForwardTable2 / ConvertInterfaceLuidToAlias /
+# GetIpInterfaceEntry），不再拉起 PowerShell（无子进程、无窗口闪、无输出编码坑）。
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.59", features = [
+    "Win32_Foundation",
+    "Win32_NetworkManagement_IpHelper",
+    "Win32_NetworkManagement_Ndis",
+    "Win32_Networking_WinSock",
+] }
+
 [features]
 default = ["custom-protocol"]
 custom-protocol = ["tauri/custom-protocol"]

@@ -1,19 +1,25 @@
 import { useState } from 'react'
 import {
   Activity,
+  Cloud,
   FileClock,
   Gauge,
+  Info,
+  Network,
   Radar,
   RefreshCw,
+  Router,
   ScrollText,
   SlidersHorizontal,
   Settings,
   ShieldCheck,
   Stethoscope,
   Timer,
+  Unlock,
 } from 'lucide-react'
 import { useNetPolicyProbe } from './ProbeContext'
 import { useNetPolicyController } from './NetPolicyController'
+import { PageHeaderProvider, usePageHeaderSlot } from './PageHeaderContext'
 import { btn } from './uiHelpers'
 import { OverviewPage } from './pages/OverviewPage'
 import { TrafficPage } from './pages/TrafficPage'
@@ -24,8 +30,13 @@ import { DiagnosticsPage } from './pages/DiagnosticsPage'
 import { SettingsPage } from './pages/SettingsPage'
 import { LogsPage } from './pages/LogsPage'
 import { CapturePage } from './pages/CapturePage'
+import { DecryptPage } from './pages/DecryptPage'
+import { AboutPage } from './pages/AboutPage'
+import { ProxySubscriptionsPage } from './pages/ProxySubscriptionsPage'
+import { SystemRoutesPage } from './pages/SystemRoutesPage'
+import { EgressPage } from './pages/EgressPage'
 
-type MenuKey = 'overview' | 'traffic' | 'policy' | 'tempdirect' | 'records' | 'capture' | 'logs' | 'diagnostics' | 'settings'
+type MenuKey = 'overview' | 'egress' | 'traffic' | 'policy' | 'proxy' | 'tempdirect' | 'records' | 'capture' | 'decrypt' | 'logs' | 'diagnostics' | 'system-routes' | 'settings' | 'about'
 
 interface MenuItem {
   key: MenuKey
@@ -39,8 +50,10 @@ const MENU_GROUPS: { label: string; items: MenuItem[] }[] = [
     label: '核心',
     items: [
       { key: 'overview', label: '概览', description: '保护姿态、默认出口与数据通路。', icon: <Gauge size={16} /> },
+      { key: 'egress', label: '出口', description: '出口生命周期（启动/停止/重连/健康）与是否被策略使用。', icon: <Router size={16} /> },
       { key: 'traffic', label: '流量', description: '观察活跃与被阻断流量，并直接调整出口。', icon: <Activity size={16} /> },
       { key: 'policy', label: '策略编排', description: '维护用户规则，并核对最终生效顺序。', icon: <SlidersHorizontal size={16} /> },
+      { key: 'proxy', label: '代理订阅', description: '管理订阅、激活出口及本地 SOCKS5/HTTP 端口。', icon: <Cloud size={16} /> },
     ],
   },
   {
@@ -49,6 +62,7 @@ const MENU_GROUPS: { label: string; items: MenuItem[] }[] = [
       { key: 'tempdirect', label: '临时直连', description: '海外出口故障时限时切换直连。', icon: <Timer size={16} /> },
       { key: 'records', label: '操作记录', description: '查看请求、事件与进程树。', icon: <FileClock size={16} /> },
       { key: 'capture', label: '抓包', description: '抓取 TUN 数据包，导出 Wireshark pcapng。', icon: <Radar size={16} /> },
+      { key: 'decrypt', label: '应用明文', description: 'TLS 解密（专用 CA，高风险，默认脱敏）。', icon: <Unlock size={16} /> },
       { key: 'logs', label: '日志', description: 'mihomo / WireGuard 隧道的实时运行日志。', icon: <ScrollText size={16} /> },
     ],
   },
@@ -56,7 +70,9 @@ const MENU_GROUPS: { label: string; items: MenuItem[] }[] = [
     label: '系统',
     items: [
       { key: 'diagnostics', label: '诊断', description: '检查本机网络栈并运行验证。', icon: <Stethoscope size={16} /> },
+      { key: 'system-routes', label: '系统路由表', description: '直接查看 Windows 当前路由。', icon: <Network size={16} /> },
       { key: 'settings', label: 'WireGuard 设置', description: '配置海外隧道与 kill-switch。', icon: <Settings size={16} /> },
+      { key: 'about', label: '关于', description: '查看版本、编译 commit 与编译时间。', icon: <Info size={16} /> },
     ],
   },
 ]
@@ -66,14 +82,19 @@ const MENU_ITEMS = MENU_GROUPS.flatMap((group) => group.items)
 function renderPage(key: MenuKey) {
   switch (key) {
     case 'overview': return <OverviewPage />
+    case 'egress': return <EgressPage />
     case 'traffic': return <TrafficPage />
     case 'policy': return <PolicyPage />
+    case 'proxy': return <ProxySubscriptionsPage />
     case 'records': return <RecordsPage />
     case 'capture': return <CapturePage />
+    case 'decrypt': return <DecryptPage />
     case 'logs': return <LogsPage />
     case 'tempdirect': return <TempDirectPage />
     case 'diagnostics': return <DiagnosticsPage />
+    case 'system-routes': return <SystemRoutesPage />
     case 'settings': return <SettingsPage />
+    case 'about': return <AboutPage />
   }
 }
 
@@ -82,6 +103,14 @@ export function NetPolicyShell() {
   const { busy, msg, refresh } = useNetPolicyController()
   const [active, setActive] = useState<MenuKey>('overview')
   const current = MENU_ITEMS.find((item) => item.key === active) ?? MENU_ITEMS[0]
+  // 页头操作插槽：当前页可注入自己的头部操作，未注入则回退到默认全局刷新。
+  const { slot, setSlot, ctx } = usePageHeaderSlot()
+
+  // 切页时先清空插槽，避免上一页的操作在新页 effect 注入前残留一帧。
+  const goto = (key: MenuKey) => {
+    setSlot(null)
+    setActive(key)
+  }
 
   return (
     <div className="mx-auto flex max-w-7xl gap-6">
@@ -106,7 +135,7 @@ export function NetPolicyShell() {
                 {group.items.map((item) => (
                   <button
                     key={item.key}
-                    onClick={() => setActive(item.key)}
+                    onClick={() => goto(item.key)}
                     aria-current={active === item.key ? 'page' : undefined}
                     className={`flex w-full items-center gap-2 rounded-md px-2.5 py-2 text-left text-sm transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-blue-400 ${
                       active === item.key
@@ -130,9 +159,11 @@ export function NetPolicyShell() {
             <h1 className="text-lg font-semibold text-gray-900 dark:text-gray-100">{current.label}</h1>
             <p className="mt-0.5 text-xs text-gray-500 dark:text-gray-400">{current.description}</p>
           </div>
-          <button className={btn()} onClick={() => void refresh()} disabled={busy}>
-            <RefreshCw size={14} className={busy ? 'animate-spin' : ''} /> 刷新
-          </button>
+          {slot ? slot.node : (
+            <button className={btn()} onClick={() => void refresh()} disabled={busy}>
+              <RefreshCw size={14} className={busy ? 'animate-spin' : ''} /> 刷新
+            </button>
+          )}
         </header>
 
         {status && !status.platform_supported && (
@@ -147,7 +178,9 @@ export function NetPolicyShell() {
           </div>
         )}
 
-        {renderPage(active)}
+        <PageHeaderProvider value={ctx}>
+          {renderPage(active)}
+        </PageHeaderProvider>
       </main>
 
       {msg && (

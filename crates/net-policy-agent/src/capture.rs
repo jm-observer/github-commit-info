@@ -530,7 +530,15 @@ impl CaptureManager {
             return Err(internal(e));
         }
         // 确认进入 running（§8#5：status 确认后才算 running）。
-        if !status_running().map_err(internal)? {
+        let running = match status_running() {
+            Ok(running) => running,
+            Err(e) => {
+                let _ = stop_capture();
+                let _ = remove_filters();
+                return Err(internal(e));
+            }
+        };
+        if !running {
             let _ = stop_capture();
             let _ = remove_filters();
             return Err(ProtocolError::new(
@@ -565,7 +573,11 @@ impl CaptureManager {
             convert_ok: false,
             known_limits,
         };
-        self.store.write_manifest(&manifest).map_err(internal)?;
+        if let Err(e) = self.store.write_manifest(&manifest) {
+            let _ = stop_capture();
+            let _ = remove_filters();
+            return Err(internal(e));
+        }
         let session = manifest.to_session(CaptureState::Running, None);
         *slot = Some(Active {
             id,
@@ -591,6 +603,11 @@ impl CaptureManager {
             // 幂等：非活跃 → 返回磁盘上的当前态。
             return self.get(id);
         }
+        // 先停 pktmon，再移除过滤器。stop 失败时保留 active 所有权，允许调用者重试，且不会产生
+        // “过滤器已撤但全 TUN 仍在抓”的窗口。
+        if let Err(e) = stop_capture() {
+            return Err(internal(e));
+        }
         let active = slot.take().unwrap();
         // §8 finally：本会话若加过过滤器，无论成败都 best-effort 清除（开始前已确认过滤器为空，
         // 故此处 remove 只会清掉本会话自己加的）。
@@ -599,7 +616,6 @@ impl CaptureManager {
         }
         // stop → etl2pcap → 校验 → 写 manifest。失败标 failed 并保留可诊断错误。
         let result = (|| -> Result<CaptureManifest> {
-            stop_capture()?;
             let dir = self.store.session_dir(&active.id).context("session dir")?;
             let pcapng = dir.join("capture.pcapng");
             let etl_bytes = std::fs::metadata(&active.etl).map(|m| m.len()).unwrap_or(0);
@@ -611,8 +627,10 @@ impl CaptureManager {
                 bail!("pcapng 过小（{pcapng_bytes} 字节），疑转换失败");
             }
             // 校验 pcapng SHB 魔数（0x0A0D0D0A）。
-            let head = std::fs::read(&pcapng)?;
-            if head.len() < 4 || head[0..4] != [0x0A, 0x0D, 0x0D, 0x0A] {
+            use std::io::Read;
+            let mut head = [0u8; 4];
+            std::fs::File::open(&pcapng)?.read_exact(&mut head)?;
+            if head != [0x0A, 0x0D, 0x0D, 0x0A] {
                 bail!("pcapng 头魔数非法（非 0x0A0D0D0A）");
             }
             let mut m = active.manifest.clone();

@@ -8,7 +8,10 @@
 
 mod capture;
 mod connections;
+mod decrypt_manager;
 mod decrypt_sink;
+mod dpapi;
+mod egress;
 mod engine;
 mod firewall;
 mod frame;
@@ -19,6 +22,7 @@ mod ops;
 mod paths;
 mod proc;
 mod process_watch;
+mod proxies;
 mod ptree;
 mod repair;
 mod security;
@@ -186,6 +190,13 @@ fn run_with_ready(
 fn init_log(service_mode: bool) {
     if service_mode {
         let root = paths::service_workspace();
+        // 先修复旧版本可能留下的 ACL，再创建并打开日志文件；否则 LocalSystem
+        // 遇到损坏的 ProgramData\net-policy 目录时会在 logger 启动阶段直接退出。
+        let _ = crate::security::harden_machine_data_dir(&root);
+        // 服务首次安装时 workspace 尚不存在；logger 的 prod 构建会直接打开
+        // etc/<app>.toml 和 log/<app>.log，必须在启动 logger 前创建父目录。
+        let _ = std::fs::create_dir_all(root.join("etc"));
+        let _ = std::fs::create_dir_all(root.join("log"));
         let _ = custom_utils::logger::logger_feature_with_path(
             "net-policy-agent",
             "info,reqwest=warn",

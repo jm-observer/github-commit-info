@@ -12,6 +12,8 @@ use crate::sink::{FlowRequest, FlowResponse};
 
 use super::session::MitmSession;
 
+const MAX_H2_BODY_SIZE: usize = 50 * 1024 * 1024;
+
 pub(super) async fn relay_h2<ClientTls, UpstreamTls>(
     client_tls: ClientTls,
     upstream_tls: UpstreamTls,
@@ -179,6 +181,9 @@ async fn read_h2_body(stream: &mut h2::RecvStream) -> Result<Vec<u8>> {
     let mut body = Vec::new();
     while let Some(chunk) = stream.data().await {
         let chunk = chunk.context("read HTTP/2 data frame")?;
+        if body.len().saturating_add(chunk.len()) > MAX_H2_BODY_SIZE {
+            anyhow::bail!("HTTP/2 body exceeds {MAX_H2_BODY_SIZE} bytes");
+        }
         body.extend_from_slice(&chunk);
         stream
             .flow_control()

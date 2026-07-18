@@ -212,6 +212,27 @@ pub fn is_sensitive_query_key(key: &str) -> bool {
     SENSITIVE_QUERY_SUBSTRINGS.iter().any(|s| k.contains(s))
 }
 
+fn percent_decode_key(key: &str) -> String {
+    let bytes = key.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'%' && i + 2 < bytes.len() {
+            let hex = [bytes[i + 1], bytes[i + 2]];
+            if let Ok(hex) = std::str::from_utf8(&hex) {
+                if let Ok(value) = u8::from_str_radix(hex, 16) {
+                    out.push(value);
+                    i += 3;
+                    continue;
+                }
+            }
+        }
+        out.push(if bytes[i] == b'+' { b' ' } else { bytes[i] });
+        i += 1;
+    }
+    String::from_utf8_lossy(&out).into_owned()
+}
+
 /// 按脱敏档处理一个头值：`Default` 对敏感头替换为 `[REDACTED]`；`Raw` 保留原值（§17.6）。
 pub fn redact_header_value(name: &str, value: &str, profile: RedactProfile) -> String {
     match profile {
@@ -229,7 +250,9 @@ pub fn redact_query(query: &str, profile: RedactProfile) -> String {
     query
         .split('&')
         .map(|pair| match pair.split_once('=') {
-            Some((k, _v)) if is_sensitive_query_key(k) => format!("{k}={REDACTED}"),
+            Some((k, _v)) if is_sensitive_query_key(&percent_decode_key(k)) => {
+                format!("{k}={REDACTED}")
+            }
             _ => pair.to_string(),
         })
         .collect::<Vec<_>>()
@@ -283,14 +306,48 @@ fn body_text(
     let truncated = body.len() > cap;
     let slice = &body[..body.len().min(cap)];
     let mut text = String::from_utf8_lossy(slice).into_owned();
-    // form 正文里的敏感键（token/password…）按 query 脱敏（§17.6）。
-    if content_type
-        .map(|c| c.to_ascii_lowercase().contains("application/x-www-form-urlencoded"))
-        .unwrap_or(false)
-    {
-        text = redact_query(&text, opts.redact_profile);
+    if matches!(opts.redact_profile, RedactProfile::Raw) {
+        return (Some(text), truncated);
     }
-    (Some(text), truncated)
+    let content_type = content_type
+        .map(str::to_ascii_lowercase)
+        .unwrap_or_default();
+    // form 正文里的敏感键（token/password…）按 query 脱敏（§17.6）。
+    if content_type.contains("application/x-www-form-urlencoded") {
+        text = redact_query(&text, opts.redact_profile);
+        return (Some(text), truncated);
+    }
+    // JSON 递归按键脱敏。解析失败、multipart、纯文本及未知类型在 Default 档不落正文：这些格式
+    // 无法可靠识别凭据边界，宁可只保留 body_size，也不把 secret 明文写盘。
+    if content_type.contains("application/json") || content_type.contains("+json") {
+        let mut value: serde_json::Value = match serde_json::from_str(&text) {
+            Ok(value) => value,
+            Err(_) => return (None, truncated),
+        };
+        redact_json_value(&mut value);
+        return (serde_json::to_string(&value).ok(), truncated);
+    }
+    (None, truncated)
+}
+
+fn redact_json_value(value: &mut serde_json::Value) {
+    match value {
+        serde_json::Value::Object(map) => {
+            for (key, value) in map {
+                if is_sensitive_query_key(key) {
+                    *value = serde_json::Value::String(REDACTED.to_string());
+                } else {
+                    redact_json_value(value);
+                }
+            }
+        }
+        serde_json::Value::Array(values) => {
+            for value in values {
+                redact_json_value(value);
+            }
+        }
+        _ => {}
+    }
 }
 
 /// 一条 http.jsonl 事件（§17.6：request / response / websocket）。**已脱敏**——序列化即落盘。
@@ -533,6 +590,32 @@ pub struct DecryptSession {
     pub error: Option<crate::protocol::ProtocolError>,
 }
 
+/// session id 前缀（agent 生成；客户端不能提供路径，§17.8）。
+const SESSION_ID_PREFIX: &str = "dec-";
+const SESSION_ID_HEX_LEN: usize = 32;
+
+/// 由 16 字节随机数格式化 session id（随机源在 agent；core 只做纯格式化）。
+pub fn format_session_id(bytes: [u8; 16]) -> String {
+    let mut s = String::with_capacity(SESSION_ID_PREFIX.len() + SESSION_ID_HEX_LEN);
+    s.push_str(SESSION_ID_PREFIX);
+    for b in bytes {
+        s.push_str(&format!("{b:02x}"));
+    }
+    s
+}
+
+/// 校验 session id 严格为 `dec-` + 32 位小写 hex。**防路径穿越**：用于定位 `decrypt/<id>/`，
+/// 任何含分隔符 / `..` / 非 hex 字符一律拒收（§17.6/§18.4）。
+pub fn is_valid_session_id(s: &str) -> bool {
+    let Some(hex) = s.strip_prefix(SESSION_ID_PREFIX) else {
+        return false;
+    };
+    hex.len() == SESSION_ID_HEX_LEN
+        && hex
+            .bytes()
+            .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+}
+
 /// 校验 `DecryptRead` 的 offset/len（同 §10 分块）。
 pub fn validate_read_window(offset: u64, len: u32, file_len: u64) -> Result<()> {
     if len > DECRYPT_READ_MAX_LEN {
@@ -681,6 +764,10 @@ mod tests {
             redact_query("token=SEKRET", RedactProfile::Raw),
             "token=SEKRET"
         );
+        assert_eq!(
+            redact_query("access%5Ftoken=SEKRET", RedactProfile::Default),
+            format!("access%5Ftoken={REDACTED}")
+        );
     }
 
     #[test]
@@ -748,7 +835,7 @@ mod tests {
             ..
         } = &ev
         {
-            assert_eq!(body.as_deref(), Some("0123"));
+            assert!(body.is_none(), "Default 档不落无法可靠脱敏的纯文本正文");
             assert!(*body_truncated);
             assert_eq!(*body_size, 10);
         } else {
@@ -774,7 +861,28 @@ mod tests {
             &opts2,
         );
         if let HttpEvent::Request { body, .. } = &ev2 {
-            assert_eq!(body.as_deref(), Some(&format!("user=bob&password={REDACTED}")[..]));
+            assert_eq!(
+                body.as_deref(),
+                Some(&format!("user=bob&password={REDACTED}")[..])
+            );
+        } else {
+            panic!()
+        }
+
+        let json = HttpEvent::request(
+            1,
+            "h",
+            "POST",
+            "/login",
+            "HTTP/1.1",
+            &[("content-type".into(), "application/json".into())],
+            br#"{"user":"bob","nested":{"access_token":"secret"}}"#,
+            &opts2,
+        );
+        if let HttpEvent::Request { body, .. } = json {
+            let body = body.unwrap();
+            assert!(!body.contains("secret"));
+            assert!(body.contains(REDACTED));
         } else {
             panic!()
         }
@@ -797,19 +905,34 @@ mod tests {
         {
             assert_eq!(direction, "c2s");
             assert!(*is_text);
-            assert_eq!(body.as_deref(), Some("hello"));
+            assert!(body.is_none(), "Default 档不落无法结构化脱敏的 WS 文本");
             assert_eq!(*size, 5);
         } else {
             panic!()
         }
         // 二进制帧不留正文（即使 capture_bodies）
         let bin = HttpEvent::ws_frame(1, "h", false, false, &[0xff, 0x00], &opts);
-        if let HttpEvent::WsFrame { direction, body, .. } = &bin {
+        if let HttpEvent::WsFrame {
+            direction, body, ..
+        } = &bin
+        {
             assert_eq!(direction, "s2c");
             assert!(body.is_none());
         } else {
             panic!()
         }
+    }
+
+    #[test]
+    fn session_id_format_and_validate() {
+        let id = format_session_id([0xcd; 16]);
+        assert_eq!(id, format!("dec-{}", "cd".repeat(16)));
+        assert!(is_valid_session_id(&id));
+        assert!(!is_valid_session_id("dec-../etc"));
+        assert!(!is_valid_session_id("dec-ABCDEF")); // 大写拒
+        assert!(!is_valid_session_id("cap-00000000000000000000000000000000")); // 错前缀
+        assert!(!is_valid_session_id(&format!("dec-{}", "a".repeat(31)))); // 长度
+        assert!(!is_valid_session_id("dec-abc\\def"));
     }
 
     #[test]

@@ -2,8 +2,8 @@ import { invoke } from '@tauri-apps/api/core'
 
 // ── 与后端 net_policy 命令对齐的类型 ───────────────────────────────────────────
 
-// direct/wg 用作单条规则出口；wg/blackhole 用作默认出口（default_route）。
-export type Route = 'direct' | 'wg' | 'blackhole'
+// direct/wg/proxy 可用作规则或默认出口；blackhole 主要用于默认阻断。
+export type Route = 'direct' | 'wg' | 'proxy' | 'blackhole'
 export type RuleKind = 'process-path' | 'process-name' | 'domain-suffix' | 'domain-keyword' | 'ip-cidr'
 
 export interface Rule {
@@ -33,6 +33,44 @@ export interface AmneziaConfig {
   h4: number
 }
 
+export type WgDialerProxyKind = 'socks5' | 'http'
+
+export interface WgDialerProxy {
+  type: WgDialerProxyKind
+  server: string
+  port: number
+  username: string
+  password: string
+  udp: boolean
+  subscription_slot?: number | null
+}
+
+export interface ProxySubscription {
+  name: string
+  url: string
+  interval_secs: number
+}
+
+export interface ProxySubscriptions {
+  first: ProxySubscription | null
+  second: ProxySubscription | null
+  active: number | null
+}
+
+export interface ProxyNode {
+  name: string
+  type: string
+  alive: boolean
+  delay_ms: number | null
+}
+
+export interface LocalProxyListeners {
+  /** 本机 SOCKS5 监听端口。 */
+  socks_port: number
+  /** 本机 HTTP 代理端口；HTTPS 请求通过 CONNECT 转发。 */
+  http_port: number
+}
+
 export interface WgConfig {
   server: string
   port: number
@@ -43,6 +81,8 @@ export interface WgConfig {
   mtu: number
   /** 可选：AmneziaWG 混淆。缺省 = 标准 WireGuard。导入带 Jc/H1.. 的 .conf 时自动带出。 */
   amnezia?: AmneziaConfig | null
+  /** 可选：通过本地 Clash Verge/Mihomo 代理建立 WireGuard endpoint 连接。 */
+  dialer_proxy?: WgDialerProxy | null
 }
 
 export interface Settings {
@@ -57,6 +97,8 @@ export interface Settings {
   enabled: boolean
   /** L2 域名嗅探（mihomo sniffer）：补全 TLS SNI / HTTP Host / QUIC 域名，只增强观察数据。默认关。 */
   sniffer_enabled: boolean
+  proxy_subscriptions: ProxySubscriptions
+  local_proxy: LocalProxyListeners
 }
 
 export interface FirewallStatus {
@@ -120,8 +162,23 @@ export interface RouteEntry {
   kind: string
   value: string
   route: Route
+  /** 实际生效出口；不等于 route 即发生了降级（出口不可用按 fallback 处理）。undefined = 与 route 相同。 */
+  applied_route?: Route
   source: string
   deletable: boolean
+}
+
+/** Windows 实际系统路由（GUI 直接读取，不依赖 agent 或策略引擎）。 */
+export interface SystemRoute {
+  destination_prefix: string
+  next_hop: string
+  interface_alias: string
+  interface_index: number
+  route_metric: number
+  interface_metric: number
+  protocol: string
+  state: string
+  address_family: string
 }
 
 export interface ProcessRef {
@@ -199,6 +256,237 @@ export interface CaptureChunk {
   eof: boolean
 }
 
+// ── L4 应用明文（Decrypt*/DecryptCa*，抓包设计 §17） ──────────────────────────
+
+/** 精确进程实例（防 PID 复用：pid + 创建时间 + 规范化路径）。 */
+export interface ProcessInstanceRef {
+  pid: number
+  created_at_100ns: number
+  path: string
+}
+
+/** 脱敏档：default=核心凭据强制脱敏（不可关）；raw=保留原文（UI 须红标 + 更短时限）。 */
+export type RedactProfile = 'default' | 'raw'
+
+/** 解密目标：精确进程实例 + 必填域名 allowlist（无 All target）。 */
+export interface DecryptTarget {
+  process: ProcessInstanceRef
+  domains: string[]
+}
+
+export interface DecryptOpts {
+  /** 时长上限（秒）。默认 60，范围 10–300。 */
+  max_secs: number
+  /** 总字节配额。默认 64MiB，最大 256MiB。 */
+  max_total_bytes: number
+  /** 单请求/响应正文上限。默认 1MiB，最大 16MiB。 */
+  max_body_bytes: number
+  /** 默认 false：只记方法/URL/状态/头，不落正文。 */
+  capture_bodies: boolean
+  /** 默认 false：临时阻 UDP/443 逼 QUIC 回退 TCP（§17.7，改变应用行为，须单独确认）。 */
+  force_tcp_for_quic: boolean
+  redact_profile: RedactProfile
+}
+
+export type DecryptState =
+  | 'checking_ca' | 'preparing' | 'decrypting' | 'stopping' | 'finalizing' | 'done' | 'failed'
+
+export type CaState = 'absent' | 'installed' | 'broken'
+
+/** CA 信任状态（私钥永不出现）。 */
+export interface CaStatus {
+  state: CaState
+  thumbprint: string | null
+  subject: string | null
+  not_after_ms: number | null
+  /** 安装到的用户 SID（CurrentUser\Root）。 */
+  owner_sid: string | null
+  /** 固定 current_user。 */
+  store_scope: string | null
+}
+
+/** 每域名处理计数（§17.9：不只显示总"成功"）。 */
+export interface DomainCounters {
+  decrypted: number
+  passthrough: number
+  pinned: number
+  quic: number
+  failed: number
+}
+
+export interface DecryptSession {
+  id: string
+  state: DecryptState
+  target: DecryptTarget
+  opts: DecryptOpts
+  started_ms: number
+  ended_ms: number | null
+  /** 键为规范化域名。 */
+  per_domain: Record<string, DomainCounters>
+  error: { kind: string; message: string } | null
+}
+
+export type DecryptArtifact = 'manifest' | 'http_jsonl' | 'flows'
+
+// ── 统一出口（Egress*，minor 8，出口设计 §8.8） ────────────────────────────────
+// 核心约束：出口是否已启动/已连接，与当前是否有业务流量经过它，是两个独立问题。
+// `EgressStatus` 把「生命周期」（lifecycle）与「策略是否选中」（selected/usage）分成两个
+// 字段——前端不得由其一推断另一个，卡片必须同时展示两者。
+
+export type EgressKind = 'direct' | 'wire_guard' | 'proxy'
+
+/**
+ * 出口数据面归谁所有——决定「停掉 mihomo 后这个出口还在不在」。
+ *
+ * 第一阶段 WG/代理都是 `mihomo-managed`：隧道随引擎存亡、reload 会重建。UI **必须**把这点讲
+ * 明白，否则「已就绪」会被误读成「这是个能独立存活的出口」。
+ */
+export type EgressManagement = 'mihomo-managed' | 'system' | 'independent'
+
+export const EGRESS_MANAGEMENT_LABELS: Record<EgressManagement, string> = {
+  'mihomo-managed': '由 mihomo 承载',
+  system: '系统承载',
+  independent: '独立进程',
+}
+
+/** 该出口的可用性是否依赖 mihomo 进程在跑。 */
+export function egressDependsOnEngine(m: EgressManagement): boolean {
+  return m === 'mihomo-managed'
+}
+
+export type EgressLifecycle =
+  | 'stopped' | 'starting' | 'connecting' | 'ready' | 'degraded' | 'reconnecting' | 'failed'
+
+/** 生命周期展示文案（与后端 `EgressLifecycle::label()` 对齐）。 */
+export const EGRESS_LIFECYCLE_LABELS: Record<EgressLifecycle, string> = {
+  stopped: '已停止',
+  starting: '启动中',
+  connecting: '连接中',
+  ready: '已就绪',
+  degraded: '降级',
+  reconnecting: '重连中',
+  failed: '失败',
+}
+
+/** 该生命周期是否承载业务流量（与后端 `EgressLifecycle::accepts_traffic()` 对齐）。 */
+export function egressAcceptsTraffic(l: EgressLifecycle): boolean {
+  return l === 'ready' || l === 'degraded'
+}
+
+export type HealthState = 'unknown' | 'healthy' | 'degraded' | 'unhealthy'
+
+export interface HealthReport {
+  state: HealthState
+  /** 探测完成时刻（epoch 毫秒）；0=从未探测。 */
+  checked_at_ms: number
+  latency_ms?: number | null
+  /** 探测目标（脱敏后的 URL / 主机）。 */
+  target?: string | null
+  error?: string | null
+}
+
+export interface WireGuardDetail {
+  /** 脱敏 endpoint（如 1.2.3.x:51820）。 */
+  endpoint: string
+  local_ip: string
+  mtu: number
+  /** 是否启用 AmneziaWG 混淆。 */
+  obfuscation: boolean
+  via_dialer_proxy: boolean
+  /**
+   * 最近一次**经该 outbound 主动探测成功**的时刻（epoch 毫秒，0=从未）。
+   *
+   * 这不是 WireGuard 的 latest-handshake——数据面在 mihomo 进程内，拿不到 peer 握手时间。
+   * 决议 §6.2 禁止展示虚假的 latest-handshake / rx-tx / 网卡状态，UI 措辞必须是「探测」。
+   */
+  last_probe_ok_at_ms: number
+}
+
+export interface ProxyDetail {
+  subscription: string
+  node: string
+  node_delay_ms?: number | null
+  node_alive: boolean
+  node_count: number
+  refreshed_at_ms: number
+}
+
+export interface DirectDetail {
+  /** 物理出口网卡别名（已排除 mihomo 的 Meta TUN；未知时空串）。 */
+  interface: string
+  /** 物理默认网关（未知时空串）。 */
+  gateway: string
+}
+
+/** 类型相关详情，三选一（缺省全空也合法）。 */
+export interface EgressDetail {
+  wireguard?: WireGuardDetail | null
+  proxy?: ProxyDetail | null
+  direct?: DirectDetail | null
+}
+
+export interface EgressUsage {
+  /** 是否是当前默认出口（兜底 MATCH）。 */
+  is_default: boolean
+  /** 有多少条规则/程序组指向它。 */
+  rule_count: number
+}
+
+/** 出口向路由器暴露的目标（mihomo outbound 名 / direct / reject）。 */
+export interface RouteTarget {
+  kind: 'mihomo-outbound' | 'direct' | 'reject'
+  name: string
+}
+
+export type EgressFallback = 'block' | 'direct'
+
+/** 前端出口 DTO：生命周期（lifecycle）与策略选中（selected/usage）分两个字段，不得互相推断。 */
+export interface EgressStatus {
+  id: string
+  name: string
+  kind: EgressKind
+  /** 数据面归属。`mihomo-managed` 时「已就绪」只代表当前引擎里这条出口通。 */
+  management: EgressManagement
+  lifecycle: EgressLifecycle
+  /** 当前是否被策略导流（= usage.is_default || usage.rule_count > 0）。 */
+  selected: boolean
+  usage: EgressUsage
+  /** 当前实际经该出口的活跃连接数，不等于策略选中数量。 */
+  active_connections: number
+  /** 配置是否完整可用（WG 校验通过 / 订阅已激活）；false 时不该出现在「Ready」。 */
+  configured: boolean
+  unconfigured_reason?: string | null
+  health: HealthReport
+  detail: EgressDetail
+  route: Route
+  route_target: RouteTarget
+  /** 出口不可用时该出口上的规则如何处理。 */
+  fallback: EgressFallback
+  reconnect_count: number
+  /** 最近一次生命周期变迁时刻（epoch 毫秒）。 */
+  changed_at_ms: number
+  last_error?: string | null
+}
+
+/** 「策略选了它但它承载不了」——UI 必须显式警告（与后端 `selected_but_unusable()` 对齐）。 */
+export function egressSelectedButUnusable(e: EgressStatus): boolean {
+  return e.selected && !egressAcceptsTraffic(e.lifecycle)
+}
+
+/** 前端 `listen('net-policy://egress-changed')` 订阅的频道名——**与 APPLY_PROGRESS_EVENT 分开
+ *  推送**，只更新出口卡片，不得据此推断导流策略变化。 */
+export const EGRESS_CHANGED_EVENT = 'net-policy://egress-changed'
+
+/** DecryptOpts 默认值（与 core DecryptOpts::default 对齐）。 */
+export const DEFAULT_DECRYPT_OPTS: DecryptOpts = {
+  max_secs: 60,
+  max_total_bytes: 64 * 1024 * 1024,
+  max_body_bytes: 1024 * 1024,
+  capture_bodies: false,
+  force_tcp_for_quic: false,
+  redact_profile: 'default',
+}
+
 // ── 活跃连接快照（P0-1，net_policy_connections） ───────────────────────────────
 
 export interface Connection {
@@ -216,6 +504,7 @@ export interface ConnectionsSnapshot {
   available: boolean
   total: number
   wg_count: number
+  proxy_count: number
   direct_count: number
   other_count: number
   by_process: Record<string, number>
@@ -272,6 +561,8 @@ export const APPLY_STEPS = [
 export const NetPolicyAPI = {
   getStatus: () => invoke<Status>('net_policy_get_status'),
   getConnections: () => invoke<ConnectionsSnapshot>('net_policy_connections'),
+  getProxyNodes: () => invoke<ProxyNode[]>('net_policy_proxy_nodes'),
+  testProxyNode: (name: string) => invoke<ProxyNode>('net_policy_test_proxy_node', { name }),
   getSettings: () => invoke<Settings>('net_policy_get_settings'),
   saveSettings: (settings: Settings) => invoke('net_policy_save_settings', { settings }),
   parseWgConf: (content: string) => invoke<WgConfig>('net_policy_parse_wg_conf', { content }),
@@ -302,6 +593,8 @@ export const NetPolicyAPI = {
   events: (limit = 200) => invoke<LifecycleEvent[]>('net_policy_events', { limit }),
   /** 生效路由列表（含优先级/来源/是否可删）。 */
   routes: () => invoke<RouteEntry[]>('net_policy_routes'),
+  /** Windows 当前系统路由表；纯只读，不依赖 agent 或策略是否启用。 */
+  systemRoutes: () => invoke<SystemRoute[]>('net_policy_system_routes'),
   /** 当前进程树。 */
   processTree: () => invoke<ProcessNode[]>('net_policy_process_tree'),
   /** 临时直连状态（剩余时间等）。 */
@@ -331,4 +624,44 @@ export const NetPolicyAPI = {
   captureDelete: (id: string) => invoke<void>('net_policy_capture_delete', { id }),
   captureRead: (id: string, offset: number, len: number) =>
     invoke<CaptureChunk>('net_policy_capture_read', { id, offset, len }),
+
+  // ── L4 应用明文（minor 6，抓包设计 §17） ──────────────────────────────────
+  /** 查 CA 信任状态。 */
+  decryptCaStatus: () => invoke<CaStatus>('net_policy_decrypt_ca_status'),
+  /** 生成专用调试 CA（agent 侧 + DPAPI 私钥保护；不装信任库）。 */
+  decryptCaCreate: () => invoke<CaStatus>('net_policy_decrypt_ca_create'),
+  /** 装公钥进 CurrentUser\Root（弹 Windows 确认框）→ 实查验证 → 交 agent 复核。 */
+  decryptCaInstall: () => invoke<CaStatus>('net_policy_decrypt_ca_install'),
+  /** 移除本产品 CA（信任库证书 + agent 私钥/记录）。 */
+  decryptCaRemove: () => invoke<CaStatus>('net_policy_decrypt_ca_remove'),
+  decryptStart: (target: DecryptTarget, opts: DecryptOpts) =>
+    invoke<DecryptSession>('net_policy_decrypt_start', { target, opts }),
+  decryptStop: (id: string) => invoke<DecryptSession>('net_policy_decrypt_stop', { id }),
+  decryptGet: (id: string) => invoke<DecryptSession>('net_policy_decrypt_get', { id }),
+  decryptList: () => invoke<DecryptSession[]>('net_policy_decrypt_list'),
+  decryptDelete: (id: string) => invoke<void>('net_policy_decrypt_delete', { id }),
+  decryptRead: (id: string, artifact: DecryptArtifact, offset: number, len: number) =>
+    invoke<CaptureChunk>('net_policy_decrypt_read', { id, artifact, offset, len }),
+
+  // ── 统一出口（minor 8，出口设计 §8.8） ────────────────────────────────────
+  // 六个操作语义互不重叠，全部回出口全量清单；改导流策略走 saveSettings/saveRule，不在这里。
+  /** 出口全量清单。 */
+  egressList: () => invoke<EgressStatus[]>('net_policy_egress_list'),
+  /** 启动出口（渲染进配置 + 立即探测）。不改变任何导流规则。 */
+  egressStart: (id: string) => invoke<EgressStatus[]>('net_policy_egress_start', { id }),
+  /** 停止出口（从配置摘除；指向它的规则按 fallback 处理，默认阻断）。 */
+  egressStop: (id: string) => invoke<EgressStatus[]>('net_policy_egress_stop', { id }),
+  /** 重置该出口上的存量连接并重新探测（不改导流；mihomo-managed 出口无隧道可重建）。 */
+  egressReconnect: (id: string) => invoke<EgressStatus[]>('net_policy_egress_reconnect', { id }),
+  /** 仅测试连接：探测一次，不改生命周期也不改导流策略。 */
+  egressProbe: (id: string) => invoke<EgressStatus[]>('net_policy_egress_probe', { id }),
+  /** 设置出口不可用时的处理方式（阻断 / 明确允许回落直连）。 */
+  egressSetFallback: (id: string, fallback: EgressFallback) =>
+    invoke<EgressStatus[]>('net_policy_egress_set_fallback', { id, fallback }),
+  /** 刷新代理订阅，不主动重连当前节点。 */
+  egressRefreshSubscription: (id: string) =>
+    invoke<EgressStatus[]>('net_policy_egress_refresh_subscription', { id }),
+  /** 切换代理订阅当前节点。 */
+  egressSelectNode: (id: string, node: string) =>
+    invoke<EgressStatus[]>('net_policy_egress_select_node', { id, node }),
 }

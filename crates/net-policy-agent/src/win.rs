@@ -67,7 +67,13 @@ pub fn run_ps_timeout(script: &str, timeout: std::time::Duration) -> Result<Stri
         .context("collect powershell output")?;
     if !out.status.success() {
         let stderr = String::from_utf8_lossy(&out.stderr);
-        bail!("powershell failed ({}): {}", out.status, stderr.trim());
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        bail!(
+            "powershell failed ({}): stderr={} stdout={}",
+            out.status,
+            stderr.trim(),
+            stdout.trim()
+        );
     }
     Ok(String::from_utf8_lossy(&out.stdout).into_owned())
 }

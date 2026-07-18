@@ -25,6 +25,7 @@ const EMPTY_CONNS: ConnectionsSnapshot = {
   available: false,
   total: 0,
   wg_count: 0,
+  proxy_count: 0,
   direct_count: 0,
   other_count: 0,
   by_process: {},

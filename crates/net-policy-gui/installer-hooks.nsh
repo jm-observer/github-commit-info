@@ -36,19 +36,14 @@
   Abort
 net_policy_agent_install_ok:
   DetailPrint "net-policy-agent install 返回码: $0（Windows 服务及命名管道已就绪）"
-  ; L4 抓包明文引擎（mitmproxy）部署：下载 + SHA-256 校验 + Defender 放行 + 解压到
-  ; %ProgramFiles%\net-policy\mitm\engine\<ver>\。**best-effort**——L4 是独立高风险可选能力，
-  ; 失败只提示、不 Abort（核心网络策略已装好）。离线分发：把 mitmproxy-12.2.3-windows-x86_64.zip
-  ; 放进 bundle-resources 并改成 install-mitm-engine --zip "$INSTDIR\mitmproxy-12.2.3-windows-x86_64.zip"。
-  DetailPrint "部署 L4 抓包明文引擎（mitmproxy，可选，需联网下载）..."
-  nsExec::ExecToLog '"$INSTDIR\net-policy-agent.exe" install-mitm-engine'
-  Pop $0
-  DetailPrint "install-mitm-engine 返回码: $0（0=已部署；非0=跳过，L4 明文暂不可用，可日后在应用内重试）"
+  ; L4 抓包明文能力由 net-policy-agent 内置的 Rust MITM 提供，随 agent 一起安装。
+  ; 内置 Rust MITM 不需要额外的安装目录或外部引擎。
+  ; 不再下载或部署旧的 mitmproxy 外部引擎。
+  DetailPrint "Rust MITM 已随 net-policy-agent 就绪"
   ; GUI 随用户登录自启：写 HKLM Run 键。GUI 是瘦客户端，管道 ACL 已放行交互用户(IU)、无需提权即可连服务；
   ; Tauri 默认 asInvoker（非提权），故 Run 键能正常拉起。
   WriteRegStr HKLM "Software\Microsoft\Windows\CurrentVersion\Run" "net-policy-gui" '"$INSTDIR\net-policy-gui.exe"'
   DetailPrint "已设置 GUI 登录自启"
-  Exec '"$INSTDIR\net-policy-gui.exe"'
 !macroend
 
 !macro NSIS_HOOK_PREUNINSTALL
