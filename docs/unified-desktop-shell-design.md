@@ -489,7 +489,7 @@ Tauri 2 的 `tauri::generate_handler!` 是**过程宏**，只能在单个调用�
 
 用户当前在 Windows 下使用 WireGuard 连接海外 VPN。问题不是 WireGuard 隧道本身，而是默认海外出口导致国内服务访问不理想；同时用户要求未知请求必须继续走海外出口，只有明确配置的程序、域名或 IP 才允许走本地出口。
 
-本模块最终作为 `zero-desktop` 的一个页面和后台服务集成，暂名 `net-policy`。验证阶段只产出结论和最小原型，不直接进入主壳实现。
+网络策略不再作为 `zero-desktop` 内嵌页面或后台模块；当前以独立的 `net-policy-gui`、`net-policy-agent`、`net-policy-cli` 组件交付。本节保留为历史验证与架构决策记录，后续实现以 `docs/net-policy/` 为准。
 
 不可妥协约束：
 
@@ -524,7 +524,7 @@ Tauri 2 的 `tauri::generate_handler!` 是**过程宏**，只能在单个调用�
 结构：
 
 ```
-zero-desktop net-policy
+net-policy 独立应用
 ├─ WireGuard 官方客户端或 tunnel service
 ├─ Windows route table
 ├─ Windows Firewall 规则
@@ -603,7 +603,7 @@ zero-net-policy-service
 ├─ WFP callout/filter
 ├─ process tree observer
 ├─ WireGuard tunnel control
-└─ zero-desktop UI
+└─ net-policy-gui UI
 ```
 
 优点：
@@ -720,15 +720,15 @@ DNS 是防泄漏重点。验证阶段按以下原则：
 - 关闭 WireGuard 后，未知公网失败；本地直连规则是否继续允许，需要产品上明确开关，默认建议失败。
 - 修改默认路由后，防火墙仍能阻断未知物理出口。
 
-### 14.7 zero-desktop 集成形态
+### 14.7 独立应用形态（已取代 zero-desktop 集成）
 
-前端新增入口：
+独立 GUI 入口（不加入 zero-desktop Shell）：
 
 ```
 /net-policy
 ```
 
-Shell 导航新增：
+独立应用侧栏包含：
 
 - 网络策略
 
@@ -749,7 +749,7 @@ Shell 导航新增：
 后端模块：
 
 ```
-crates/zero-desktop/src/modules/net_policy/
+crates/net-policy-agent/ + crates/net-policy-gui/
 ├─ mod.rs
 ├─ state.rs
 ├─ config.rs
@@ -777,7 +777,7 @@ command 命名：
 新增：
 
 ```
-{workspace}/net-policy/
+独立应用工作区：`%ProgramData%/net-policy`（服务）或用户配置目录（GUI/CLI）
 ├─ settings.json
 ├─ rules.json
 ├─ generated/

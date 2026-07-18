@@ -11,8 +11,6 @@ pub fn ensure_workspace(path: &Path) -> Result<()> {
         "cookie",
         "cookie/login_profile/douyin",
         "cookie/login_profile/ths",
-        "net-policy",
-        "net-policy/generated",
         "music",
         "music/covers",
         "codeloop",

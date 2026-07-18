@@ -6,7 +6,6 @@ import EnglishPackages from "./modules/english/EnglishPackages";
 import SpeechPage from "./modules/speech/SpeechPage";
 import AudioCleanPage from "./modules/audio-clean/AudioCleanPage";
 import CookiePage from "./modules/cookie/CookiePage";
-import NetPolicyPage from "./modules/net-policy/NetPolicyPage";
 import CodeloopPage from "./modules/codeloop/CodeloopPage";
 import ChatSummaryPage from "./modules/chat-summary/ChatSummaryPage";
 import LlmChatPage from "./modules/llmchat/LlmChatPage";
@@ -16,12 +15,10 @@ import MusicPage from "./modules/music/MusicPage";
 import ScreenshotPage from "./modules/screenshot/ScreenshotPage";
 import EgressWorkersPage from "./modules/egress/EgressWorkersPage";
 import { MusicPlayerProvider } from "./modules/music/PlayerContext";
-import { NetPolicyProbeProvider } from "./modules/net-policy/ProbeContext";
 
 export default function App() {
   return (
     <MusicPlayerProvider>
-      <NetPolicyProbeProvider>
       <BrowserRouter>
         <Routes>
           <Route path="/" element={<ShellLayout />}>
@@ -32,7 +29,6 @@ export default function App() {
             <Route path="speech" element={<SpeechPage />} />
             <Route path="audio-clean" element={<AudioCleanPage />} />
             <Route path="cookie" element={<CookiePage />} />
-            <Route path="net-policy" element={<NetPolicyPage />} />
             <Route path="codeloop" element={<CodeloopPage />} />
             <Route path="chat-summary" element={<ChatSummaryPage />} />
             <Route path="llmchat" element={<LlmChatPage />} />
@@ -45,7 +41,6 @@ export default function App() {
           </Route>
         </Routes>
       </BrowserRouter>
-      </NetPolicyProbeProvider>
     </MusicPlayerProvider>
   );
 }
