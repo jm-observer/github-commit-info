@@ -2,7 +2,7 @@
 //!
 //! 桌面端频繁起 `git` / `powershell` / `pwsh` / `mihomo` 等控制台程序；若不加
 //! `CREATE_NO_WINDOW`，Windows 会为每个子进程弹一个（一闪而过的）黑色控制台窗口，
-//! 体验很差（net-policy 轮询状态会"一直弹 powershell"，G10 部署会"闪很多窗口"）。
+//! 体验很差（例如 G10 部署会"闪很多窗口"）。
 //! 统一经此模块加无窗口标志；非 Windows 平台为 no-op。
 
 /// `CREATE_NO_WINDOW`：不为子进程分配控制台窗口（GUI 进程仍可正常 I/O 重定向）。

@@ -117,6 +117,11 @@ impl SessionStore {
     pub fn len(&self) -> usize {
         self.inner.lock().unwrap().len()
     }
+
+    #[cfg(test)]
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
 }
 
 /// 后台 TTL reaper:周期性扫描并回收过期 session。仅在真正 `serve` 时 spawn

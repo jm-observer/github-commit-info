@@ -767,10 +767,12 @@ async fn drive(ctx: &LoopCtx, start_round: u32) -> Result<()> {
                 &target,
                 ctx.mode,
                 n,
-                codex_first_turn,
+                prompt::CodexPromptOptions {
+                    first_turn: codex_first_turn,
+                    evaluate_alternatives: ctx.evaluate_alternatives,
+                },
                 ctx.target_role,
                 ctx.spec_doc.as_deref(),
-                ctx.evaluate_alternatives,
             )
         };
         let review = match send_and_resolve(ctx, &codex, &codex_prompt).await? {

@@ -63,6 +63,13 @@ enum AutoPasteAction {
     Retype { backspaces: usize, text: String },
 }
 
+#[derive(Debug, Clone, Copy)]
+struct AutoPasteOptions {
+    window: Duration,
+    space_separator: bool,
+    rewrite_retype: bool,
+}
+
 fn common_prefix_char_count(a: &str, b: &str) -> usize {
     a.chars().zip(b.chars()).take_while(|(x, y)| x == y).count()
 }
@@ -73,9 +80,7 @@ fn next_auto_paste_text(
     ref_id: i64,
     t_start: f64,
     t_end: f64,
-    window: Duration,
-    space_separator: bool,
-    rewrite_retype: bool,
+    options: AutoPasteOptions,
 ) -> Option<AutoPasteAction> {
     if text.is_empty() {
         return None;
@@ -92,7 +97,7 @@ fn next_auto_paste_text(
         }
         // 同 ref 改写：旧文本不再是新文本前缀（LLM 把已说的部分修订成别的）。
         // 关闭开关时保守跳过，留给剪贴板兜底；开启时按公共前缀长度回退再补打。
-        if !rewrite_retype {
+        if !options.rewrite_retype {
             return None;
         }
         let common = common_prefix_char_count(&prev, text);
@@ -113,13 +118,15 @@ fn next_auto_paste_text(
     ap.typed_text_by_id.insert(ref_id, text.to_string());
     let continues = ap
         .last_t_end
-        .is_some_and(|prev_end| (t_start - prev_end) < window.as_secs_f64());
+        .is_some_and(|prev_end| (t_start - prev_end) < options.window.as_secs_f64());
     ap.last_t_end = Some(t_end);
-    Some(AutoPasteAction::Type(if continues && space_separator {
-        format!(" {text}")
-    } else {
-        text.to_string()
-    }))
+    Some(AutoPasteAction::Type(
+        if continues && options.space_separator {
+            format!(" {text}")
+        } else {
+            text.to_string()
+        },
+    ))
 }
 
 /// 把一段识别结果直接打字进当前焦点输入框。
@@ -127,27 +134,15 @@ fn next_auto_paste_text(
 /// 新 ref 首次输入完整文本；合并链模式下同 ref 后续回发累计文本时，只输入严格后缀。
 /// 若同 ref 后续结果改写了已输入部分：默认保守跳过（剪贴板有最新整段供 Ctrl+V 兜底）；
 /// `rewrite_retype=true` 时则按公共前缀长度发退格回退、再补打新尾巴。
-#[allow(clippy::too_many_arguments)]
 fn auto_paste_segment(
     ap: &mut AutoPasteState,
     text: &str,
     ref_id: i64,
     t_start: f64,
     t_end: f64,
-    window: Duration,
-    space_separator: bool,
-    rewrite_retype: bool,
+    options: AutoPasteOptions,
 ) {
-    let Some(action) = next_auto_paste_text(
-        ap,
-        text,
-        ref_id,
-        t_start,
-        t_end,
-        window,
-        space_separator,
-        rewrite_retype,
-    ) else {
+    let Some(action) = next_auto_paste_text(ap, text, ref_id, t_start, t_end, options) else {
         return;
     };
     match action {
@@ -788,9 +783,11 @@ async fn run_one_connection(
                             id,
                             st.t0,
                             st.t1,
-                            Duration::from_millis(paste_window_ms),
-                            false,
-                            rewrite_retype,
+                            AutoPasteOptions {
+                                window: Duration::from_millis(paste_window_ms),
+                                space_separator: false,
+                                rewrite_retype,
+                            },
                         );
                     }
                     // 尾部命令：正文已通过 auto_paste 打进焦点框（do_paste 为真才会发生），
@@ -865,9 +862,11 @@ async fn run_one_connection(
                             id,
                             st.t0,
                             st.t1,
-                            Duration::from_millis(paste_window_ms),
-                            true,
-                            rewrite_retype,
+                            AutoPasteOptions {
+                                window: Duration::from_millis(paste_window_ms),
+                                space_separator: true,
+                                rewrite_retype,
+                            },
                         );
                     }
                 }
@@ -903,16 +902,12 @@ async fn run_one_connection(
             // 采集线程同样观察 `stop`:它会 flush 尾帧后 drop 掉发送端,关闭 pcm_rx。
             // 发 stop(让服务端做最终切分)之前,把还在 pcm_rx 里排队的尾部 PCM 全部转发出去,
             // 否则途中的最后 ~100-300ms 音频(最后一两个字)会被丢弃、从转写里缺失。
-            loop {
-                match tokio::time::timeout(Duration::from_millis(500), pcm_rx.recv()).await {
-                    Ok(Some(bytes)) => {
-                        if wr.send(Message::Binary(bytes)).await.is_err() {
-                            reader.abort();
-                            return Outcome::Stopped;
-                        }
-                    }
-                    // 通道关闭(采集线程已 flush 完并退出)或 500ms 内无新音频 → 收尾。
-                    _ => break,
+            while let Ok(Some(bytes)) =
+                tokio::time::timeout(Duration::from_millis(500), pcm_rx.recv()).await
+            {
+                if wr.send(Message::Binary(bytes)).await.is_err() {
+                    reader.abort();
+                    return Outcome::Stopped;
                 }
             }
             let _ = wr
@@ -946,6 +941,14 @@ mod tests {
 
     fn w(ms: u64) -> Duration {
         Duration::from_millis(ms)
+    }
+
+    fn auto_options(ms: u64, space_separator: bool, rewrite_retype: bool) -> AutoPasteOptions {
+        AutoPasteOptions {
+            window: w(ms),
+            space_separator,
+            rewrite_retype,
+        }
     }
 
     #[test]
@@ -996,7 +999,14 @@ mod tests {
     #[test]
     fn autopaste_same_ref_cumulative_text_types_suffix() {
         let mut ap = AutoPasteState::default();
-        let first = next_auto_paste_text(&mut ap, "第一句。", 1, 0.0, 1.0, w(3000), false, false);
+        let first = next_auto_paste_text(
+            &mut ap,
+            "第一句。",
+            1,
+            0.0,
+            1.0,
+            auto_options(3000, false, false),
+        );
         assert_eq!(first, Some(AutoPasteAction::Type("第一句。".into())));
 
         let second = next_auto_paste_text(
@@ -1005,9 +1015,7 @@ mod tests {
             1,
             0.0,
             2.0,
-            w(3000),
-            false,
-            false,
+            auto_options(3000, false, false),
         );
         assert_eq!(second, Some(AutoPasteAction::Type("第二句。".into())));
     }
@@ -1015,24 +1023,43 @@ mod tests {
     #[test]
     fn autopaste_same_ref_identical_text_does_not_repeat() {
         let mut ap = AutoPasteState::default();
-        next_auto_paste_text(&mut ap, "Hello", 1, 0.0, 1.0, w(3000), true, false);
-        let out = next_auto_paste_text(&mut ap, "Hello", 1, 0.0, 1.0, w(3000), true, false);
+        next_auto_paste_text(
+            &mut ap,
+            "Hello",
+            1,
+            0.0,
+            1.0,
+            auto_options(3000, true, false),
+        );
+        let out = next_auto_paste_text(
+            &mut ap,
+            "Hello",
+            1,
+            0.0,
+            1.0,
+            auto_options(3000, true, false),
+        );
         assert_eq!(out, None);
     }
 
     #[test]
     fn autopaste_same_ref_rewrite_is_skipped_when_retype_off() {
         let mut ap = AutoPasteState::default();
-        next_auto_paste_text(&mut ap, "第一句。", 1, 0.0, 1.0, w(3000), false, false);
+        next_auto_paste_text(
+            &mut ap,
+            "第一句。",
+            1,
+            0.0,
+            1.0,
+            auto_options(3000, false, false),
+        );
         let out = next_auto_paste_text(
             &mut ap,
             "第一句改写。第二句。",
             1,
             0.0,
             2.0,
-            w(3000),
-            false,
-            false,
+            auto_options(3000, false, false),
         );
         assert_eq!(out, None);
     }
@@ -1046,8 +1073,8 @@ mod tests {
         let mut ap = AutoPasteState::default();
         let prev = "G10里面的这个Z2的服务，它原先要调用这个闹钟的那个。";
         let next = "G10里面的这个Z2的服务，它原先要调用这个闹钟的，闹钟本来是要调那个的。";
-        next_auto_paste_text(&mut ap, prev, 1, 0.0, 1.0, w(3000), false, true);
-        let out = next_auto_paste_text(&mut ap, next, 1, 0.0, 2.0, w(3000), false, true);
+        next_auto_paste_text(&mut ap, prev, 1, 0.0, 1.0, auto_options(3000, false, true));
+        let out = next_auto_paste_text(&mut ap, next, 1, 0.0, 2.0, auto_options(3000, false, true));
         let common = common_prefix_char_count(prev, next);
         let expect_back = prev.chars().count() - common;
         let expect_tail: String = next.chars().skip(common).collect();
@@ -1063,16 +1090,44 @@ mod tests {
     #[test]
     fn autopaste_same_ref_identical_text_no_retype_action() {
         let mut ap = AutoPasteState::default();
-        next_auto_paste_text(&mut ap, "Hello", 1, 0.0, 1.0, w(3000), true, true);
-        let out = next_auto_paste_text(&mut ap, "Hello", 1, 0.0, 1.0, w(3000), true, true);
+        next_auto_paste_text(
+            &mut ap,
+            "Hello",
+            1,
+            0.0,
+            1.0,
+            auto_options(3000, true, true),
+        );
+        let out = next_auto_paste_text(
+            &mut ap,
+            "Hello",
+            1,
+            0.0,
+            1.0,
+            auto_options(3000, true, true),
+        );
         assert_eq!(out, None);
     }
 
     #[test]
     fn autopaste_new_english_ref_continuation_gets_separator() {
         let mut ap = AutoPasteState::default();
-        next_auto_paste_text(&mut ap, "Hello.", 1, 0.0, 1.0, w(3000), true, false);
-        let out = next_auto_paste_text(&mut ap, "World.", 2, 1.5, 2.0, w(3000), true, false);
+        next_auto_paste_text(
+            &mut ap,
+            "Hello.",
+            1,
+            0.0,
+            1.0,
+            auto_options(3000, true, false),
+        );
+        let out = next_auto_paste_text(
+            &mut ap,
+            "World.",
+            2,
+            1.5,
+            2.0,
+            auto_options(3000, true, false),
+        );
         assert_eq!(out, Some(AutoPasteAction::Type(" World.".into())));
     }
 

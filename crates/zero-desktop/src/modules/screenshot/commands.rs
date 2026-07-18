@@ -430,7 +430,7 @@ pub fn screenshot_list_history(app: AppHandle) -> Result<Vec<HistoryItem>, Strin
             height,
         });
     }
-    items.sort_by(|a, b| b.modified_ms.cmp(&a.modified_ms));
+    items.sort_by_key(|item| std::cmp::Reverse(item.modified_ms));
     Ok(items)
 }
 
@@ -669,7 +669,7 @@ fn write_clipboard_cf_dib(rgba_top_down: &[u8], w: u32, h: u32) -> Result<(), St
             biHeight: h as i32, // 正值 = bottom-up
             biPlanes: 1,
             biBitCount: 32,
-            biCompression: BI_RGB as u32,
+            biCompression: BI_RGB,
             biSizeImage: pixel_bytes as u32,
             biXPelsPerMeter: 0,
             biYPelsPerMeter: 0,

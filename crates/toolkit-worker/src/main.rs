@@ -367,17 +367,15 @@ fn resolve_worker_id(
             Some(mac) => format!("w-{name}-{mac}"),
             None => format!("w-{name}"),
         })
-    } else if let Some(ip) = local_address {
-        Some(
+    } else {
+        local_address.map(|ip| {
             match interface_name_for_ip(ip)
                 .and_then(|name| mac_suffix(&name).map(|mac| (name, mac)))
             {
                 Some((_, mac)) => format!("w-{ip}-{mac}"),
                 None => format!("w-{ip}"),
-            },
-        )
-    } else {
-        None
+            }
+        })
     };
 
     let id = match derived {
@@ -912,7 +910,11 @@ async fn handle_conn(
             .next_back()
             .unwrap_or("HTTP/1.1");
         let rewritten_line = format!("{method} {origin_path} {http_version}\r\n");
-        let headers_rest = head.splitn(2, "\r\n").nth(1).unwrap_or("").to_string();
+        let headers_rest = head
+            .split_once("\r\n")
+            .map(|(_, rest)| rest)
+            .unwrap_or("")
+            .to_string();
 
         upstream
             .write_all(rewritten_line.as_bytes())

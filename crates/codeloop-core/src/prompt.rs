@@ -250,19 +250,24 @@ pub fn locator_block(
 ///
 /// `evaluate_alternatives`：仅在 `mode=Design` 下生效，true → 切到
 /// [`DESIGN_SCOPE_WITH_ALTERNATIVES`]（多一条"方案最优性"维度）。Implementation 恒忽略此参数。
+#[derive(Debug, Clone, Copy)]
+pub struct CodexPromptOptions {
+    pub first_turn: bool,
+    pub evaluate_alternatives: bool,
+}
+
 pub fn render_codex_prompt(
     template: &str,
     target: &TargetSpec,
     mode: ReviewMode,
     round: u32,
-    first_turn: bool,
+    options: CodexPromptOptions,
     target_role: TargetRole,
     spec_doc: Option<&Path>,
-    evaluate_alternatives: bool,
 ) -> String {
     let scope = match mode {
         ReviewMode::Design => {
-            if evaluate_alternatives {
+            if options.evaluate_alternatives {
                 DESIGN_SCOPE_WITH_ALTERNATIVES
             } else {
                 DESIGN_SCOPE
@@ -276,7 +281,7 @@ pub fn render_codex_prompt(
         String::new()
     };
     let mut s = template.to_string();
-    if first_turn {
+    if options.first_turn {
         s.push_str(&locator_block(target, target_role, spec_doc));
     }
     fill_locator(&s, target)
@@ -418,10 +423,12 @@ mod tests {
             &spec("设计文档 docs/foo.md"),
             ReviewMode::Design,
             1,
-            true,
+            CodexPromptOptions {
+                first_turn: true,
+                evaluate_alternatives: false,
+            },
             TargetRole::RevisionDoc,
             None,
-            false,
         );
         assert!(p.contains("设计文档 docs/foo.md"));
         assert!(p.contains("VERDICT: PASS"));
@@ -445,10 +452,12 @@ mod tests {
             &spec("docs/foo.md"),
             ReviewMode::Implementation,
             3,
-            false,
+            CodexPromptOptions {
+                first_turn: false,
+                evaluate_alternatives: false,
+            },
             TargetRole::SpecDoc,
             None,
-            false,
         );
         assert!(p.contains("第 3 轮"));
         assert!(p.contains("符合设计"));
@@ -508,10 +517,12 @@ mod tests {
             &spec("docs/foo.md"),
             ReviewMode::Implementation,
             1,
-            true,
+            CodexPromptOptions {
+                first_turn: true,
+                evaluate_alternatives: false,
+            },
             TargetRole::RevisionCode,
             Some(&spec_doc),
-            false,
         );
         assert!(p.contains("待修订代码根"), "首轮应出现 RevisionCode 措辞");
         assert!(p.contains("规格依据"), "spec_doc=Some 时应追加规格依据行");
@@ -530,10 +541,12 @@ mod tests {
             &spec("docs/foo.md"),
             ReviewMode::Implementation,
             1,
-            true,
+            CodexPromptOptions {
+                first_turn: true,
+                evaluate_alternatives: false,
+            },
             TargetRole::RevisionCode,
             None,
-            false,
         );
         assert!(p.contains("待修订代码根"));
         assert!(
@@ -606,10 +619,12 @@ mod tests {
             &spec("docs/foo.md"),
             ReviewMode::Design,
             1,
-            true,
+            CodexPromptOptions {
+                first_turn: true,
+                evaluate_alternatives: false,
+            },
             TargetRole::RevisionDoc,
             None,
-            false,
         );
         assert!(p.contains("现状"), "DESIGN_SCOPE 默认应含现状分析维度");
         assert!(!p.contains("评估所选方案"), "默认不打开方案最优性维度");
@@ -622,10 +637,12 @@ mod tests {
             &spec("docs/foo.md"),
             ReviewMode::Design,
             1,
-            true,
+            CodexPromptOptions {
+                first_turn: true,
+                evaluate_alternatives: true,
+            },
             TargetRole::RevisionDoc,
             None,
-            true,
         );
         assert!(p.contains("评估所选方案"));
         assert!(p.contains("现状"), "alternatives 维度不应替换掉现状分析");
@@ -639,10 +656,12 @@ mod tests {
             &spec("src/foo.rs"),
             ReviewMode::Implementation,
             1,
-            true,
+            CodexPromptOptions {
+                first_turn: true,
+                evaluate_alternatives: true,
+            },
             TargetRole::SpecDoc,
             None,
-            true, // 即便传 true
         );
         assert!(p.contains("符合设计"));
         assert!(!p.contains("评估所选方案"));

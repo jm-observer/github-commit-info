@@ -7,12 +7,12 @@ import { EgressAPI, type WorkerStatus } from './api/tauri-client'
  * 最近心跳时间 / 占用的 type。只读观测面，无写操作。
  *
  * 拉 G10 toolkit-server 的 `/api/web/egress/workers`（经 egress_list_workers Tauri
- * 命令中转，形态与 net-policy / llm 模块一致）。手动刷新 + 5s 定时轮询。
+ * 命令中转，形态与 llm 模块一致）。手动刷新 + 5s 定时轮询。
  */
 
 const POLL_INTERVAL_MS = 5000
 
-// 与 net-policy ObservatorySection 的 ago() 同口径（相对时间展示）。
+// 相对时间展示。
 function ago(ms: number): string {
   if (!ms) return ''
   const sec = Math.max(0, Math.floor((Date.now() - ms) / 1000))

@@ -56,7 +56,7 @@ unsafe fn grab_rgba(rect: &MonitorRect, w: i32, h: i32) -> Result<Vec<u8>> {
         bmi.bmiHeader.biHeight = -h;
         bmi.bmiHeader.biPlanes = 1;
         bmi.bmiHeader.biBitCount = 32;
-        bmi.bmiHeader.biCompression = BI_RGB as u32;
+        bmi.bmiHeader.biCompression = BI_RGB;
 
         let stride = (w as usize) * 4;
         let mut buf = vec![0u8; stride * (h as usize)];

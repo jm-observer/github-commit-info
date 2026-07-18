@@ -76,7 +76,7 @@ async fn relay(client: WebSocket, base: String, state: AppState, p: StreamParams
         while let Some(Ok(msg)) = cli_rx.next().await {
             let fwd = match msg {
                 Message::Text(t) => TMessage::text(t.to_string()),
-                Message::Binary(b) => TMessage::Binary(b.to_vec().into()),
+                Message::Binary(b) => TMessage::Binary(b.to_vec()),
                 Message::Close(_) => {
                     let _ = up_tx.send(TMessage::Close(None)).await;
                     break;
@@ -91,29 +91,22 @@ async fn relay(client: WebSocket, base: String, state: AppState, p: StreamParams
 
     // 上游 → 桌面端:转发事件;拦截 final 落库。
     while let Some(Ok(msg)) = up_rx.next().await {
-        match msg {
+        let outbound = match msg {
             TMessage::Text(t) => {
                 // final 事件:解析→落库→**规范化为 ScoreResult 形状**(与批量 /score 一致,
                 // 桌面端零分叉);其它事件(ready/partial/error)原样透传。
                 let out = finalize_or_passthrough(&t.to_string(), &state, &p, kind, threshold);
-                if cli_tx.send(Message::Text(out.into())).await.is_err() {
-                    break;
-                }
+                Message::Text(out.into())
             }
-            TMessage::Binary(b) => {
-                if cli_tx
-                    .send(Message::Binary(b.to_vec().into()))
-                    .await
-                    .is_err()
-                {
-                    break;
-                }
-            }
+            TMessage::Binary(b) => Message::Binary(b.to_vec().into()),
             TMessage::Close(_) => {
                 let _ = cli_tx.send(Message::Close(None)).await;
                 break;
             }
-            _ => {}
+            _ => continue,
+        };
+        if cli_tx.send(outbound).await.is_err() {
+            break;
         }
     }
     client_to_upstream.abort();
