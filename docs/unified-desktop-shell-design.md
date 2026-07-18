@@ -489,7 +489,8 @@ Tauri 2 的 `tauri::generate_handler!` 是**过程宏**，只能在单个调用�
 
 用户当前在 Windows 下使用 WireGuard 连接海外 VPN。问题不是 WireGuard 隧道本身，而是默认海外出口导致国内服务访问不理想；同时用户要求未知请求必须继续走海外出口，只有明确配置的程序、域名或 IP 才允许走本地出口。
 
-网络策略不再作为 `zero-desktop` 内嵌页面或后台模块；当前以独立的 `net-policy-gui`、`net-policy-agent`、`net-policy-cli` 组件交付。本节保留为历史验证与架构决策记录，后续实现以 `docs/net-policy/` 为准。
+网络策略不再作为 `zero-desktop` 内嵌页面或后台模块；当前以独立的 `net-policy-gui`、`net-policy-agent`、`net-policy-cli` 组件交付。本节保留为历史验证与架构决策记录；**net-policy 已于 2026-07 拆为独立仓**
+[jm-observer/net-policy](https://github.com/jm-observer/net-policy)，后续实现以该仓的 `docs/net-policy/` 为准。
 
 不可妥协约束：
 

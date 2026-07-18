@@ -13,17 +13,11 @@ members = [
     "crates/toolkit-llm",
     "crates/toolkit-server",
     "crates/zero-desktop",
-    "crates/net-policy-core",
-    "crates/net-policy-client",
-    "crates/net-policy-agent",
-    "crates/net-policy-cli",
-    "crates/net-policy-mitm",
     "crates/orchestrator",
     "crates/egress-pool",
     "crates/egress-client",
     "crates/toolkit-worker",
     "crates/egress-tester",
-    "crates/net-policy-gui",
 ]
 resolver = "2"
 

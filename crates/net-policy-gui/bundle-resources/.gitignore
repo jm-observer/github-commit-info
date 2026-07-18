@@ -1,3 +1,0 @@
-# 打包时由 package-net-policy.ps1 拷入的二进制，不入库。
-*.exe
-!.gitignore

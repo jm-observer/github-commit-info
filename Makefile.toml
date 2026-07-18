@@ -33,17 +33,7 @@ cwd = "crates/zero-desktop"
 command = "cargo"
 args = ["tauri", "dev", "--no-watch"]
 
-# ── net-policy-gui ────────────────────────────────────────────────────────────
-
-[tasks.package-net-policy]
-description = "打包 net-policy-gui 一体化 NSIS 安装程序（GUI + agent + mihomo + 内置 Rust MITM）"
-command = "pwsh"
-args = ["-NoProfile", "-File", "${CARGO_MAKE_WORKING_DIRECTORY}/package-net-policy.ps1"]
-
-[tasks.package-net-policy-debug]
-description = "Debug 编译并打包 net-policy-gui 一体化 NSIS 安装程序（用于本地调试）"
-command = "pwsh"
-args = ["-NoProfile", "-File", "${CARGO_MAKE_WORKING_DIRECTORY}/package-net-policy.ps1", "-Debug"]
+# net-policy 已拆为独立仓（jm-observer/net-policy），打包任务随之迁出。
 
 [tasks.worker]
 command = "cargo"
