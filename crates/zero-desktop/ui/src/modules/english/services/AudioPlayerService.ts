@@ -93,20 +93,20 @@ export class AudioPlayerService {
 
   private _initAudioContext(): void {
     this.audioAdapter.onPlay(() => {
-      this.isPlaying = true
+      // 只更新文案，不写会话状态：底层 play 事件可能晚于用户的暂停到达(见 playCurrentAudio
+      // 的异步窗口)，若在此置 true 会把刚暂停的会话复活，表现为"点暂停无效"。
       this._updateStatusText('播放中...')
-      this._triggerEvent('onPlayStateChange', { isPlaying: true })
     })
     this.audioAdapter.onPause(() => {
-      this._updateStatusText('已暂停')
-      this._triggerEvent('onPlayStateChange', { isPlaying: false })
+      // 句间切换会主动 pause() 底层音频元素，但会话仍在播放中——此时不能翻成"已暂停"，
+      // 否则按钮在每个间隔都闪一次 ▶。只有会话真的停了(用户暂停/停止/跟读等待)才更新文案。
+      if (!this.isPlaying) this._updateStatusText('已暂停')
     })
     this.audioAdapter.onEnded(() => this._onAudioEnded())
     this.audioAdapter.onError((error) => {
       if (error && typeof error === 'object' && 'type' in error && error.type === 'autoplay_blocked') {
         this._updateStatusText('请点击播放按钮开始播放')
-        this.isPlaying = false
-        this._triggerEvent('onPlayStateChange', { isPlaying: false })
+        this._setPlaying(false)
         return
       }
       this._updateStatusText('播放失败')
@@ -115,6 +115,17 @@ export class AudioPlayerService {
     this.audioAdapter.onWaiting(() => { /* loading */ })
     this.audioAdapter.onCanplay(() => { /* ready */ })
     this.isInitialized = true
+  }
+
+  /**
+   * 会话级播放状态的唯一写入口。isPlaying 表达「播放会话是否进行中」，而非「音频元素此刻是否出声」——
+   * 句间间隔、切句、重复播放这些内部暂停都不改它，按钮因此在整个连播过程中稳定显示 ⏸。
+   * 只在值真的变化时广播，避免重复事件。
+   */
+  private _setPlaying(next: boolean): void {
+    if (this.isPlaying === next) return
+    this.isPlaying = next
+    this._triggerEvent('onPlayStateChange', { isPlaying: next })
   }
 
   private _updateStatusText(text: string): void {
@@ -139,6 +150,9 @@ export class AudioPlayerService {
   }
 
   async playCurrentAudio(): Promise<void> {
+    // 会话状态的另一个入口：外部(PackagePlayer/AnnotationPlayer 自动播放)可能不经
+    // togglePlayPause 直接调这里，故在此声明会话开始。
+    this._setPlaying(true)
     let audio = this._getCurrentAudio()
     let sentence = this._getCurrentSentence()
 
@@ -154,8 +168,7 @@ export class AudioPlayerService {
         if (s && Array.isArray(s.audios) && s.audios.length > 0) { found = idx; break }
       }
       if (found < 0) {
-        this.isPlaying = false
-        this._triggerEvent('onPlayStateChange', { isPlaying: false })
+        this._setPlaying(false)
         this._updateStatusText('当前列表无可播放音频')
         return
       }
@@ -182,6 +195,8 @@ export class AudioPlayerService {
       } else {
         this._updateStatusText('播放缓存音频...')
       }
+      // 取缓存是异步的，这期间用户可能已点暂停/停止 —— 不复检就会照常起播，暂停形同无效。
+      if (!this.isPlaying) return
       if (this.audioAdapter.setTitle) {
         this.audioAdapter.setTitle(sentence.text ? sentence.text.substring(0, 50) : '英语音频')
       }
@@ -250,8 +265,7 @@ export class AudioPlayerService {
   private _enterShadowWait(): void {
     try { this.audioAdapter.pause() } catch { /* ignore */ }
     this._clearTimers()
-    this.isPlaying = false
-    this._triggerEvent('onPlayStateChange', { isPlaying: false })
+    this._setPlaying(false)
     this._updateStatusText('请跟读…')
     const sentence = this._getCurrentSentence()
     if (sentence) {
@@ -264,7 +278,6 @@ export class AudioPlayerService {
 
   private _nextSentence(): void {
     try { this.audioAdapter.pause() } catch { /* ignore */ }
-    this.isPlaying = false
     const isLast = this.currentSentenceIndex === this.sentences.length - 1
     if (this.stopMode === 'roundEnd' && isLast) {
       this.stopAudio()
@@ -272,6 +285,9 @@ export class AudioPlayerService {
       this._triggerEvent('onPlayComplete', {})
       return
     }
+    // 切句是会话内的推进：无论此前是暂停态(手动点下一句/跟读判分通过)还是连播中，
+    // 之后都会自动播下一句，所以这里把会话置为播放中，按钮保持 ⏸。
+    this._setPlaying(true)
     this.currentSentenceIndex = isLast ? 0 : this.currentSentenceIndex + 1
     this.currentAudioIndex = 0
     this.playCount = 0
@@ -285,13 +301,14 @@ export class AudioPlayerService {
     if (this.delayPlayTimer) clearTimeout(this.delayPlayTimer)
     this.delayPlayTimer = setTimeout(() => {
       this.delayPlayTimer = null
-      void this.playCurrentAudio()
+      // 间隔窗口内用户可能点了暂停，到点前再确认一次会话仍在播放。
+      if (this.isPlaying) void this.playCurrentAudio()
     }, this.audioSwitchDelay)
   }
 
   private _previousSentence(): void {
     try { this.audioAdapter.pause() } catch { /* ignore */ }
-    this.isPlaying = false
+    this._setPlaying(true)
     this.currentSentenceIndex = this.currentSentenceIndex > 0
       ? this.currentSentenceIndex - 1
       : this.sentences.length - 1
@@ -307,7 +324,8 @@ export class AudioPlayerService {
     if (this.delayPlayTimer) clearTimeout(this.delayPlayTimer)
     this.delayPlayTimer = setTimeout(() => {
       this.delayPlayTimer = null
-      void this.playCurrentAudio()
+      // 间隔窗口内用户可能点了暂停，到点前再确认一次会话仍在播放。
+      if (this.isPlaying) void this.playCurrentAudio()
     }, this.audioSwitchDelay)
   }
 
@@ -370,13 +388,14 @@ export class AudioPlayerService {
 
   togglePlayPause(): void {
     if (this.isPlaying) {
-      this.audioAdapter.pause()
-      this.isPlaying = false
+      // 可能正处于句间间隔(音频元素没在响、只有 timer 挂着)，一并清掉才算真暂停。
+      // 只清间隔 timer，半小时停止的计时不受暂停影响。
+      if (this.delayPlayTimer) { clearTimeout(this.delayPlayTimer); this.delayPlayTimer = null }
+      try { this.audioAdapter.pause() } catch { /* ignore */ }
+      this._setPlaying(false)
       this._updateStatusText('已暂停')
-      this._triggerEvent('onPlayStateChange', { isPlaying: false })
     } else {
-      this.isPlaying = true
-      this._triggerEvent('onPlayStateChange', { isPlaying: true })
+      this._setPlaying(true)
       void this.playCurrentAudio()
     }
   }
@@ -387,7 +406,7 @@ export class AudioPlayerService {
       if (this.audioAdapter.stop) this.audioAdapter.stop()
       else this.audioAdapter.pause()
     } catch { /* ignore */ }
-    this.isPlaying = false
+    this._setPlaying(false)
     this.playCount = 0
     this._updateStatusText('已停止')
   }
@@ -404,8 +423,7 @@ export class AudioPlayerService {
     this.currentAudioIndex = 0
     // 置 playCount = max-1：播一遍后 _onAudioEnded 即走 _nextAudio → 末段 → 再次进闸门。
     this.playCount = Math.max(0, this.maxPlayCount - 1)
-    this.isPlaying = true
-    this._triggerEvent('onPlayStateChange', { isPlaying: true })
+    this._setPlaying(true)
     void this.playCurrentAudio()
   }
 
