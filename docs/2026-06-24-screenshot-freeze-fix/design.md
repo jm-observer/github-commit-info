@@ -198,5 +198,64 @@ zero-desktop 主窗 webview 消息循环，所以 UI「卡」时 ASR 照常响�
 - 不重做截图模块、不改交互/快捷键/合成协议。
 - 不把 overlay 改成「Rust 原生窗」——`tauri-plugin-global-shortcut` + WebviewWindow 的
   组合本身没问题，问题在错误处理。
-- ready-ack watchdog 仅在「show() 后未就绪」窗口期生效，**不做长期 watchdog 线程
-  定时巡检残留窗**——前 4 道防线已封死所有已知卡死路径。
+- ~~ready-ack watchdog 仅在「show() 后未就绪」窗口期生效，**不做长期 watchdog 线程
+  定时巡检残留窗**——前 4 道防线已封死所有已知卡死路径。~~
+  **↑ 2026-07-21 推翻，见 §7。**
+
+## 7. 2026-07-21 复发与二次修复
+
+症状复发，且比首版更重：不只是「点哪都没反应」，还伴随整个程序无响应。
+
+### 7.1 首版为什么没兜住
+
+**首版的四道防线全部是「单进程内」的 overlay 生命周期管理，而复发的根因是跨进程的。**
+现场抓到的活体证据：机器上同时存在两个 zero-desktop 进程（一个装在
+`AppData\Local\`、一个 `target\debug\`），**两个都建出了 `global_hotkey_app` 窗口**，
+即两个实例同时抢注 `Ctrl+Alt+A`。
+
+两个此前完全没被覆盖的缺口：
+
+| # | 缺口 | 后果 |
+|---|---|---|
+| ① | **没有单实例保护**。`main.rs` 的插件列表里没有 `tauri-plugin-single-instance`。 | 两个进程互抢全局热键（`mod.rs::register_hotkey` 每个进程启动都 `unregister_all()` 再注册自己）、争同一个 workspace SQLite。更致命的是 `open_overlay` 的「等旧窗销毁」只查**本进程**窗口表，对另一个进程的残留 overlay 既看不见也关不掉。 |
+| ② | **关主窗不等于退进程**。overlay 是 `skip_taskbar(true)` 的窗，而 `on_window_event` 当时只处理 `Focused`。 | Tauri 默认「最后一个窗口关闭才退出」，overlay 一旦残留，关主窗后进程继续存活且**任务栏毫无痕迹**——用户以为关干净了，实际留下幽灵进程：热键仍注册着，overlay 仍是拦截整个桌面输入的隐身玻璃。再启动一个就成了缺口 ①。 |
+
+### 7.2 三道新防线
+
+| 防线 | 改动 | 封死的路径 |
+|---|---|---|
+| ⑥ 单实例 | `main.rs` 挂 `tauri-plugin-single-instance`（必须是第一个插件），第二实例改为聚焦已有主窗后自退。 | 缺口 ① |
+| ⑦ 关窗即退进程 | `on_window_event` 补 `CloseRequested{ label=="main" }` → `close_overlay` + `app.exit(0)`。 | 缺口 ② |
+| ⑧ 滞留兜底 | `overlay.rs` 加 `CURRENT_SESSION` + `LINGER_LIMIT`(120s) watchdog：到期时若屏上 overlay 仍属本 session 则无条件关窗。所有关窗路径统一走 `close_overlay`（顺带清 `CURRENT_SESSION`）。 | §6 原本明确「不做」的那条 |
+
+防线 ⑧ 是对原结论的推翻。原文的理由是「前 4 道防线已封死所有已知卡死路径」，但那个
+「已知」不含 **ready 成功之后**才发生的故障（选区交互中 JS 崩、commit 卡住、进程被外部
+挂起）——ready-ack watchdog 只覆盖「show() 到就绪」这一小段窗口期，ack 一旦到达就
+彻底撤防。而残留代价是整个桌面失去输入，不对称到不值得省这一层。
+
+### 7.3 验收记录（2026-07-21 实测）
+
+1. **单实例**：起一个实例后再次启动 → 新进程立即自退（退出码 0），实例数保持 1；
+   新版进程可见窗口中出现 `com.jmobserver.zero-desktop-sic`（插件 IPC 窗）。
+2. **关窗即退**：向主窗 `PostMessage(WM_CLOSE)` → 进程真正消失（改前会留幽灵）。
+3. **滞留兜底**：把 `LINGER_LIMIT` 临时调到 8s，并把 `ui/dist/overlay.html` 换成
+   「只报 ready、之后永不 commit/cancel」的 stub 以模拟「ready 之后前端失能」，
+   trace 精确落在预期时序上：
+
+   ```
+   01:07:21.371 overlay-shown
+   01:07:23.876 overlay-ready          ← ack 到达，防线 ③ 就此撤防
+   01:07:29.374 linger-check | sid=1 current=1 win_exists=true
+   01:07:29.378 overlay-linger-timeout ← 防线 ⑧ 强制关窗
+   ```
+
+   关窗后主窗仍在（不误杀应用）。另单独验证了**不误杀正常路径**：用户按 Esc 正常
+   取消后，watchdog 到期走「窗口已消失」的静默分支，不写 timeout、不影响后续截图。
+
+### 7.4 仍未做
+
+§3.5 的 P2（抓屏移出主线程）依然没做，且实测确认它是真实存在的卡顿源：debug 构建下
+`frame-saved → overlay-shown` 之间耗时 **3.7s**（release 会好很多但同量级），这段全部
+压在主线程上；`open_overlay` 等旧窗销毁的轮询 `std::thread::sleep`（最多 300ms）同样
+跑在主线程。这解释了复发描述里的「甚至会出现程序无响应」中**不由隐身玻璃造成**的那部分
+——它是真的主线程阻塞。防线 ⑥⑦⑧ 不覆盖这个，需按 §3.5 独立跟进。

@@ -206,6 +206,17 @@ fn run_gui(workspace: PathBuf) -> Result<()> {
     let state = AppState::new(workspace).context("AppState::new")?;
 
     tauri::Builder::default()
+        // 单实例必须是第一个插件（Tauri 要求）：第二个实例启动时不再自建窗口，
+        // 而是把已有主窗拉到前台后自行退出。杜绝「两个进程互抢 Ctrl+Alt+A /
+        // 同一个 workspace SQLite」，也杜绝旧进程被误当成已关闭而重复拉起。
+        .plugin(tauri_plugin_single_instance::init(|app, _argv, _cwd| {
+            use tauri::Manager;
+            if let Some(w) = app.get_webview_window("main") {
+                let _ = w.unminimize();
+                let _ = w.show();
+                let _ = w.set_focus();
+            }
+        }))
         .plugin(tauri_plugin_fs::init())
         .plugin(tauri_plugin_http::init())
         .plugin(tauri_plugin_store::Builder::default().build())
@@ -216,12 +227,27 @@ fn run_gui(workspace: PathBuf) -> Result<()> {
         .plugin(tauri_plugin_global_shortcut::Builder::new().build())
         .manage(state.clone())
         .on_window_event(|window, event| {
-            // 窗口重新聚焦时失效活动端点探测缓存：用户可能刚切换了网络（回家/外出），
-            // 下次请求据此重新探测局域网可达性、自动选路。
-            if let tauri::WindowEvent::Focused(true) = event {
-                use tauri::Manager;
-                let net = window.state::<AppState>().net.clone();
-                tauri::async_runtime::spawn(async move { net.invalidate().await });
+            use tauri::Manager;
+            match event {
+                // 窗口重新聚焦时失效活动端点探测缓存：用户可能刚切换了网络（回家/外出），
+                // 下次请求据此重新探测局域网可达性、自动选路。
+                tauri::WindowEvent::Focused(true) => {
+                    let net = window.state::<AppState>().net.clone();
+                    tauri::async_runtime::spawn(async move { net.invalidate().await });
+                }
+                // 关主窗 = 真退出进程。
+                //
+                // 不能依赖 Tauri 默认的「最后一个窗口关闭才退出」：截图 overlay 是
+                // `skip_taskbar(true)` 的透明置顶窗（见 modules::screenshot::overlay），
+                // 一旦它残留，关掉主窗后进程会因为「还有窗口」而继续存活，且任务栏上
+                // 毫无痕迹 —— 用户以为关干净了，实际留下一个幽灵进程：它的全局热键仍
+                // 注册着，它的 overlay 仍是一层拦截整个桌面输入的隐身玻璃。这正是
+                // 「点哪都没反应」反复复发的根源。
+                tauri::WindowEvent::CloseRequested { .. } if window.label() == "main" => {
+                    modules::screenshot::overlay::close_overlay(&window.app_handle().clone());
+                    window.app_handle().exit(0);
+                }
+                _ => {}
             }
         })
         .invoke_handler(tauri::generate_handler![

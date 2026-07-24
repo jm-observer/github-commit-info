@@ -17,6 +17,9 @@ tauri-plugin-clipboard-manager = "2"
 tauri-plugin-notification = "2"
 # screenshot 模块：全局热键唤起截图
 tauri-plugin-global-shortcut = "2"
+# 单实例保护：杜绝两个进程互抢全局热键 / workspace，并杜绝「看不见的旧进程」
+# （截图 overlay 是 skip_taskbar 窗，旧进程残留时任务栏无迹可寻）。
+tauri-plugin-single-instance = "2"
 # screenshot 模块：把抓屏 BGRA 像素编码成 PNG（轻量，不引整套 image）
 png = "0.17"
 serde = { workspace = true }

@@ -5,6 +5,10 @@
 //! - 旧窗未销毁前不重建，超时直接放弃本次截图（不复用旧窗，避免锁定故障态）。
 //! - 建窗后启动 ready-ack watchdog：前端 `screenshot_overlay_ready` 未在 ~2.5s
 //!   内回执则自动关窗 + 通知，覆盖「JS 起不来 / asset 协议失败」等前端兜底不到的路径。
+//! - **滞留兜底**（推翻原 design.md §6「不做长期巡检」的结论）：ready-ack watchdog 只
+//!   覆盖「show() 之后到就绪之前」这个窗口期，一旦前端 ack 过了，之后再出问题（选区
+//!   交互中 JS 崩、commit 卡住、进程被外部挂起）就再没人管，而残留代价是整个桌面失去
+//!   输入。故给每个 overlay 加一条上限 `LINGER_LIMIT` 的存活线，超时无条件关窗。
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -19,11 +23,19 @@ pub const OVERLAY_LABEL: &str = "screenshot-overlay";
 const READY_WATCHDOG: Duration = Duration::from_millis(2500);
 /// 等待旧窗销毁的总时长（轮询 20ms 一次）。
 const OLD_WINDOW_WAIT: Duration = Duration::from_millis(300);
+/// overlay 存活上限：超过这个时间还没 commit/cancel，一律视为滞留并强制关窗。
+/// 取值考虑「人正常框选 + 标注」的耗时上限——两分钟足够从容操作，又不至于让一层
+/// 隐身玻璃罩着桌面太久。
+const LINGER_LIMIT: Duration = Duration::from_secs(120);
 
 // ---- per-session ready-ack 状态 ----
 
 static NEXT_SID: AtomicU64 = AtomicU64::new(1);
 static READY_FLAGS: OnceLock<Mutex<HashMap<u64, Arc<AtomicBool>>>> = OnceLock::new();
+
+/// 当前屏上 overlay 归属的 session id；0 = 当前无 overlay。
+/// 滞留 watchdog 到期时据此确认「屏上这个窗还是不是我建的那个」，避免误关后续截图。
+static CURRENT_SESSION: AtomicU64 = AtomicU64::new(0);
 
 fn flags_map() -> &'static Mutex<HashMap<u64, Arc<AtomicBool>>> {
     READY_FLAGS.get_or_init(|| Mutex::new(HashMap::new()))
@@ -118,6 +130,7 @@ pub fn open_overlay(
         return Err(e);
     }
     let _ = win.set_focus();
+    CURRENT_SESSION.store(session_id, Ordering::SeqCst);
 
     // ready-ack watchdog：~2.5s 没收到前端 ready 就强行关窗 + 通知。覆盖所有
     // 「window 已 show 但前端永远跑不到 ack」的路径（JS chunk 缺失 / asset 协议
@@ -135,19 +148,42 @@ pub fn open_overlay(
                 "overlay-ready-timeout",
                 &session_id.to_string(),
             );
-            if let Some(w) = app_clone.get_webview_window(OVERLAY_LABEL) {
-                let _ = w.close();
-            }
+            close_overlay(&app_clone);
             super::commands::notify_capture_failed(&app_clone, "叠加窗未就绪，已自动关闭");
         }
         unregister_session(session_id);
     });
 
+    // 滞留 watchdog：ready 之后的所有故障路径的最后一道闸。到期时若屏上 overlay
+    // 仍是本次 session 的（commit/cancel 会把 CURRENT_SESSION 清零，正常路径不会命中），
+    // 无条件关窗——宁可丢一次没做完的截图，也不能让隐身玻璃继续罩着整个桌面。
+    let app_linger = app.clone();
+    let workspace_linger = app.state::<crate::app_state::AppState>().workspace.clone();
+    tauri::async_runtime::spawn(async move {
+        tokio::time::sleep(LINGER_LIMIT).await;
+        if CURRENT_SESSION.load(Ordering::SeqCst) != session_id {
+            return; // 已正常收尾，或已被后续截图接管
+        }
+        if app_linger.get_webview_window(OVERLAY_LABEL).is_none() {
+            CURRENT_SESSION.store(0, Ordering::SeqCst);
+            return;
+        }
+        super::commands::trace_capture(
+            &workspace_linger,
+            "overlay-linger-timeout",
+            &session_id.to_string(),
+        );
+        close_overlay(&app_linger);
+        super::commands::notify_capture_failed(&app_linger, "截图窗停留过久，已自动关闭");
+    });
+
     Ok(())
 }
 
-/// 关闭叠加窗口（若存在）。
+/// 关闭叠加窗口（若存在）。所有关窗路径（commit / cancel / 两个 watchdog / 主窗退出）
+/// 都走这里，顺带清掉 `CURRENT_SESSION`，让滞留 watchdog 到期时认得出「已收尾」。
 pub fn close_overlay(app: &AppHandle) {
+    CURRENT_SESSION.store(0, Ordering::SeqCst);
     if let Some(w) = app.get_webview_window(OVERLAY_LABEL) {
         let _ = w.close();
     }
