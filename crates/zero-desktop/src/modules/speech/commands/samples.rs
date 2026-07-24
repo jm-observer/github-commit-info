@@ -42,6 +42,13 @@ pub struct Sample {
     pub audio_status: String,
     pub hotword_sync: Option<String>,
     pub marked_at: String,
+    pub source: String,
+    pub segment_ids: Option<String>,
+    pub app_exe: Option<String>,
+    pub app_path: Option<String>,
+    pub app_title: Option<String>,
+    pub app_class: Option<String>,
+    pub delivery_mode: Option<String>,
 }
 
 impl From<SampleRow> for Sample {
@@ -61,6 +68,13 @@ impl From<SampleRow> for Sample {
             audio_status: r.audio_status,
             hotword_sync: r.hotword_sync,
             marked_at: r.marked_at,
+            source: r.source,
+            segment_ids: r.segment_ids,
+            app_exe: r.app_exe,
+            app_path: r.app_path,
+            app_title: r.app_title,
+            app_class: r.app_class,
+            delivery_mode: r.delivery_mode,
         }
     }
 }
@@ -273,6 +287,10 @@ pub async fn speech_mark_sample(
         note,
         audio_status: "skipped".to_string(),
         marked_at: now_str(),
+        source: "ui".to_string(),
+        segment_ids: None,
+        // 手工标注面板没有「交付动作」这一时刻，应用上下文留空（只有自动交付链路才抓拍）。
+        app: Default::default(),
     };
     let sample_id = db.insert_sample(new).await.map_err(|e| e.to_string())?;
 
@@ -377,6 +395,15 @@ pub async fn speech_export_samples(state: State<'_, AppState>) -> Result<String,
                 "audio_status": r.audio_status,
                 "hotword_sync": r.hotword_sync,
                 "marked_at": r.marked_at,
+                "source": r.source,
+                "segment_ids": r.segment_ids,
+                // 交付时的应用上下文（同音字纠错数据收集期）。app_title 可能含聊天对象名 /
+                // 文档名 / 网页标题——分享导出文件前请自行留意。
+                "app_exe": r.app_exe,
+                "app_path": r.app_path,
+                "app_title": r.app_title,
+                "app_class": r.app_class,
+                "delivery_mode": r.delivery_mode,
             })
         })
         .collect();

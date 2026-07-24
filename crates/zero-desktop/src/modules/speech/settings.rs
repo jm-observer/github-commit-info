@@ -48,9 +48,15 @@ pub(crate) struct CombinedSettings {
     pub(crate) auto_paste_rewrite_retype: bool,
     #[serde(default)]
     pub(crate) auto_start: bool,
+    #[serde(default = "default_capture_enabled_dto")]
+    pub(crate) capture_enabled: bool,
 }
 
 fn default_notify_sound_dto() -> bool {
+    true
+}
+
+fn default_capture_enabled_dto() -> bool {
     true
 }
 
@@ -71,6 +77,7 @@ pub(crate) fn get_settings_from_state(state: &SpeechState) -> Result<CombinedSet
         auto_paste: llm.auto_paste,
         auto_paste_rewrite_retype: llm.auto_paste_rewrite_retype,
         auto_start: llm.auto_start,
+        capture_enabled: llm.capture_enabled,
     })
 }
 
@@ -129,6 +136,7 @@ pub(crate) async fn apply_settings_to_state(
         auto_paste_rewrite_retype: new_settings.auto_paste_rewrite_retype,
         auto_start: new_settings.auto_start,
         voice_commands_enabled,
+        capture_enabled: new_settings.capture_enabled,
     };
     let new_url = new_settings.remote_url.trim().to_string();
 
@@ -217,6 +225,16 @@ pub(crate) async fn apply_settings_to_state(
     )
     .await
     .map_err(|e| e.to_string())?;
+    db.upsert_setting(
+        "capture.enabled".to_string(),
+        if new_llm.capture_enabled {
+            "1".into()
+        } else {
+            "0".into()
+        },
+    )
+    .await
+    .map_err(|e| e.to_string())?;
     db.upsert_setting("remote.url".to_string(), new_url)
         .await
         .map_err(|e| e.to_string())?;
@@ -274,6 +292,9 @@ pub(crate) async fn load_llm_settings_from_db(db: &db::SpeechDatabase) -> LlmSet
         .await
     {
         s.voice_commands_enabled = !matches!(v.as_str(), "0" | "off" | "false");
+    }
+    if let Ok(Some(v)) = db.get_setting("capture.enabled".to_string()).await {
+        s.capture_enabled = matches!(v.as_str(), "1" | "on" | "true");
     }
     s
 }

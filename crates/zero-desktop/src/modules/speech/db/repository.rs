@@ -19,6 +19,33 @@ pub struct SampleRow {
     pub audio_status: String,
     pub hotword_sync: Option<String>,
     pub marked_at: String,
+    /// 样本来源：`"ui"`（手工标注面板）| `"copy"`（专用快捷键一键采集）。
+    pub source: String,
+    /// 采集涉及的完整 segment id 列表（JSON 数组文本），一条样本可能由多段 burst 拼成。
+    /// 手工标注（单段）通常为 `None`，`segment_id` 单列已够用。
+    pub segment_ids: Option<String>,
+    /// 交付时前台应用的可执行文件名，如 `Code.exe`。
+    pub app_exe: Option<String>,
+    /// 交付时前台应用的可执行文件全路径。
+    pub app_path: Option<String>,
+    /// 交付时的窗口标题。浏览器场景下是区分具体站点的唯一线索。
+    pub app_title: Option<String>,
+    /// 交付时的窗口类名。
+    pub app_class: Option<String>,
+    /// 交付模式：`"auto_paste"` | `"auto_copy"`；手工标注或未开启自动交付时为 `None`。
+    pub delivery_mode: Option<String>,
+}
+
+/// 一次交付时的应用上下文（`speech_samples` 的 `app_*` / `delivery_mode` 五列）。
+///
+/// 手工标注路径没有交付动作，取 `Default`（全空）即可。
+#[derive(Debug, Clone, Default)]
+pub struct SampleAppContext {
+    pub app_exe: Option<String>,
+    pub app_path: Option<String>,
+    pub app_title: Option<String>,
+    pub app_class: Option<String>,
+    pub delivery_mode: Option<String>,
 }
 
 /// 新插入标注样本前的入参（不含自增 id / 落盘音频字段）。
@@ -34,6 +61,10 @@ pub struct NewSample {
     pub note: Option<String>,
     pub audio_status: String,
     pub marked_at: String,
+    pub source: String,
+    pub segment_ids: Option<String>,
+    /// 交付时的应用上下文；手工标注路径传 `Default::default()`。
+    pub app: SampleAppContext,
 }
 
 /// 插入一条样本，返回自增 id。`audio_path`/`hotword_sync` 暂为空，后续 update。
@@ -42,8 +73,11 @@ pub fn insert_sample(conn: &Connection, s: &NewSample) -> Result<i64> {
         "INSERT INTO speech_samples(
             segment_id, session_id, label, text_raw, text_optimized,
             text_english, text_secondary, correction, note,
-            audio_path, audio_status, hotword_sync, marked_at
-        ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, NULL, ?10, NULL, ?11)",
+            audio_path, audio_status, hotword_sync, marked_at,
+            source, segment_ids,
+            app_exe, app_path, app_title, app_class, delivery_mode
+        ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, NULL, ?10, NULL, ?11, ?12, ?13,
+                  ?14, ?15, ?16, ?17, ?18)",
         params![
             s.segment_id,
             s.session_id,
@@ -56,6 +90,13 @@ pub fn insert_sample(conn: &Connection, s: &NewSample) -> Result<i64> {
             s.note,
             s.audio_status,
             s.marked_at,
+            s.source,
+            s.segment_ids,
+            s.app.app_exe,
+            s.app.app_path,
+            s.app.app_title,
+            s.app.app_class,
+            s.app.delivery_mode,
         ],
     )
     .context("failed to insert speech sample")?;
@@ -103,12 +144,21 @@ fn row_to_sample(row: &rusqlite::Row<'_>) -> rusqlite::Result<SampleRow> {
         audio_status: row.get(11)?,
         hotword_sync: row.get(12)?,
         marked_at: row.get(13)?,
+        source: row.get(14)?,
+        segment_ids: row.get(15)?,
+        app_exe: row.get(16)?,
+        app_path: row.get(17)?,
+        app_title: row.get(18)?,
+        app_class: row.get(19)?,
+        delivery_mode: row.get(20)?,
     })
 }
 
 const SAMPLE_COLS: &str = "id, segment_id, session_id, label, text_raw, text_optimized,
         text_english, text_secondary, correction, note,
-        audio_path, audio_status, hotword_sync, marked_at";
+        audio_path, audio_status, hotword_sync, marked_at,
+        source, segment_ids,
+        app_exe, app_path, app_title, app_class, delivery_mode";
 
 /// 读取单条样本。
 pub fn get_sample(conn: &Connection, id: i64) -> Result<Option<SampleRow>> {

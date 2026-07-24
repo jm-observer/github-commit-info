@@ -46,6 +46,7 @@ export interface AppSettings {
   auto_paste: boolean;
   auto_paste_rewrite_retype: boolean;
   auto_start: boolean;
+  capture_enabled: boolean;
 }
 
 export const DEFAULT_REMOTE_URL = 'ws://192.168.0.68:8788/api/asr/stream';
@@ -98,6 +99,8 @@ export interface Sample {
   audio_status: 'saved' | 'expired' | 'fetch_failed' | 'skipped' | string;
   hotword_sync?: 'added' | 'exists' | 'failed' | null;
   marked_at: string;
+  source: 'ui' | 'copy' | string;
+  segment_ids?: string | null;
 }
 
 export interface MarkSampleArgs extends Record<string, unknown> {

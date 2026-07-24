@@ -27,6 +27,10 @@ fn default_voice_commands_enabled() -> bool {
     true
 }
 
+fn default_capture_enabled() -> bool {
+    true
+}
+
 #[derive(Serialize, Deserialize, Clone, PartialEq)]
 pub struct LlmSettings {
     #[serde(default)]
@@ -54,6 +58,9 @@ pub struct LlmSettings {
     /// 默认开启；UI 可后续暴露开关。详见 [`crate::modules::speech::voice_commands`]。
     #[serde(default = "default_voice_commands_enabled")]
     pub voice_commands_enabled: bool,
+    /// 语音纠错一键采集总开关：关闭后专用快捷键触发即忽略（不读剪贴板、不落库）。
+    #[serde(default = "default_capture_enabled")]
+    pub capture_enabled: bool,
 }
 
 impl Default for LlmSettings {
@@ -67,6 +74,7 @@ impl Default for LlmSettings {
             auto_paste_rewrite_retype: false,
             auto_start: false,
             voice_commands_enabled: true,
+            capture_enabled: true,
         }
     }
 }

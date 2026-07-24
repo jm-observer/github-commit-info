@@ -1,3 +1,4 @@
+pub mod capture;
 pub mod commands;
 pub mod db;
 pub mod legacy;
@@ -30,6 +31,7 @@ pub struct SpeechState {
     pub(crate) selected_device: Arc<RwLock<Option<String>>>,
     pub(crate) remote_url: Arc<RwLock<String>>,
     pub(crate) remote_url_presets: Arc<RwLock<Vec<String>>>,
+    pub(crate) capture: Arc<capture::CaptureState>,
 }
 
 impl SpeechState {
@@ -58,6 +60,7 @@ impl SpeechState {
             selected_device: Arc::new(RwLock::new(None)),
             remote_url: Arc::new(RwLock::new(remote_url)),
             remote_url_presets: Arc::new(RwLock::new(remote_url_presets)),
+            capture: capture::CaptureState::new(),
         });
 
         // Remote-only client: report ready immediately.
@@ -70,9 +73,19 @@ impl SpeechState {
 }
 
 /// 初始化 Speech 模块：注册托盘（仅 Show + Quit）、完成 DB/状态准备。
-pub fn setup(app: &tauri::AppHandle, _state: Arc<SpeechState>) -> Result<()> {
+pub fn setup(app: &tauri::AppHandle, state: Arc<SpeechState>) -> Result<()> {
     // 装全局 Ctrl+V 观察器：粘贴后重置自动复制的拼接累加器，避免「每段即时粘贴」时重复粘贴前一段。
     paste_watch::start_paste_watcher();
+
+    // 语音纠错一键采集：建信号通道 + 起后台 worker（Ctrl+Alt+C 命中时读剪贴板、配对、落库）。
+    let capture_rx = capture::init_capture_channel();
+    tauri::async_runtime::spawn(capture::run_capture_worker(
+        app.clone(),
+        Arc::clone(&state.db),
+        Arc::clone(&state.capture),
+        Arc::clone(&state.llm_settings),
+        capture_rx,
+    ));
 
     // Register tray icon. Per §4.2.1 the menu only has "Show window" and "Quit".
     // The "quick start recording" item is in legacy/mod.rs.

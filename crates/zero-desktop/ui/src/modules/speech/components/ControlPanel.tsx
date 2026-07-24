@@ -42,6 +42,8 @@ interface ControlPanelProps {
   onWantSecondaryChange: (val: boolean) => void;
   notifySound: boolean;
   onNotifySoundChange: (val: boolean) => void;
+  captureEnabled: boolean;
+  onCaptureEnabledChange: (val: boolean) => void;
   disabled?: boolean;
 }
 
@@ -97,6 +99,8 @@ export const ControlPanel: React.FC<ControlPanelProps> = ({
   onWantSecondaryChange,
   notifySound,
   onNotifySoundChange,
+  captureEnabled,
+  onCaptureEnabledChange,
   disabled,
 }) => {
   return (
@@ -234,6 +238,15 @@ export const ControlPanel: React.FC<ControlPanelProps> = ({
             <span className="text-[11px] text-[var(--ink-4)]">每段优化+翻译完成时伴随托盘图标跳动播放短促系统音；扬声器+麦克风录音时建议关闭以避免被采入</span>
           </div>
           <Switch checked={notifySound} onCheckedChange={onNotifySoundChange} />
+        </div>
+        <div className="flex items-center justify-between">
+          <div className="flex flex-col pr-3">
+            <span className="text-[13px] font-medium text-[var(--ink-2)]">启用纠错一键采集</span>
+            <span className="text-[11px] text-[var(--ink-4)]">
+              改好优化稿并复制整段后按 Ctrl+Alt+C，读取剪贴板与最近交付比对并落库，用于积累纠错语料
+            </span>
+          </div>
+          <Switch checked={captureEnabled} onCheckedChange={onCaptureEnabledChange} disabled={disabled} />
         </div>
       </div>
 

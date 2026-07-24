@@ -168,7 +168,7 @@ fn auto_paste_segment(
     }
 }
 
-fn strip_overlap_prefix(head: &str, tail: &str) -> String {
+pub(crate) fn strip_overlap_prefix(head: &str, tail: &str) -> String {
     const MAX_OVERLAP_CHARS: usize = 200;
     const MIN_OVERLAP_CHARS: usize = 2;
     let head_chars: Vec<char> = head.chars().collect();
@@ -188,7 +188,7 @@ fn strip_overlap_prefix(head: &str, tail: &str) -> String {
     tail.to_string()
 }
 
-fn join_dedup(head: &str, tail: &str) -> String {
+pub(crate) fn join_dedup(head: &str, tail: &str) -> String {
     let rest = strip_overlap_prefix(head, tail);
     if rest.is_empty() {
         head.to_string()
@@ -532,6 +532,7 @@ pub(crate) async fn run_remote_session(
     recording: Arc<AtomicBool>,
     init_status: Arc<AtomicU8>,
     init_error: Arc<RwLock<String>>,
+    capture: Arc<crate::modules::speech::capture::CaptureState>,
 ) {
     let device_name = read_lock(&selected_device).clone();
     let language = {
@@ -575,8 +576,16 @@ pub(crate) async fn run_remote_session(
             Ok((ws, _)) => {
                 info!(target: "speech", "[remote] connected {url}");
                 let conn_start = std::time::Instant::now();
-                let outcome =
-                    run_one_connection(ws, &hello, &mut pcm_rx, &app, &llm_settings, &stop).await;
+                let outcome = run_one_connection(
+                    ws,
+                    &hello,
+                    &mut pcm_rx,
+                    &app,
+                    &llm_settings,
+                    &stop,
+                    &capture,
+                )
+                .await;
                 if outcome == Outcome::Stopped || stop.load(Ordering::Relaxed) {
                     break;
                 }
@@ -623,6 +632,7 @@ pub(crate) async fn run_remote_session(
     info!(target: "speech", "[remote] session ended");
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn run_one_connection(
     ws: tokio_tungstenite::WebSocketStream<
         tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
@@ -632,6 +642,7 @@ async fn run_one_connection(
     app: &tauri::AppHandle,
     llm_settings: &Arc<RwLock<LlmSettings>>,
     stop: &Arc<AtomicBool>,
+    capture: &Arc<crate::modules::speech::capture::CaptureState>,
 ) -> Outcome {
     let (mut wr, mut rd) = ws.split();
     if wr.send(Message::Text(hello.to_string())).await.is_err() {
@@ -640,6 +651,7 @@ async fn run_one_connection(
 
     let app_r = app.clone();
     let llm_settings_r = Arc::clone(llm_settings);
+    let capture_r = Arc::clone(capture);
     let mut reader = tokio::spawn(async move {
         let mut segs: HashMap<i64, SegState> = HashMap::new();
         let mut copy_acc: Option<AutoCopyAccum> = None;
@@ -746,6 +758,9 @@ async fn run_one_connection(
                         )
                     };
                     if copy && !text.is_empty() {
+                        // 语音纠错一键采集：旁路只读记录一次交付（O=最终交付文本，R=该段原始
+                        // ASR），不影响下面的剪贴板/自动粘贴主链路。
+                        capture_r.record_delivery(id, text.clone(), st.raw.clone(), None);
                         // 用户上次粘贴后重新开始累加，避免重复粘贴已粘走的前一段。
                         if crate::modules::speech::paste_watch::take_paste_signal() {
                             copy_acc = None;
@@ -825,6 +840,8 @@ async fn run_one_connection(
                         )
                     };
                     if copy && !text.is_empty() {
+                        // 语音纠错一键采集：旁路只读记录一次交付，与中文优化分支同款处理。
+                        capture_r.record_delivery(id, text.clone(), st.raw.clone(), None);
                         // 用户上次粘贴后重新开始累加，避免重复粘贴已粘走的前一段。
                         if crate::modules::speech::paste_watch::take_paste_signal() {
                             copy_acc = None;

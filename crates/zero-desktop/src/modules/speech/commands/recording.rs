@@ -69,6 +69,7 @@ pub async fn speech_start_recording(
     let recording = Arc::clone(&speech.recording);
     let init_status = Arc::clone(&speech.init_status);
     let init_error = Arc::clone(&speech.init_error);
+    let capture = Arc::clone(&speech.capture);
     let app2 = app.clone();
 
     tauri::async_runtime::spawn(async move {
@@ -82,6 +83,7 @@ pub async fn speech_start_recording(
             recording,
             init_status,
             init_error,
+            capture,
         )
         .await;
     });
