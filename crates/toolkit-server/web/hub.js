@@ -53,7 +53,14 @@ MODULES.forEach((m) => {
   header.className = 'group-header';
   header.innerHTML =
     `<span class="chevron">+</span><span class="nav-label">${m.name}</span>`;
-  header.addEventListener('click', () => toggleGroup(m.id));
+  header.addEventListener('click', () => {
+    // 模块标题本身也是导航入口：沿用当前环境切换右侧内容，同时保留展开/收起行为。
+    // 之前这里只调用 toggleGroup，用户点击模块标题时右侧 iframe 不会发生变化，
+    // 只有点击 local/g10 子项才会触发 selectCell。
+    const envId = ENVS.some(e => e.id === active.envId) ? active.envId : ENVS[0].id;
+    selectCell(m.id, envId);
+    toggleGroup(m.id);
+  });
 
   const children = document.createElement('div');
   children.className = 'group-children';
