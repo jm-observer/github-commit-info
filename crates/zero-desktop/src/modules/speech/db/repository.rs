@@ -1,5 +1,5 @@
 use anyhow::{Context, Result};
-use rusqlite::{params, Connection};
+use rusqlite::{params, params_from_iter, Connection};
 use serde::Serialize;
 
 /// 一条标注样本的完整落库形态（与 `speech_samples` 表逐列对应）。
@@ -188,6 +188,215 @@ pub fn list_samples(conn: &Connection) -> Result<Vec<SampleRow>> {
         out.push(r.context("failed to read sample row")?);
     }
     Ok(out)
+}
+
+// ---- 场景记录（speech_scenes）----
+
+/// 一次交付的落库入参。应用上下文可能全空（抓拍失败 / 非 Windows），留空不猜。
+pub struct NewScene {
+    pub session_id: Option<String>,
+    pub segment_id: i64,
+    /// `auto_paste` | `auto_copy`
+    pub delivery_mode: String,
+    /// `optimized_zh` | `english`
+    pub content_kind: String,
+    pub text: String,
+    pub app: SampleAppContext,
+    pub delivered_at: String,
+}
+
+/// 按应用聚合的一行统计。
+#[derive(Debug, Clone, Serialize)]
+pub struct SceneAppStat {
+    /// 抓拍失败时为 `None`，前端显示为「未知」。
+    pub app_exe: Option<String>,
+    pub count: i64,
+    pub chars: i64,
+    pub last_at: Option<String>,
+}
+
+/// 按「应用 + 窗口标题」聚合的一行统计。比 [`SceneAppStat`] 细一层：浏览器/编辑器里 exe 相同、
+/// title 才是区分具体场景（哪个网站、哪个文档、跟谁聊天）的唯一信号。**收集期只做原始聚合、
+/// 不解析归纳**（提取域名/文档名等留给数据摊开后再定），故这里就是 exe+title 原样分组计数。
+#[derive(Debug, Clone, Serialize)]
+pub struct SceneTitleStat {
+    pub app_exe: Option<String>,
+    /// 无标题窗口 / 抓拍失败为 `None`，前端显示为「（无标题）」。
+    pub app_title: Option<String>,
+    pub count: i64,
+    pub chars: i64,
+    pub last_at: Option<String>,
+}
+
+/// 场景记录总览：给桌面端一眼看出「在涨」的几个数。
+#[derive(Debug, Clone, Serialize)]
+pub struct SceneStats {
+    pub total: i64,
+    pub today: i64,
+    pub total_chars: i64,
+    /// 抓到应用上下文的条数——这个数与 total 的差距就是抓拍覆盖率。
+    pub with_app: i64,
+    pub distinct_apps: i64,
+    /// 被纠错样本回标过的记录数（`correction_sample_id IS NOT NULL`）。统计真实表达风格时
+    /// 应排除这部分——它们的交付文本含 ASR/LLM 错误，不是用户想说的。
+    pub corrected: i64,
+    pub last_at: Option<String>,
+    /// 按条数倒序的应用排行（最多 12 项，够看趋势又不至于刷屏）。
+    pub top_apps: Vec<SceneAppStat>,
+    /// 按「应用 + 窗口标题」的具体场景排行（最多 15 项）。title 基数大，只取头部。
+    pub top_titles: Vec<SceneTitleStat>,
+}
+
+/// 插入一条场景记录，返回自增 id。
+pub fn insert_scene(conn: &Connection, d: &NewScene) -> Result<i64> {
+    conn.execute(
+        "INSERT INTO speech_scenes(
+            session_id, segment_id, delivery_mode, content_kind, text, char_count,
+            app_exe, app_path, app_title, app_class, delivered_at
+        ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
+        params![
+            d.session_id,
+            d.segment_id,
+            d.delivery_mode,
+            d.content_kind,
+            d.text,
+            d.text.chars().count() as i64,
+            d.app.app_exe,
+            d.app.app_path,
+            d.app.app_title,
+            d.app.app_class,
+            d.delivered_at,
+        ],
+    )
+    .context("failed to insert speech delivery")?;
+    Ok(conn.last_insert_rowid())
+}
+
+/// 把 `segment_ids` 命中的场景记录回标为「被 `sample_id` 这条纠错样本改过」，返回受影响行数。
+///
+/// - 只标 `correction_sample_id IS NULL` 的行：一条场景记录归属首次纠正它的样本，归属稳定
+///   （同段被改两次时不来回抢标；具体哪条样本是次要信息，"被改过"这个事实才是关键）。
+/// - 段号可能跨多条场景记录（auto_paste 一段长话分几次打字各记一行），故用 `IN`。
+/// - `segment_ids` 为空直接返回 0，不发空 `IN ()`。
+pub fn mark_scenes_corrected(
+    conn: &Connection,
+    segment_ids: &[i64],
+    sample_id: i64,
+) -> Result<usize> {
+    if segment_ids.is_empty() {
+        return Ok(0);
+    }
+    let placeholders = vec!["?"; segment_ids.len()].join(",");
+    let sql = format!(
+        "UPDATE speech_scenes SET correction_sample_id = ?
+         WHERE segment_id IN ({placeholders}) AND correction_sample_id IS NULL"
+    );
+    let mut params: Vec<i64> = Vec::with_capacity(segment_ids.len() + 1);
+    params.push(sample_id);
+    params.extend_from_slice(segment_ids);
+    let n = conn
+        .execute(&sql, params_from_iter(params))
+        .context("failed to mark scenes corrected")?;
+    Ok(n)
+}
+
+/// 汇总场景记录。`today_prefix` 传本地日期前缀（`YYYY-MM-DD`）——`delivered_at` 存的是本地
+/// 时间字符串，用前缀比较即可，不引入时区换算。
+pub fn scene_stats(conn: &Connection, today_prefix: &str) -> Result<SceneStats> {
+    let mut stmt = conn
+        .prepare(
+            "SELECT COUNT(*),
+                    COALESCE(SUM(char_count), 0),
+                    COALESCE(SUM(app_exe IS NOT NULL), 0),
+                    COUNT(DISTINCT app_exe),
+                    COALESCE(SUM(correction_sample_id IS NOT NULL), 0),
+                    MAX(delivered_at)
+             FROM speech_scenes",
+        )
+        .context("failed to prepare scene_stats")?;
+    let (total, total_chars, with_app, distinct_apps, corrected, last_at) = stmt
+        .query_row([], |row| {
+            Ok((
+                row.get::<_, i64>(0)?,
+                row.get::<_, i64>(1)?,
+                row.get::<_, i64>(2)?,
+                row.get::<_, i64>(3)?,
+                row.get::<_, i64>(4)?,
+                row.get::<_, Option<String>>(5)?,
+            ))
+        })
+        .context("failed to query scene_stats")?;
+
+    let today: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM speech_scenes WHERE delivered_at LIKE ?1 || '%'",
+            params![today_prefix],
+            |row| row.get(0),
+        )
+        .context("failed to query today's delivery count")?;
+
+    let mut stmt = conn
+        .prepare(
+            "SELECT app_exe, COUNT(*) n, COALESCE(SUM(char_count), 0), MAX(delivered_at)
+             FROM speech_scenes
+             GROUP BY app_exe
+             ORDER BY n DESC
+             LIMIT 12",
+        )
+        .context("failed to prepare delivery app ranking")?;
+    let rows = stmt
+        .query_map([], |row| {
+            Ok(SceneAppStat {
+                app_exe: row.get(0)?,
+                count: row.get(1)?,
+                chars: row.get(2)?,
+                last_at: row.get(3)?,
+            })
+        })
+        .context("failed to query delivery app ranking")?;
+    let mut top_apps = Vec::new();
+    for r in rows {
+        top_apps.push(r.context("failed to read delivery app stat row")?);
+    }
+
+    // 按「应用 + 窗口标题」的具体场景排行。SQLite 的 GROUP BY 把 NULL 归为同一组，
+    // 故无标题的记录会聚成一行（app_title = NULL），前端另行显示「（无标题）」。
+    let mut stmt = conn
+        .prepare(
+            "SELECT app_exe, app_title, COUNT(*) n, COALESCE(SUM(char_count), 0), MAX(delivered_at)
+             FROM speech_scenes
+             GROUP BY app_exe, app_title
+             ORDER BY n DESC
+             LIMIT 15",
+        )
+        .context("failed to prepare scene title ranking")?;
+    let rows = stmt
+        .query_map([], |row| {
+            Ok(SceneTitleStat {
+                app_exe: row.get(0)?,
+                app_title: row.get(1)?,
+                count: row.get(2)?,
+                chars: row.get(3)?,
+                last_at: row.get(4)?,
+            })
+        })
+        .context("failed to query scene title ranking")?;
+    let mut top_titles = Vec::new();
+    for r in rows {
+        top_titles.push(r.context("failed to read scene title stat row")?);
+    }
+
+    Ok(SceneStats {
+        total,
+        today,
+        total_chars,
+        with_app,
+        distinct_apps,
+        corrected,
+        last_at,
+        top_apps,
+        top_titles,
+    })
 }
 
 pub fn upsert_setting(conn: &Connection, key: &str, value: &str, now: &str) -> Result<()> {

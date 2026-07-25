@@ -125,6 +125,53 @@ impl SpeechDatabase {
         Ok(row)
     }
 
+    /// 记一次交付（日常全量收集，与手动采集的样本分开）。
+    pub async fn insert_scene(&self, new: repository::NewScene) -> Result<i64> {
+        let conn = Arc::clone(&self.conn);
+        let id = tokio::task::spawn_blocking(move || {
+            let guard = conn
+                .lock()
+                .map_err(|_| anyhow::anyhow!("db mutex poisoned"))?;
+            repository::insert_scene(&guard, &new)
+        })
+        .await
+        .map_err(|e| anyhow::anyhow!("spawn_blocking join error: {e}"))??;
+        Ok(id)
+    }
+
+    /// 把纠错样本 `sample_id` 关联到它改动的那几条场景记录（按段号回标），返回受影响行数。
+    pub async fn mark_scenes_corrected(
+        &self,
+        segment_ids: Vec<i64>,
+        sample_id: i64,
+    ) -> Result<usize> {
+        let conn = Arc::clone(&self.conn);
+        let n = tokio::task::spawn_blocking(move || {
+            let guard = conn
+                .lock()
+                .map_err(|_| anyhow::anyhow!("db mutex poisoned"))?;
+            repository::mark_scenes_corrected(&guard, &segment_ids, sample_id)
+        })
+        .await
+        .map_err(|e| anyhow::anyhow!("spawn_blocking join error: {e}"))??;
+        Ok(n)
+    }
+
+    /// 场景记录总览（总数/今日/按应用排行）。
+    pub async fn scene_stats(&self) -> Result<repository::SceneStats> {
+        let today = Local::now().format("%Y-%m-%d").to_string();
+        let conn = Arc::clone(&self.conn);
+        let stats = tokio::task::spawn_blocking(move || {
+            let guard = conn
+                .lock()
+                .map_err(|_| anyhow::anyhow!("db mutex poisoned"))?;
+            repository::scene_stats(&guard, &today)
+        })
+        .await
+        .map_err(|e| anyhow::anyhow!("spawn_blocking join error: {e}"))??;
+        Ok(stats)
+    }
+
     /// 列出全部样本（marked_at 倒序）。
     pub async fn list_samples(&self) -> Result<Vec<repository::SampleRow>> {
         let conn = Arc::clone(&self.conn);

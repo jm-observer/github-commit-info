@@ -59,6 +59,17 @@ pub(crate) fn run_migrations(conn: &Connection) -> Result<()> {
             .with_context(|| format!("failed to run sqlite migration 0007 ({column} column)"))?;
         }
     }
+    // 0008：场景记录表（每次交付都记，与手动采集的 speech_samples 分开）。
+    // 建表 + 索引都是 IF NOT EXISTS，幂等，无条件执行。
+    let sql_0008 = include_str!("../../../../migrations/0008_speech_scenes.sql");
+    conn.execute_batch(sql_0008)
+        .context("failed to run sqlite migration 0008_speech_scenes.sql")?;
+    // 守卫：若某库已在加 correction_sample_id 之前建过 speech_scenes（IF NOT EXISTS 会跳过
+    // 建表、不补新列），单独 ALTER 补上。新库走建表语句已含此列，这里跳过。
+    if !column_exists(conn, "speech_scenes", "correction_sample_id")? {
+        conn.execute_batch("ALTER TABLE speech_scenes ADD COLUMN correction_sample_id INTEGER;")
+            .context("failed to add speech_scenes.correction_sample_id")?;
+    }
     Ok(())
 }
 
@@ -151,6 +162,211 @@ mod tests {
         assert_eq!(one.app_exe.as_deref(), Some("Code.exe"));
         assert_eq!(one.app_title.as_deref(), Some("main.rs - toolkit"));
         assert_eq!(one.delivery_mode.as_deref(), Some("auto_paste"));
+    }
+
+    /// 0008：场景记录表建起来、能往返，且统计口径正确（总数/今日/按应用聚合）。
+    #[test]
+    fn migration_0008_scenes_roundtrip_and_stats() {
+        use crate::modules::speech::db::repository::NewScene;
+
+        let conn = Connection::open_in_memory().unwrap();
+        run_migrations(&conn).unwrap();
+        // 重跑一次：建表/建索引都是 IF NOT EXISTS，必须幂等。
+        run_migrations(&conn).unwrap();
+
+        let mk = |seg: i64, mode: &str, exe: Option<&str>, text: &str, at: &str| NewScene {
+            session_id: None,
+            segment_id: seg,
+            delivery_mode: mode.into(),
+            content_kind: "optimized_zh".into(),
+            text: text.into(),
+            app: SampleAppContext {
+                app_exe: exe.map(str::to_string),
+                app_path: None,
+                app_title: None,
+                app_class: None,
+                delivery_mode: Some(mode.into()),
+            },
+            delivered_at: at.into(),
+        };
+        repository::insert_scene(
+            &conn,
+            &mk(
+                1,
+                "auto_paste",
+                Some("Code.exe"),
+                "四个字啊",
+                "2026-07-25 09:00:00",
+            ),
+        )
+        .unwrap();
+        repository::insert_scene(
+            &conn,
+            &mk(
+                2,
+                "auto_copy",
+                Some("Code.exe"),
+                "两字",
+                "2026-07-25 10:00:00",
+            ),
+        )
+        .unwrap();
+        // 抓拍失败的一条：app_exe 为空，仍要入库（记原始事实），但不计入 with_app。
+        repository::insert_scene(
+            &conn,
+            &mk(3, "auto_paste", None, "三个字", "2026-07-24 23:00:00"),
+        )
+        .unwrap();
+
+        let s = repository::scene_stats(&conn, "2026-07-25").unwrap();
+        assert_eq!(s.total, 3);
+        assert_eq!(s.today, 2, "只统计 delivered_at 前缀匹配当天的");
+        assert_eq!(s.with_app, 2, "抓拍失败的那条不计入");
+        assert_eq!(s.distinct_apps, 1, "COUNT(DISTINCT app_exe) 不计 NULL");
+        assert_eq!(s.total_chars, 4 + 2 + 3);
+        assert_eq!(s.last_at.as_deref(), Some("2026-07-25 10:00:00"));
+
+        let top = &s.top_apps;
+        assert_eq!(top[0].app_exe.as_deref(), Some("Code.exe"));
+        assert_eq!(top[0].count, 2);
+        assert_eq!(top[0].chars, 6);
+        // 未知应用单独成组，不被丢弃——覆盖率缺口要看得见。
+        assert!(top.iter().any(|a| a.app_exe.is_none() && a.count == 1));
+    }
+
+    /// 待办 1：纠错样本落库后按段号回标场景记录，统计能区分「被改过」的记录。
+    #[test]
+    fn scene_correction_linkage() {
+        use crate::modules::speech::db::repository::NewScene;
+
+        let conn = Connection::open_in_memory().unwrap();
+        run_migrations(&conn).unwrap();
+
+        let scene = |seg: i64, at: &str| NewScene {
+            session_id: None,
+            segment_id: seg,
+            delivery_mode: "auto_paste".into(),
+            content_kind: "optimized_zh".into(),
+            text: "文本".into(),
+            app: SampleAppContext {
+                app_exe: Some("Code.exe".into()),
+                app_path: None,
+                app_title: None,
+                app_class: None,
+                delivery_mode: Some("auto_paste".into()),
+            },
+            delivered_at: at.into(),
+        };
+        // 一个 burst 分两段交付各记一行（seg 1、2），另有无关的一段（seg 9）。
+        repository::insert_scene(&conn, &scene(1, "2026-07-25 09:00:00")).unwrap();
+        repository::insert_scene(&conn, &scene(2, "2026-07-25 09:00:01")).unwrap();
+        repository::insert_scene(&conn, &scene(9, "2026-07-25 09:30:00")).unwrap();
+
+        let sample_id = repository::insert_sample(
+            &conn,
+            &NewSample {
+                segment_id: 1,
+                session_id: None,
+                label: "other".into(),
+                text_raw: "原文".into(),
+                text_optimized: Some("优化稿".into()),
+                text_english: None,
+                text_secondary: None,
+                correction: Some("改好的".into()),
+                note: None,
+                audio_status: "skipped".into(),
+                marked_at: "2026-07-25 09:01:00".into(),
+                source: "copy".into(),
+                segment_ids: Some("[1,2]".into()),
+                app: SampleAppContext::default(),
+            },
+        )
+        .unwrap();
+
+        // 回标 burst 的两段：命中 2 条，seg 9 不动。
+        let n = repository::mark_scenes_corrected(&conn, &[1, 2], sample_id).unwrap();
+        assert_eq!(n, 2);
+
+        let s = repository::scene_stats(&conn, "2026-07-25").unwrap();
+        assert_eq!(s.total, 3);
+        assert_eq!(s.corrected, 2, "被改过的两段计入 corrected");
+
+        // 幂等/稳定归属：再标一次，已有 correction_sample_id 的行不被抢标。
+        let n2 = repository::mark_scenes_corrected(&conn, &[1, 2], 99999).unwrap();
+        assert_eq!(n2, 0);
+        assert_eq!(
+            repository::scene_stats(&conn, "2026-07-25")
+                .unwrap()
+                .corrected,
+            2
+        );
+
+        // 空段号不发空 IN()，安全返回 0。
+        assert_eq!(
+            repository::mark_scenes_corrected(&conn, &[], sample_id).unwrap(),
+            0
+        );
+    }
+
+    /// 待办 3：按「应用 + 窗口标题」聚合。浏览器 exe 相同、title 才区分具体场景。
+    #[test]
+    fn scene_title_ranking() {
+        use crate::modules::speech::db::repository::NewScene;
+
+        let conn = Connection::open_in_memory().unwrap();
+        run_migrations(&conn).unwrap();
+
+        let scene = |seg: i64, exe: &str, title: Option<&str>, at: &str| NewScene {
+            session_id: None,
+            segment_id: seg,
+            delivery_mode: "auto_paste".into(),
+            content_kind: "optimized_zh".into(),
+            text: "四个字啊".into(),
+            app: SampleAppContext {
+                app_exe: Some(exe.into()),
+                app_path: None,
+                app_title: title.map(str::to_string),
+                app_class: None,
+                delivery_mode: Some("auto_paste".into()),
+            },
+            delivered_at: at.into(),
+        };
+        // 同 exe 不同 title：title 才是区分场景的信号。
+        repository::insert_scene(
+            &conn,
+            &scene(1, "chrome.exe", Some("A 站"), "2026-07-25 09:00:00"),
+        )
+        .unwrap();
+        repository::insert_scene(
+            &conn,
+            &scene(2, "chrome.exe", Some("A 站"), "2026-07-25 09:01:00"),
+        )
+        .unwrap();
+        repository::insert_scene(
+            &conn,
+            &scene(3, "chrome.exe", Some("B 站"), "2026-07-25 09:02:00"),
+        )
+        .unwrap();
+        repository::insert_scene(&conn, &scene(4, "Code.exe", None, "2026-07-25 09:03:00"))
+            .unwrap();
+
+        let s = repository::scene_stats(&conn, "2026-07-25").unwrap();
+        // 按 exe 聚合：chrome.exe 3 条居首。
+        assert_eq!(s.top_apps[0].app_exe.as_deref(), Some("chrome.exe"));
+        assert_eq!(s.top_apps[0].count, 3);
+
+        // 按 exe+title 聚合：(chrome.exe, A 站) 2 条居首，(chrome.exe, B 站) 与 A 站分开。
+        let t = &s.top_titles;
+        assert_eq!(t[0].app_exe.as_deref(), Some("chrome.exe"));
+        assert_eq!(t[0].app_title.as_deref(), Some("A 站"));
+        assert_eq!(t[0].count, 2);
+        assert!(t
+            .iter()
+            .any(|x| x.app_title.as_deref() == Some("B 站") && x.count == 1));
+        // 无标题记录聚成一行（app_title = NULL），不丢弃。
+        assert!(t
+            .iter()
+            .any(|x| x.app_exe.as_deref() == Some("Code.exe") && x.app_title.is_none()));
     }
 
     /// 老库（已有 0005/0006 但无 0007 列）重跑迁移应幂等补列，且不丢已有行。

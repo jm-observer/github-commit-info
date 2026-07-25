@@ -103,6 +103,39 @@ export interface Sample {
   segment_ids?: string | null;
 }
 
+/** 场景记录按应用聚合的一行。 */
+export interface SceneAppStat {
+  app_exe?: string | null;
+  count: number;
+  chars: number;
+  last_at?: string | null;
+}
+
+/** 场景记录按「应用 + 窗口标题」聚合的一行（收集期只原始聚合，不解析归纳）。 */
+export interface SceneTitleStat {
+  app_exe?: string | null;
+  app_title?: string | null;
+  count: number;
+  chars: number;
+  last_at?: string | null;
+}
+
+/** 场景记录总览（每次交付都记的全量日志，非手动采集的纠错样本）。 */
+export interface SceneStats {
+  total: number;
+  today: number;
+  total_chars: number;
+  /** 抓到应用上下文的条数；与 total 的差即抓拍覆盖率缺口。 */
+  with_app: number;
+  distinct_apps: number;
+  /** 被纠错样本回标过的记录数；统计真实表达风格时应排除这部分（含 ASR/LLM 错误）。 */
+  corrected: number;
+  last_at?: string | null;
+  top_apps: SceneAppStat[];
+  /** 按「应用 + 窗口标题」的具体场景排行（最多 15 项）。 */
+  top_titles: SceneTitleStat[];
+}
+
 export interface MarkSampleArgs extends Record<string, unknown> {
   segmentId: number;
   sessionId?: string | null;
@@ -137,5 +170,6 @@ export const SpeechAPI = {
   markSample: (args: MarkSampleArgs) => invoke<Sample>('speech_mark_sample', args),
   listSamples: () => invoke<Sample[]>('speech_list_samples'),
   exportSamples: () => invoke<string>('speech_export_samples'),
+  sceneStats: () => invoke<SceneStats>('speech_scene_stats'),
   openInFolder: (path: string) => invoke('speech_open_in_folder', { path }),
 };

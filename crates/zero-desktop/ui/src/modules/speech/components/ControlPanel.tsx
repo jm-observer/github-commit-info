@@ -7,6 +7,7 @@ import { Button } from './ui/Button';
 import { Icon } from './ui/Icon';
 import { StatusChip } from './StatusChip';
 import { RemoteUrlPicker } from './RemoteUrlPicker';
+import { SceneStatsCard } from './SceneStatsCard';
 import type { AsrLanguage, AutoCopyMode } from '../api/tauri-client';
 
 interface ControlPanelProps {
@@ -243,11 +244,13 @@ export const ControlPanel: React.FC<ControlPanelProps> = ({
           <div className="flex flex-col pr-3">
             <span className="text-[13px] font-medium text-[var(--ink-2)]">启用纠错一键采集</span>
             <span className="text-[11px] text-[var(--ink-4)]">
-              改好优化稿并复制整段后按 Ctrl+Alt+C，读取剪贴板与最近交付比对并落库，用于积累纠错语料
+              改好优化稿并复制整段后按 Ctrl+Alt+X，读取剪贴板与最近交付比对并落库，用于积累纠错语料
             </span>
           </div>
           <Switch checked={captureEnabled} onCheckedChange={onCaptureEnabledChange} disabled={disabled} />
         </div>
+        {/* 日常全量收集的实时读数，与上面「手动采集」的开关并列但不是一回事，见组件文档。 */}
+        <SceneStatsCard />
       </div>
 
       <div className="flex-1" />

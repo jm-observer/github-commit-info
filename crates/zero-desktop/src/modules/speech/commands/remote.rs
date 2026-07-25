@@ -141,10 +141,13 @@ fn auto_paste_segment(
     t_start: f64,
     t_end: f64,
     options: AutoPasteOptions,
+    content_kind: &'static str,
 ) {
     let Some(action) = next_auto_paste_text(ap, text, ref_id, t_start, t_end, options) else {
         return;
     };
+    // 只在确实打进了外部窗口（typed=true）时记场景记录：前台是本进程时 SendInput 被护栏
+    // 拦下，那不是一次对外交付，记了就是脏数据。
     match action {
         AutoPasteAction::Type(payload) => {
             let typed = crate::modules::speech::paste_watch::type_text_to_foreground(&payload);
@@ -153,6 +156,9 @@ fn auto_paste_segment(
                 "[remote] auto paste ref={ref_id} typed={typed} chars={}",
                 payload.chars().count()
             );
+            if typed {
+                log_delivery(ref_id, "auto_paste", content_kind, payload);
+            }
         }
         AutoPasteAction::Retype { backspaces, text } => {
             let typed =
@@ -164,8 +170,24 @@ fn auto_paste_segment(
                 "[remote] auto paste retype ref={ref_id} typed={typed} backspaces={backspaces} chars={}",
                 text.chars().count()
             );
+            if typed {
+                log_delivery(ref_id, "auto_paste", content_kind, text);
+            }
         }
     }
+}
+
+/// 场景记录的统一入口（`session_id` 与一键采集保持一致，remote 侧此处拿不到，留空）。
+fn log_delivery(ref_id: i64, mode: &'static str, content_kind: &'static str, text: String) {
+    crate::modules::speech::scene_log::log_typed_scene(
+        crate::modules::speech::scene_log::SceneEvent {
+            session_id: None,
+            segment_id: ref_id,
+            delivery_mode: mode,
+            content_kind,
+            text,
+        },
+    );
 }
 
 pub(crate) fn strip_overlap_prefix(head: &str, tail: &str) -> String {
@@ -775,7 +797,17 @@ async fn run_one_connection(
                         );
                         match app_r.clipboard().write_text(merged.clone()) {
                             Ok(_) => {
-                                info!(target: "speech", "[remote] auto copy (优化中文) ref={id} chars={}", merged.chars().count())
+                                info!(target: "speech", "[remote] auto copy (优化中文) ref={id} chars={}", merged.chars().count());
+                                // 此刻还没交付——登记为「待粘贴」，用户按下 Ctrl+V 才算数。
+                                crate::modules::speech::scene_log::record_clipboard_pending(
+                                    crate::modules::speech::scene_log::SceneEvent {
+                                        session_id: None,
+                                        segment_id: id,
+                                        delivery_mode: "auto_copy",
+                                        content_kind: "optimized_zh",
+                                        text: merged.clone(),
+                                    },
+                                );
                             }
                             Err(e) => {
                                 error!(target: "speech", "[remote] clipboard 优化中文 failed: {e}")
@@ -803,6 +835,7 @@ async fn run_one_connection(
                                 space_separator: false,
                                 rewrite_retype,
                             },
+                            "optimized_zh",
                         );
                     }
                     // 尾部命令：正文已通过 auto_paste 打进焦点框（do_paste 为真才会发生），
@@ -856,7 +889,16 @@ async fn run_one_connection(
                         );
                         match app_r.clipboard().write_text(merged.clone()) {
                             Ok(_) => {
-                                info!(target: "speech", "[remote] auto copy (英文) ref={id} chars={}", merged.chars().count())
+                                info!(target: "speech", "[remote] auto copy (英文) ref={id} chars={}", merged.chars().count());
+                                crate::modules::speech::scene_log::record_clipboard_pending(
+                                    crate::modules::speech::scene_log::SceneEvent {
+                                        session_id: None,
+                                        segment_id: id,
+                                        delivery_mode: "auto_copy",
+                                        content_kind: "english",
+                                        text: merged.clone(),
+                                    },
+                                );
                             }
                             Err(e) => {
                                 error!(target: "speech", "[remote] clipboard 英文 failed: {e}")
@@ -884,6 +926,7 @@ async fn run_one_connection(
                                 space_separator: true,
                                 rewrite_retype,
                             },
+                            "english",
                         );
                     }
                 }

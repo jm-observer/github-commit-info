@@ -350,6 +350,26 @@ pub async fn speech_list_samples(state: State<'_, AppState>) -> Result<Vec<Sampl
     Ok(rows.into_iter().map(Sample::from).collect())
 }
 
+/// 场景记录总览：桌面端据此显示「收了多少、今天多少、都来自哪些应用」。
+///
+/// 与样本采集是两条线：这里统计的是**每次交付都记**的全量日志，不是手动采集的纠错样本。
+#[tauri::command]
+pub async fn speech_scene_stats(
+    state: State<'_, AppState>,
+) -> Result<crate::modules::speech::db::repository::SceneStats, String> {
+    let db = {
+        let guard = state
+            .speech
+            .db
+            .lock()
+            .map_err(|_| "speech db mutex poisoned".to_string())?;
+        guard
+            .clone()
+            .ok_or_else(|| "speech db 未初始化".to_string())?
+    };
+    db.scene_stats().await.map_err(|e| e.to_string())
+}
+
 #[tauri::command]
 pub async fn speech_export_samples(state: State<'_, AppState>) -> Result<String, String> {
     let workspace = state.workspace.clone();

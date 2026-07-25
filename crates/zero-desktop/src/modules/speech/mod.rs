@@ -5,6 +5,7 @@ pub mod legacy;
 pub mod llm_settings;
 pub mod lock_utils;
 pub mod paste_watch;
+pub mod scene_log;
 pub mod settings;
 pub mod voice_commands;
 
@@ -77,7 +78,7 @@ pub fn setup(app: &tauri::AppHandle, state: Arc<SpeechState>) -> Result<()> {
     // 装全局 Ctrl+V 观察器：粘贴后重置自动复制的拼接累加器，避免「每段即时粘贴」时重复粘贴前一段。
     paste_watch::start_paste_watcher();
 
-    // 语音纠错一键采集：建信号通道 + 起后台 worker（Ctrl+Alt+C 命中时读剪贴板、配对、落库）。
+    // 语音纠错一键采集：建信号通道 + 起后台 worker（Ctrl+Alt+X 命中时读剪贴板、配对、落库）。
     let capture_rx = capture::init_capture_channel();
     tauri::async_runtime::spawn(capture::run_capture_worker(
         app.clone(),
@@ -86,6 +87,15 @@ pub fn setup(app: &tauri::AppHandle, state: Arc<SpeechState>) -> Result<()> {
         Arc::clone(&state.llm_settings),
         capture_rx,
     ));
+
+    // 场景记录：每次交付都落库（日常全量收集）。同样走 channel + worker——auto_copy 的记录
+    // 时刻在键盘钩子回调里，那里不能碰数据库。
+    if let Some(delivery_rx) = scene_log::init_scene_channel() {
+        tauri::async_runtime::spawn(scene_log::run_scene_log_worker(
+            Arc::clone(&state.db),
+            delivery_rx,
+        ));
+    }
 
     // Register tray icon. Per §4.2.1 the menu only has "Show window" and "Quit".
     // The "quick start recording" item is in legacy/mod.rs.
