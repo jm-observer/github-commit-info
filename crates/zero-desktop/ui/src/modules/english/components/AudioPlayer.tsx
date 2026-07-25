@@ -39,7 +39,19 @@ export default function AudioPlayer({
   const [replaceOpen, setReplaceOpen] = useState(false)
   const [autoStartPref, setAutoStartPref] = useState<boolean>(readAutoStartPref)
 
-  const audioService = AudioPlayerService.getInstance()
+  // 单例会被换掉（切歌单时 resetInstance + 重建）。若一直握着 render 那一刻取到的实例，
+  // 按钮就会去操作一个早已不在播的旧 service——点了没反应。跟着单例变更事件重新绑定。
+  const [audioService, setAudioService] = useState(() => AudioPlayerService.getInstance())
+
+  useEffect(() => {
+    const onInstanceChange = () => {
+      // resetInstance 与重建之间会有一拍没有单例，此时保持旧引用，等下一次事件。
+      if (!AudioPlayerService.hasInstance()) return
+      setAudioService(AudioPlayerService.getInstance())
+    }
+    window.addEventListener(AudioPlayerService.INSTANCE_CHANGE_EVENT, onInstanceChange)
+    return () => window.removeEventListener(AudioPlayerService.INSTANCE_CHANGE_EVENT, onInstanceChange)
+  }, [])
 
   const updateCurrentSentence = useCallback(() => {
     setCurrentSentence(audioService.getState().currentSentence)

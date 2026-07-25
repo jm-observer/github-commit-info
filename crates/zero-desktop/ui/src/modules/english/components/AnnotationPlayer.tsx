@@ -149,11 +149,12 @@ export default function AnnotationPlayer({ autoStart = true, dataSource = 'annot
 
     const envConfig = await EnvConfigService.getInstance().getConfig()
     const cacheManager = FileCacheManager.getInstance()
+    // 创建新 adapter 前先销毁所有历史 adapter。不能只 stopAudio() 当前单例：那停不到
+    // 「已在播放、却被 resetInstance 从单例上摘掉」的失联 adapter（标注/听包两个入口交错
+    // 初始化就会造出这种幽灵），表现为按钮和文案都听话、声音却停不下来。
+    HtmlAudioAdapter.destroyAll()
     const audioAdapter = new HtmlAudioAdapter()
 
-    // 创建新单例前先把残留单例的 audio 显式停掉。HtmlAudioAdapter 的 <audio> 是
-    // `new Audio()` 脱离 DOM 的元素,resetInstance 只断 service 引用,旧 <audio> 还在
-    // 内存里继续响——必须主动 stop。
     try { AudioPlayerService.getInstance().stopAudio() } catch { /* no prior instance */ }
     AudioPlayerService.resetInstance()
     const audioService = AudioPlayerService.getInstance(audioAdapter, cacheManager, envConfig)

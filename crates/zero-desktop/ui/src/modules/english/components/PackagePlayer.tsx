@@ -166,9 +166,10 @@ export default function PackagePlayer({ autoStart = true }: { autoStart?: boolea
 
     const envConfig = await EnvConfigService.getInstance().getConfig()
     const cacheManager = FileCacheManager.getInstance()
+    // 销毁所有历史 adapter（含失联幽灵）后再建新的，同 AnnotationPlayer。
+    HtmlAudioAdapter.destroyAll()
     const audioAdapter = new HtmlAudioAdapter()
 
-    // 重建单例前显式停掉残留单例的音（同 AnnotationPlayer）。
     try { AudioPlayerService.getInstance().stopAudio() } catch { /* no prior instance */ }
     AudioPlayerService.resetInstance()
     const audioService = AudioPlayerService.getInstance(audioAdapter, cacheManager, envConfig)

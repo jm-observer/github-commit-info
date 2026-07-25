@@ -4,9 +4,19 @@
 
 type VoidFn = () => void
 
+/**
+ * 所有活着的 adapter。每个 adapter 持一个 `new Audio()`——脱离 DOM、不受 React 卸载影响，
+ * 只要还在内存里就会继续出声。而 AudioPlayerService.stopAudio() 只停得了「当前单例持有的
+ * 那一个」：一旦某个 adapter 在播放中被 resetInstance 从单例上摘掉（标注/听包两个入口交错
+ * 初始化、Strict Mode 双 mount 都会造成），它就再没有任何引用能停它——表现为按钮和文案都
+ * 正常响应、声音却停不下来。注册表存在的意义就是让这种失联的 adapter 仍然可达。
+ */
+const LIVE_ADAPTERS = new Set<HtmlAudioAdapter>()
+
 export default class HtmlAudioAdapter {
   private audio: HTMLAudioElement
   private isEndedFired: boolean = false
+  private destroyed = false
 
   private playCallbacks: VoidFn[] = []
   private pauseCallbacks: VoidFn[] = []
@@ -15,7 +25,19 @@ export default class HtmlAudioAdapter {
   private waitingCallbacks: VoidFn[] = []
   private canplayCallbacks: VoidFn[] = []
 
+  /**
+   * 销毁所有活着的 adapter（含已从单例上摘掉、再也没人引用得到的那些）。
+   * 调用点：任何「即将创建新 adapter / 新单例」的地方——换歌单即换播放会话，
+   * 旧会话的声音一律不该活过这一刻。
+   */
+  static destroyAll(): void {
+    for (const a of Array.from(LIVE_ADAPTERS)) {
+      try { a.destroy() } catch { /* ignore */ }
+    }
+  }
+
   constructor() {
+    LIVE_ADAPTERS.add(this)
     this.audio = new Audio()
     this.audio.preload = 'auto'
     this.audio.volume = 1.0
@@ -51,6 +73,8 @@ export default class HtmlAudioAdapter {
   }
 
   play(): void {
+    // 已弃用的 adapter 拒绝再出声：它的持有者可能是一个仍在飞行中的旧 playCurrentAudio()。
+    if (this.destroyed) return
     void this.audio.play().catch(err => {
       if (err instanceof DOMException && err.name === 'NotAllowedError') {
         this.errorCallbacks.forEach(cb => cb({
@@ -71,7 +95,29 @@ export default class HtmlAudioAdapter {
     try { this.audio.currentTime = 0 } catch { /* ignore */ }
   }
 
+  /**
+   * 彻底停音并弃用本 adapter：光 pause() 不够——已缓冲的数据 + 未决的 play() promise 仍可能
+   * 让它再响一声，故清空 src 并 load() 把媒体元素打回空载。之后所有回调不再触发。
+   */
+  destroy(): void {
+    if (this.destroyed) return
+    this.destroyed = true
+    LIVE_ADAPTERS.delete(this)
+    try {
+      this.audio.pause()
+      this.audio.src = ''
+      this.audio.load()
+    } catch { /* ignore */ }
+    this.playCallbacks = []
+    this.pauseCallbacks = []
+    this.endedCallbacks = []
+    this.errorCallbacks = []
+    this.waitingCallbacks = []
+    this.canplayCallbacks = []
+  }
+
   setSrc(url: string): void {
+    if (this.destroyed) return
     this.isEndedFired = false
     this.audio.src = url
   }
