@@ -81,6 +81,7 @@ export default function SpeechPage() {
   const [autoPasteRewriteRetype, setAutoPasteRewriteRetype] = useState(false);
   const [autoStart, setAutoStart] = useState(false);
   const [captureEnabled, setCaptureEnabled] = useState(true);
+  const [sceneLogEnabled, setSceneLogEnabled] = useState(true);
   const [settingsLoaded, setSettingsLoaded] = useState(false);
   const autoStartFiredRef = useRef(false);
 
@@ -99,6 +100,7 @@ export default function SpeechPage() {
         setAutoPasteRewriteRetype(!!s.auto_paste_rewrite_retype);
         setAutoStart(!!s.auto_start);
         setCaptureEnabled(s.capture_enabled !== false);
+        setSceneLogEnabled(s.scene_log_enabled !== false);
       })
       .catch((err) => console.warn('Load settings failed', err))
       .finally(() => setSettingsLoaded(true));
@@ -372,6 +374,7 @@ export default function SpeechPage() {
       auto_paste_rewrite_retype: autoPasteRewriteRetype,
       auto_start: autoStart,
       capture_enabled: captureEnabled,
+      scene_log_enabled: sceneLogEnabled,
     };
     persistAndMaybeReconnect(next, true);
   };
@@ -397,6 +400,7 @@ export default function SpeechPage() {
       auto_paste_rewrite_retype: autoPasteRewriteRetype,
       auto_start: autoStart,
       capture_enabled: captureEnabled,
+      scene_log_enabled: sceneLogEnabled,
     };
     persistAndMaybeReconnect(next, urlChanged);
   };
@@ -416,6 +420,7 @@ export default function SpeechPage() {
       auto_paste_rewrite_retype: autoPasteRewriteRetype,
       auto_start: autoStart,
       capture_enabled: captureEnabled,
+      scene_log_enabled: sceneLogEnabled,
     };
     SpeechAPI.applySettings(next).catch((err) =>
       console.error('apply notify_sound failed', err)
@@ -437,6 +442,7 @@ export default function SpeechPage() {
       auto_paste_rewrite_retype: autoPasteRewriteRetype,
       auto_start: autoStart,
       capture_enabled: captureEnabled,
+      scene_log_enabled: sceneLogEnabled,
     };
     SpeechAPI.applySettings(next).catch((err) =>
       console.error('apply auto_paste failed', err)
@@ -458,6 +464,7 @@ export default function SpeechPage() {
       auto_paste_rewrite_retype: val,
       auto_start: autoStart,
       capture_enabled: captureEnabled,
+      scene_log_enabled: sceneLogEnabled,
     };
     SpeechAPI.applySettings(next).catch((err) =>
       console.error('apply auto_paste_rewrite_retype failed', err)
@@ -479,6 +486,7 @@ export default function SpeechPage() {
       auto_paste_rewrite_retype: autoPasteRewriteRetype,
       auto_start: val,
       capture_enabled: captureEnabled,
+      scene_log_enabled: sceneLogEnabled,
     };
     SpeechAPI.applySettings(next).catch((err) =>
       console.error('apply auto_start failed', err)
@@ -500,9 +508,32 @@ export default function SpeechPage() {
       auto_paste_rewrite_retype: autoPasteRewriteRetype,
       auto_start: autoStart,
       capture_enabled: val,
+      scene_log_enabled: sceneLogEnabled,
     };
     SpeechAPI.applySettings(next).catch((err) =>
       console.error('apply capture_enabled failed', err)
+    );
+  };
+
+  const handleSceneLogEnabledChange = (val: boolean) => {
+    if (val === sceneLogEnabled) return;
+    setSceneLogEnabled(val);
+    const next: AppSettings = {
+      asr_language: asrLanguage,
+      auto_copy_mode: autoCopyMode,
+      merge_window_ms: mergeWindowMs,
+      remote_url: remoteUrl,
+      remote_url_presets: remoteUrlPresets,
+      want_secondary: wantSecondary,
+      notify_sound: notifySound,
+      auto_paste: autoPaste,
+      auto_paste_rewrite_retype: autoPasteRewriteRetype,
+      auto_start: autoStart,
+      capture_enabled: captureEnabled,
+      scene_log_enabled: val,
+    };
+    SpeechAPI.applySettings(next).catch((err) =>
+      console.error('apply scene_log_enabled failed', err)
     );
   };
 
@@ -521,6 +552,7 @@ export default function SpeechPage() {
       auto_paste_rewrite_retype: autoPasteRewriteRetype,
       auto_start: autoStart,
       capture_enabled: captureEnabled,
+      scene_log_enabled: sceneLogEnabled,
     };
     persistAndMaybeReconnect(next, true);
   };
@@ -543,6 +575,7 @@ export default function SpeechPage() {
       auto_paste_rewrite_retype: autoPasteRewriteRetype,
       auto_start: autoStart,
       capture_enabled: captureEnabled,
+      scene_log_enabled: sceneLogEnabled,
     };
     persistAndMaybeReconnect(next, urlChanged);
   };
@@ -617,6 +650,7 @@ export default function SpeechPage() {
               auto_paste_rewrite_retype: autoPasteRewriteRetype,
               auto_start: autoStart,
               capture_enabled: captureEnabled,
+              scene_log_enabled: sceneLogEnabled,
             };
             SpeechAPI.applySettings(next).catch((err) => console.error('apply asr_language failed', err));
           }}
@@ -635,6 +669,7 @@ export default function SpeechPage() {
               auto_paste_rewrite_retype: autoPasteRewriteRetype,
               auto_start: autoStart,
               capture_enabled: captureEnabled,
+              scene_log_enabled: sceneLogEnabled,
             };
             SpeechAPI.applySettings(next).catch((err) => console.error('apply auto_copy_mode failed', err));
           }}
@@ -659,6 +694,7 @@ export default function SpeechPage() {
               auto_paste_rewrite_retype: autoPasteRewriteRetype,
               auto_start: autoStart,
               capture_enabled: captureEnabled,
+              scene_log_enabled: sceneLogEnabled,
             };
             SpeechAPI.applySettings(next).catch((err) => console.error('apply merge_window_ms failed', err));
           }}
@@ -673,6 +709,8 @@ export default function SpeechPage() {
           onNotifySoundChange={handleNotifySoundChange}
           captureEnabled={captureEnabled}
           onCaptureEnabledChange={handleCaptureEnabledChange}
+          sceneLogEnabled={sceneLogEnabled}
+          onSceneLogEnabledChange={handleSceneLogEnabledChange}
           disabled={isBusy}
         />
       </div>

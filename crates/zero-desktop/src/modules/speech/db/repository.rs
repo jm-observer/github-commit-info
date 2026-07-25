@@ -272,28 +272,90 @@ pub fn insert_scene(conn: &Connection, d: &NewScene) -> Result<i64> {
     Ok(conn.last_insert_rowid())
 }
 
+/// 用后续交付的累计文本改写已有的那行场景记录（`auto_paste` 合并链专用），命中返回 `true`。
+///
+/// 合并链下同一段话会分几次打字进去，每次只打增量后缀；若每次都 INSERT，一句话会被切成好几行
+/// 半截话，`Retype` 退格擦掉的字符还会留在旧行里虚增 `char_count`。故改为**同一段只留一行、
+/// 用累计全文覆盖**，让 `text` 名副其实是「实际交付出去的文本」。
+///
+/// 应用上下文用 `COALESCE` 覆盖：新抓拍拿到了就更新，抓空了就保留原值——后续增量打字时前台
+/// 窗口通常没变，抓拍偶发失败不该把先前抓到的应用抹成 NULL。
+pub fn update_scene_text(
+    conn: &Connection,
+    id: i64,
+    text: &str,
+    app: &SampleAppContext,
+    delivered_at: &str,
+) -> Result<bool> {
+    let n = conn
+        .execute(
+            "UPDATE speech_scenes SET
+                text = ?1,
+                char_count = ?2,
+                app_exe = COALESCE(?3, app_exe),
+                app_path = COALESCE(?4, app_path),
+                app_title = COALESCE(?5, app_title),
+                app_class = COALESCE(?6, app_class),
+                delivered_at = ?7
+             WHERE id = ?8",
+            params![
+                text,
+                text.chars().count() as i64,
+                app.app_exe,
+                app.app_path,
+                app.app_title,
+                app.app_class,
+                delivered_at,
+                id,
+            ],
+        )
+        .context("failed to update speech scene text")?;
+    Ok(n > 0)
+}
+
 /// 把 `segment_ids` 命中的场景记录回标为「被 `sample_id` 这条纠错样本改过」，返回受影响行数。
 ///
 /// - 只标 `correction_sample_id IS NULL` 的行：一条场景记录归属首次纠正它的样本，归属稳定
 ///   （同段被改两次时不来回抢标；具体哪条样本是次要信息，"被改过"这个事实才是关键）。
-/// - 段号可能跨多条场景记录（auto_paste 一段长话分几次打字各记一行），故用 `IN`。
+/// - 段号可能跨多条场景记录（同一段的中文优化稿与英文翻译各记一行），故用 `IN`。
 /// - `segment_ids` 为空直接返回 0，不发空 `IN ()`。
+/// - **`since` 时间下界**：段号由服务端的自增计数器分配，同一个 orchestrator 库内全局递增，
+///   但换服务端 / 重建 `app.db` 后会从头再来。没有下界时，重开的小段号会把几个月前那些
+///   `correction_sample_id IS NULL` 的历史行无声误标（`corrected` 虚高，且这些记录以后会被
+///   从「真实表达风格」统计里错误排除）。采集本身只在最近几分钟的交付里找配对，这里用同一个
+///   时间窗即可。
+/// - **`session_id` 会话过滤**：仅在两侧都已知且不同时排除。老行的 `session_id` 是 NULL
+///   （该列此前恒未填），一律排除会让升级过渡期的回标全部落空，宁可放行。
 pub fn mark_scenes_corrected(
     conn: &Connection,
     segment_ids: &[i64],
     sample_id: i64,
+    since: &str,
+    session_id: Option<&str>,
 ) -> Result<usize> {
+    use rusqlite::types::Value;
+
     if segment_ids.is_empty() {
         return Ok(0);
     }
     let placeholders = vec!["?"; segment_ids.len()].join(",");
     let sql = format!(
         "UPDATE speech_scenes SET correction_sample_id = ?
-         WHERE segment_id IN ({placeholders}) AND correction_sample_id IS NULL"
+         WHERE segment_id IN ({placeholders})
+           AND correction_sample_id IS NULL
+           AND delivered_at >= ?
+           AND (session_id IS NULL OR ? IS NULL OR session_id = ?)"
     );
-    let mut params: Vec<i64> = Vec::with_capacity(segment_ids.len() + 1);
-    params.push(sample_id);
-    params.extend_from_slice(segment_ids);
+    let mut params: Vec<Value> = Vec::with_capacity(segment_ids.len() + 4);
+    params.push(Value::Integer(sample_id));
+    params.extend(segment_ids.iter().copied().map(Value::Integer));
+    params.push(Value::Text(since.to_string()));
+    let session = match session_id {
+        Some(s) => Value::Text(s.to_string()),
+        None => Value::Null,
+    };
+    params.push(session.clone());
+    params.push(session);
     let n = conn
         .execute(&sql, params_from_iter(params))
         .context("failed to mark scenes corrected")?;

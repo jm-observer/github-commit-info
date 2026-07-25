@@ -148,8 +148,12 @@ pub fn open_overlay(
                 "overlay-ready-timeout",
                 &session_id.to_string(),
             );
-            close_overlay(&app_clone);
-            super::commands::notify_capture_failed(&app_clone, "叠加窗未就绪，已自动关闭");
+            // 只关自己那一扇：屏上若已换成后续截图的 overlay，无条件 close_overlay 会连它一起
+            // 关掉，还会把 CURRENT_SESSION 清零——新 overlay 的滞留 watchdog 就会认不出自己、
+            // 提前放弃，等于新窗失去 120s 兜底，正是本文件要加的那道闸。
+            if close_overlay_if_current(&app_clone, session_id) {
+                super::commands::notify_capture_failed(&app_clone, "叠加窗未就绪，已自动关闭");
+            }
         }
         unregister_session(session_id);
     });
@@ -173,8 +177,9 @@ pub fn open_overlay(
             "overlay-linger-timeout",
             &session_id.to_string(),
         );
-        close_overlay(&app_linger);
-        super::commands::notify_capture_failed(&app_linger, "截图窗停留过久，已自动关闭");
+        if close_overlay_if_current(&app_linger, session_id) {
+            super::commands::notify_capture_failed(&app_linger, "截图窗停留过久，已自动关闭");
+        }
     });
 
     Ok(())
@@ -187,6 +192,24 @@ pub fn close_overlay(app: &AppHandle) {
     if let Some(w) = app.get_webview_window(OVERLAY_LABEL) {
         let _ = w.close();
     }
+}
+
+/// 仅当屏上 overlay 仍归属 `session_id` 时才关窗，返回是否真的关了。
+///
+/// **watchdog 专用**：定时器是「过去某一刻排下的队」，到期时屏上那扇窗可能已经不是当初那扇。
+/// 无条件 [`close_overlay`] 会误关后继截图，还会把 `CURRENT_SESSION` 清零、连带废掉它的滞留
+/// 兜底。用户主动触发的路径（commit / cancel / 关主窗）不用这个——那些就是要关掉屏上任何一扇。
+fn close_overlay_if_current(app: &AppHandle, session_id: u64) -> bool {
+    if CURRENT_SESSION
+        .compare_exchange(session_id, 0, Ordering::SeqCst, Ordering::SeqCst)
+        .is_err()
+    {
+        return false;
+    }
+    if let Some(w) = app.get_webview_window(OVERLAY_LABEL) {
+        let _ = w.close();
+    }
+    true
 }
 
 /// 极简百分号编码：保留 unreserved 字符，其余按 UTF-8 字节编码（兼容 Windows 路径反斜杠/冒号）。

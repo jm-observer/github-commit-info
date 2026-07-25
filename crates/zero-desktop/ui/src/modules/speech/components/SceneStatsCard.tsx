@@ -1,20 +1,30 @@
 import React, { useCallback, useEffect, useRef, useState } from 'react';
 import { SpeechAPI, type SceneStats } from '../api/tauri-client';
 import { Icon } from './ui/Icon';
+import { Switch } from './ui/Switch';
 
 /** 轮询间隔：交付是人说话的节奏（几秒到几十秒一条），10s 足够有「在涨」的实感又不折腾数据库。 */
 const POLL_MS = 10_000;
 /** 「刚刚 +N」提示的停留时长。 */
 const BUMP_HOLD_MS = 6_000;
 
+interface SceneStatsCardProps {
+  /** 场景记录总开关。关闭后不再记录新交付，已有统计照常展示。 */
+  enabled: boolean;
+  onEnabledChange: (val: boolean) => void;
+}
+
 /**
- * 场景记录面板 —— 让「日常全量收集」这件事看得见。
+ * 场景记录面板 —— 让「日常全量收集」这件事看得见，也让它停得下来。
  *
  * 这块统计的是**每次交付都记**的 speech_scenes，不是手动按 Ctrl+Alt+X 采的纠错样本：
  * 前者回答「我在哪个软件里说什么样的话」，是后续按应用定制中文优化的依据；后者只覆盖出错
  * 的那几条。两者刻意分开展示，免得混为一谈。
+ *
+ * 开关就放在标题旁：记录是常开的，而记下的窗口标题里可能有聊天对象/文档名/网页标题这类
+ * 比语音本身更敏感的东西，得让人一眼看见它开着、随手能关。
  */
-export const SceneStatsCard: React.FC = () => {
+export const SceneStatsCard: React.FC<SceneStatsCardProps> = ({ enabled, onEnabledChange }) => {
   const [stats, setStats] = useState<SceneStats | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [bump, setBump] = useState(0);
@@ -41,13 +51,16 @@ export const SceneStatsCard: React.FC = () => {
   }, []);
 
   useEffect(() => {
+    // 关掉记录后总数不会再变，轮询就是白跑——拉一次留个当前读数，然后停下。
     void refresh();
+    if (!enabled) return;
     const timer = setInterval(() => void refresh(), POLL_MS);
-    return () => {
-      clearInterval(timer);
-      if (bumpTimerRef.current) clearTimeout(bumpTimerRef.current);
-    };
-  }, [refresh]);
+    return () => clearInterval(timer);
+  }, [refresh, enabled]);
+
+  useEffect(() => () => {
+    if (bumpTimerRef.current) clearTimeout(bumpTimerRef.current);
+  }, []);
 
   const maxCount = stats?.top_apps?.[0]?.count ?? 0;
 
@@ -55,15 +68,24 @@ export const SceneStatsCard: React.FC = () => {
     <div className="rounded-lg border border-[var(--line)] bg-[var(--bg-soft)] p-3">
       <div className="flex items-center justify-between">
         <span className="text-[13px] font-medium text-[var(--ink-2)]">场景记录</span>
-        <button
-          type="button"
-          onClick={() => void refresh()}
-          className="rounded p-1 text-[var(--ink-4)] transition-colors hover:text-[var(--ink-2)]"
-          title="立即刷新"
-        >
-          <Icon name="refresh" size={14} />
-        </button>
+        <div className="flex items-center gap-1.5">
+          <button
+            type="button"
+            onClick={() => void refresh()}
+            className="rounded p-1 text-[var(--ink-4)] transition-colors hover:text-[var(--ink-2)]"
+            title="立即刷新"
+          >
+            <Icon name="refresh" size={14} />
+          </button>
+          <Switch checked={enabled} onCheckedChange={onEnabledChange} />
+        </div>
       </div>
+
+      <p className="mt-1 text-[11px] text-[var(--ink-4)]">
+        {enabled
+          ? '每次语音交付自动记一条（文本 + 所在应用/窗口标题）'
+          : '已暂停记录，新的交付不再入库；已有记录保留'}
+      </p>
 
       {error && <p className="mt-2 text-[11px] text-red-500">读取失败：{error}</p>}
 

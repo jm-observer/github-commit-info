@@ -331,6 +331,11 @@ pub async fn run_capture_worker(
         let segment_ids_json = serde_json::to_string(&burst.segment_ids).unwrap_or_default();
         let first_seg = burst.segment_ids.first().copied().unwrap_or(0);
         let now_str = chrono::Local::now().format("%Y-%m-%d %H:%M:%S").to_string();
+        // 场景记录回标的时间下界：与配对时间窗同宽——能配上的交付本来就在这个窗内。
+        let scenes_since = (chrono::Local::now()
+            - chrono::Duration::seconds(CAPTURE_TIME_WINDOW.as_secs() as i64))
+        .format("%Y-%m-%d %H:%M:%S")
+        .to_string();
 
         // 交付时的应用上下文：值是**交付动作发生那一刻**抓拍的（打字前 / 按下 Ctrl+V 时），
         // 此处只是读出来，读取时刻用户已切窗口也不影响正确性。超出配对时间窗的抓拍视为
@@ -385,8 +390,17 @@ pub async fn run_capture_worker(
                 // 回标场景记录：这次纠错对应的那几条交付「被改过」。用于日后统计真实表达
                 // 风格时排除含 ASR/LLM 错误的记录。命不中（对应交付没走自动交付链路、或
                 // 场景记录尚未落库）返回 0，不影响采集本身。
+                //
+                // 限定在「本次采集的配对时间窗 + 同一会话」内：段号是服务端的自增计数器，
+                // 换服务端 / 重建它的 app.db 后会从头再来，不设界的话重开的小段号会把几个月
+                // 前的历史记录无声误标成「被改过」。
                 match db_handle
-                    .mark_scenes_corrected(burst.segment_ids.clone(), id)
+                    .mark_scenes_corrected(
+                        burst.segment_ids.clone(),
+                        id,
+                        scenes_since,
+                        burst.session_id.clone(),
+                    )
                     .await
                 {
                     Ok(n) => info!(

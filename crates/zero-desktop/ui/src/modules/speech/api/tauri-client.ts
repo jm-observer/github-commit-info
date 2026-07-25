@@ -47,6 +47,8 @@ export interface AppSettings {
   auto_paste_rewrite_retype: boolean;
   auto_start: boolean;
   capture_enabled: boolean;
+  /** 场景记录总开关（每次交付都记 speech_scenes）。与手动采集的 capture_enabled 是两条线。 */
+  scene_log_enabled: boolean;
 }
 
 export const DEFAULT_REMOTE_URL = 'ws://192.168.0.68:8788/api/asr/stream';

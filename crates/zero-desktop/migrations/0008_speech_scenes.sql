@@ -7,7 +7,10 @@
 -- 为什么存 text 快照而不是 join asr_* 表：auto_copy 的合并链会把连续几段拼成一条再粘贴，
 -- 实际交付出去的那串文本在 asr_llm_results 里没有对应行，join 反推不出来。
 --
--- 实际 DDL 在 db/schema.rs（幂等执行），本文件仅作迁移记录。
+-- 本文件是这张表的权威 DDL：db/schema.rs 用 include_str! 把它整体 execute_batch（全
+-- IF NOT EXISTS，幂等，无条件执行）。改表就改这里。后加的列（如 correction_sample_id）
+-- 在建表语句里补一份，同时在 schema.rs 里加一条 ALTER 守卫兜住「建表被 IF NOT EXISTS
+-- 跳过」的老库。
 CREATE TABLE IF NOT EXISTS speech_scenes (
   id            INTEGER PRIMARY KEY AUTOINCREMENT,
   session_id    TEXT,

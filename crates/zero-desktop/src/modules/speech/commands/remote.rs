@@ -134,6 +134,15 @@ fn next_auto_paste_text(
 /// 新 ref 首次输入完整文本；合并链模式下同 ref 后续回发累计文本时，只输入严格后缀。
 /// 若同 ref 后续结果改写了已输入部分：默认保守跳过（剪贴板有最新整段供 Ctrl+V 兜底）；
 /// `rewrite_retype=true` 时则按公共前缀长度发退格回退、再补打新尾巴。
+/// 场景记录需要、但与「怎么打字」无关的随行信息。单独成组，免得再往 `auto_paste_segment`
+/// 的参数表上摞。
+#[derive(Clone, Copy)]
+struct DeliveryMeta<'a> {
+    /// `optimized_zh` | `english`
+    content_kind: &'static str,
+    session_id: Option<&'a str>,
+}
+
 fn auto_paste_segment(
     ap: &mut AutoPasteState,
     text: &str,
@@ -141,14 +150,18 @@ fn auto_paste_segment(
     t_start: f64,
     t_end: f64,
     options: AutoPasteOptions,
-    content_kind: &'static str,
+    meta: DeliveryMeta<'_>,
 ) {
     let Some(action) = next_auto_paste_text(ap, text, ref_id, t_start, t_end, options) else {
         return;
     };
+    // 场景记录落的是该段的**累计全文**，不是这一次打进去的增量。合并链下一句话会分几次
+    // 打字（每次只打严格后缀，改写时还会退格回退），逐次各记一行的话，`speech_scenes.text`
+    // 就成了一堆半截话，退格擦掉的字符还留在旧行里虚增字数。累计全文交给 worker 覆盖同一行。
+    let cumulative = ap.typed_text_by_id.get(&ref_id).cloned();
     // 只在确实打进了外部窗口（typed=true）时记场景记录：前台是本进程时 SendInput 被护栏
     // 拦下，那不是一次对外交付，记了就是脏数据。
-    match action {
+    let typed = match action {
         AutoPasteAction::Type(payload) => {
             let typed = crate::modules::speech::paste_watch::type_text_to_foreground(&payload);
             info!(
@@ -156,9 +169,7 @@ fn auto_paste_segment(
                 "[remote] auto paste ref={ref_id} typed={typed} chars={}",
                 payload.chars().count()
             );
-            if typed {
-                log_delivery(ref_id, "auto_paste", content_kind, payload);
-            }
+            typed
         }
         AutoPasteAction::Retype { backspaces, text } => {
             let typed =
@@ -170,22 +181,26 @@ fn auto_paste_segment(
                 "[remote] auto paste retype ref={ref_id} typed={typed} backspaces={backspaces} chars={}",
                 text.chars().count()
             );
-            if typed {
-                log_delivery(ref_id, "auto_paste", content_kind, text);
-            }
+            typed
+        }
+    };
+    if typed {
+        if let Some(full) = cumulative {
+            log_delivery(ref_id, meta, full);
         }
     }
 }
 
-/// 场景记录的统一入口（`session_id` 与一键采集保持一致，remote 侧此处拿不到，留空）。
-fn log_delivery(ref_id: i64, mode: &'static str, content_kind: &'static str, text: String) {
+/// 场景记录的统一入口（`auto_paste` 链路）。`text` 传该段累计全文，故 `cumulative: true`。
+fn log_delivery(ref_id: i64, meta: DeliveryMeta<'_>, text: String) {
     crate::modules::speech::scene_log::log_typed_scene(
         crate::modules::speech::scene_log::SceneEvent {
-            session_id: None,
+            session_id: meta.session_id.map(str::to_string),
             segment_id: ref_id,
-            delivery_mode: mode,
-            content_kind,
+            delivery_mode: "auto_paste",
+            content_kind: meta.content_kind,
             text,
+            cumulative: true,
         },
     );
 }
@@ -678,13 +693,22 @@ async fn run_one_connection(
         let mut segs: HashMap<i64, SegState> = HashMap::new();
         let mut copy_acc: Option<AutoCopyAccum> = None;
         let mut paste_state = AutoPasteState::default();
+        // 服务端在 ready 帧里下发的会话 id。段号是服务端的自增计数器，换服务端 / 重建它的
+        // app.db 后会从头再来——落库时带上会话，纠错样本回标才能按会话消歧，不去误标历史行。
+        let mut session_id: Option<String> = None;
         while let Some(Ok(msg)) = rd.next().await {
             let Message::Text(t) = msg else { continue };
             let Ok(v) = serde_json::from_str::<serde_json::Value>(&t) else {
                 continue;
             };
             match v.get("type").and_then(|x| x.as_str()) {
-                Some("ready") => info!(target: "speech", "[remote] session ready"),
+                Some("ready") => {
+                    session_id = v
+                        .get("session_id")
+                        .and_then(|x| x.as_str())
+                        .map(str::to_string);
+                    info!(target: "speech", "[remote] session ready session_id={session_id:?}");
+                }
                 Some("segment") => {
                     let id = v.get("id").and_then(|x| x.as_i64()).unwrap_or(0);
                     let text = v.get("text").and_then(|x| x.as_str()).unwrap_or("");
@@ -782,7 +806,12 @@ async fn run_one_connection(
                     if copy && !text.is_empty() {
                         // 语音纠错一键采集：旁路只读记录一次交付（O=最终交付文本，R=该段原始
                         // ASR），不影响下面的剪贴板/自动粘贴主链路。
-                        capture_r.record_delivery(id, text.clone(), st.raw.clone(), None);
+                        capture_r.record_delivery(
+                            id,
+                            text.clone(),
+                            st.raw.clone(),
+                            session_id.clone(),
+                        );
                         // 用户上次粘贴后重新开始累加，避免重复粘贴已粘走的前一段。
                         if crate::modules::speech::paste_watch::take_paste_signal() {
                             copy_acc = None;
@@ -801,11 +830,13 @@ async fn run_one_connection(
                                 // 此刻还没交付——登记为「待粘贴」，用户按下 Ctrl+V 才算数。
                                 crate::modules::speech::scene_log::record_clipboard_pending(
                                     crate::modules::speech::scene_log::SceneEvent {
-                                        session_id: None,
+                                        session_id: session_id.clone(),
                                         segment_id: id,
                                         delivery_mode: "auto_copy",
                                         content_kind: "optimized_zh",
                                         text: merged.clone(),
+                                        // 剪贴板里就是拼接后的整段，一次粘贴即一条完整交付。
+                                        cumulative: false,
                                     },
                                 );
                             }
@@ -835,7 +866,10 @@ async fn run_one_connection(
                                 space_separator: false,
                                 rewrite_retype,
                             },
-                            "optimized_zh",
+                            DeliveryMeta {
+                                content_kind: "optimized_zh",
+                                session_id: session_id.as_deref(),
+                            },
                         );
                     }
                     // 尾部命令：正文已通过 auto_paste 打进焦点框（do_paste 为真才会发生），
@@ -874,7 +908,12 @@ async fn run_one_connection(
                     };
                     if copy && !text.is_empty() {
                         // 语音纠错一键采集：旁路只读记录一次交付，与中文优化分支同款处理。
-                        capture_r.record_delivery(id, text.clone(), st.raw.clone(), None);
+                        capture_r.record_delivery(
+                            id,
+                            text.clone(),
+                            st.raw.clone(),
+                            session_id.clone(),
+                        );
                         // 用户上次粘贴后重新开始累加，避免重复粘贴已粘走的前一段。
                         if crate::modules::speech::paste_watch::take_paste_signal() {
                             copy_acc = None;
@@ -892,11 +931,12 @@ async fn run_one_connection(
                                 info!(target: "speech", "[remote] auto copy (英文) ref={id} chars={}", merged.chars().count());
                                 crate::modules::speech::scene_log::record_clipboard_pending(
                                     crate::modules::speech::scene_log::SceneEvent {
-                                        session_id: None,
+                                        session_id: session_id.clone(),
                                         segment_id: id,
                                         delivery_mode: "auto_copy",
                                         content_kind: "english",
                                         text: merged.clone(),
+                                        cumulative: false,
                                     },
                                 );
                             }
@@ -926,7 +966,10 @@ async fn run_one_connection(
                                 space_separator: true,
                                 rewrite_retype,
                             },
-                            "english",
+                            DeliveryMeta {
+                                content_kind: "english",
+                                session_id: session_id.as_deref(),
+                            },
                         );
                     }
                 }

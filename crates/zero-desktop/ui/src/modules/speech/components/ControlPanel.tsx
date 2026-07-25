@@ -45,6 +45,8 @@ interface ControlPanelProps {
   onNotifySoundChange: (val: boolean) => void;
   captureEnabled: boolean;
   onCaptureEnabledChange: (val: boolean) => void;
+  sceneLogEnabled: boolean;
+  onSceneLogEnabledChange: (val: boolean) => void;
   disabled?: boolean;
 }
 
@@ -102,6 +104,8 @@ export const ControlPanel: React.FC<ControlPanelProps> = ({
   onNotifySoundChange,
   captureEnabled,
   onCaptureEnabledChange,
+  sceneLogEnabled,
+  onSceneLogEnabledChange,
   disabled,
 }) => {
   return (
@@ -250,7 +254,7 @@ export const ControlPanel: React.FC<ControlPanelProps> = ({
           <Switch checked={captureEnabled} onCheckedChange={onCaptureEnabledChange} disabled={disabled} />
         </div>
         {/* 日常全量收集的实时读数，与上面「手动采集」的开关并列但不是一回事，见组件文档。 */}
-        <SceneStatsCard />
+        <SceneStatsCard enabled={sceneLogEnabled} onEnabledChange={onSceneLogEnabledChange} />
       </div>
 
       <div className="flex-1" />

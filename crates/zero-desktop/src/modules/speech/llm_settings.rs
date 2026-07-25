@@ -31,6 +31,10 @@ fn default_capture_enabled() -> bool {
     true
 }
 
+fn default_scene_log_enabled() -> bool {
+    true
+}
+
 #[derive(Serialize, Deserialize, Clone, PartialEq)]
 pub struct LlmSettings {
     #[serde(default)]
@@ -61,6 +65,11 @@ pub struct LlmSettings {
     /// 语音纠错一键采集总开关：关闭后专用快捷键触发即忽略（不读剪贴板、不落库）。
     #[serde(default = "default_capture_enabled")]
     pub capture_enabled: bool,
+    /// 场景记录总开关：关闭后每次交付都不再落 `speech_scenes`（也不暂存待粘贴内容）。
+    /// 与采集开关分开——场景记录是常开的全量收集，记的是交付文本 + 窗口标题，标题里可能
+    /// 含聊天对象/文档名/网页标题这类比语音本身更敏感的信息，得留个能停的出口。
+    #[serde(default = "default_scene_log_enabled")]
+    pub scene_log_enabled: bool,
 }
 
 impl Default for LlmSettings {
@@ -75,6 +84,7 @@ impl Default for LlmSettings {
             auto_start: false,
             voice_commands_enabled: true,
             capture_enabled: true,
+            scene_log_enabled: true,
         }
     }
 }

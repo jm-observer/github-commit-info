@@ -50,6 +50,8 @@ pub(crate) struct CombinedSettings {
     pub(crate) auto_start: bool,
     #[serde(default = "default_capture_enabled_dto")]
     pub(crate) capture_enabled: bool,
+    #[serde(default = "default_scene_log_enabled_dto")]
+    pub(crate) scene_log_enabled: bool,
 }
 
 fn default_notify_sound_dto() -> bool {
@@ -57,6 +59,10 @@ fn default_notify_sound_dto() -> bool {
 }
 
 fn default_capture_enabled_dto() -> bool {
+    true
+}
+
+fn default_scene_log_enabled_dto() -> bool {
     true
 }
 
@@ -78,6 +84,7 @@ pub(crate) fn get_settings_from_state(state: &SpeechState) -> Result<CombinedSet
         auto_paste_rewrite_retype: llm.auto_paste_rewrite_retype,
         auto_start: llm.auto_start,
         capture_enabled: llm.capture_enabled,
+        scene_log_enabled: llm.scene_log_enabled,
     })
 }
 
@@ -137,7 +144,10 @@ pub(crate) async fn apply_settings_to_state(
         auto_start: new_settings.auto_start,
         voice_commands_enabled,
         capture_enabled: new_settings.capture_enabled,
+        scene_log_enabled: new_settings.scene_log_enabled,
     };
+    // 场景记录的判定点在键盘钩子/交付链路里，读的是模块内的无锁开关，故这里同步一次。
+    crate::modules::speech::scene_log::set_enabled(new_llm.scene_log_enabled);
     let new_url = new_settings.remote_url.trim().to_string();
 
     let settings_arc = Arc::clone(&state.settings);
@@ -235,6 +245,16 @@ pub(crate) async fn apply_settings_to_state(
     )
     .await
     .map_err(|e| e.to_string())?;
+    db.upsert_setting(
+        "scene_log.enabled".to_string(),
+        if new_llm.scene_log_enabled {
+            "1".into()
+        } else {
+            "0".into()
+        },
+    )
+    .await
+    .map_err(|e| e.to_string())?;
     db.upsert_setting("remote.url".to_string(), new_url)
         .await
         .map_err(|e| e.to_string())?;
@@ -295,6 +315,10 @@ pub(crate) async fn load_llm_settings_from_db(db: &db::SpeechDatabase) -> LlmSet
     }
     if let Ok(Some(v)) = db.get_setting("capture.enabled".to_string()).await {
         s.capture_enabled = matches!(v.as_str(), "1" | "on" | "true");
+    }
+    // 缺省（老库没这行）即保持默认开启，与 capture 不同——场景记录是常开的全量收集。
+    if let Ok(Some(v)) = db.get_setting("scene_log.enabled".to_string()).await {
+        s.scene_log_enabled = !matches!(v.as_str(), "0" | "off" | "false");
     }
     s
 }

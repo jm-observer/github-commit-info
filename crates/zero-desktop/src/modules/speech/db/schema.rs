@@ -283,8 +283,27 @@ mod tests {
         )
         .unwrap();
 
+        // 时间下界先兜住：晚于这几行的 since，一条都不该标（换服务端后段号重头再来时，
+        // 靠它挡住「小段号误标几个月前的历史行」）。
+        let none_in_window = repository::mark_scenes_corrected(
+            &conn,
+            &[1, 2],
+            sample_id,
+            "2026-07-25 09:10:00",
+            None,
+        )
+        .unwrap();
+        assert_eq!(none_in_window, 0, "超出时间下界的历史行不该被标");
+
         // 回标 burst 的两段：命中 2 条，seg 9 不动。
-        let n = repository::mark_scenes_corrected(&conn, &[1, 2], sample_id).unwrap();
+        let n = repository::mark_scenes_corrected(
+            &conn,
+            &[1, 2],
+            sample_id,
+            "2026-07-25 08:58:00",
+            None,
+        )
+        .unwrap();
         assert_eq!(n, 2);
 
         let s = repository::scene_stats(&conn, "2026-07-25").unwrap();
@@ -292,7 +311,9 @@ mod tests {
         assert_eq!(s.corrected, 2, "被改过的两段计入 corrected");
 
         // 幂等/稳定归属：再标一次，已有 correction_sample_id 的行不被抢标。
-        let n2 = repository::mark_scenes_corrected(&conn, &[1, 2], 99999).unwrap();
+        let n2 =
+            repository::mark_scenes_corrected(&conn, &[1, 2], 99999, "2026-07-25 08:58:00", None)
+                .unwrap();
         assert_eq!(n2, 0);
         assert_eq!(
             repository::scene_stats(&conn, "2026-07-25")
@@ -303,9 +324,115 @@ mod tests {
 
         // 空段号不发空 IN()，安全返回 0。
         assert_eq!(
-            repository::mark_scenes_corrected(&conn, &[], sample_id).unwrap(),
+            repository::mark_scenes_corrected(&conn, &[], sample_id, "2026-07-25 08:58:00", None)
+                .unwrap(),
             0
         );
+    }
+
+    /// 会话过滤：段号会随服务端重建而重头再来，同号不同会话不得互相误标；
+    /// 但会话未知的老行（`session_id IS NULL`）要放行，否则升级过渡期回标全落空。
+    #[test]
+    fn scene_correction_respects_session() {
+        use crate::modules::speech::db::repository::NewScene;
+
+        let conn = Connection::open_in_memory().unwrap();
+        run_migrations(&conn).unwrap();
+
+        let scene = |seg: i64, session: Option<&str>| NewScene {
+            session_id: session.map(str::to_string),
+            segment_id: seg,
+            delivery_mode: "auto_paste".into(),
+            content_kind: "optimized_zh".into(),
+            text: "文本".into(),
+            app: SampleAppContext::default(),
+            delivered_at: "2026-07-25 09:00:00".into(),
+        };
+        repository::insert_scene(&conn, &scene(1, Some("sess-A"))).unwrap();
+        repository::insert_scene(&conn, &scene(1, Some("sess-B"))).unwrap();
+        repository::insert_scene(&conn, &scene(1, None)).unwrap();
+
+        // 会话 A 的纠错只标 A 的行 + 会话未知的老行，不碰 B。
+        let n = repository::mark_scenes_corrected(
+            &conn,
+            &[1],
+            42,
+            "2026-07-25 08:00:00",
+            Some("sess-A"),
+        )
+        .unwrap();
+        assert_eq!(n, 2, "命中 sess-A 与 session_id IS NULL 两行");
+
+        let still_free: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM speech_scenes
+                 WHERE session_id = 'sess-B' AND correction_sample_id IS NULL",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(still_free, 1, "另一会话的同号段不该被误标");
+    }
+
+    /// 合并链：同一段的后续累计全文覆盖同一行，而不是各记一行半截话。
+    #[test]
+    fn scene_update_overwrites_same_row() {
+        use crate::modules::speech::db::repository::NewScene;
+
+        let conn = Connection::open_in_memory().unwrap();
+        run_migrations(&conn).unwrap();
+
+        let id = repository::insert_scene(
+            &conn,
+            &NewScene {
+                session_id: None,
+                segment_id: 7,
+                delivery_mode: "auto_paste".into(),
+                content_kind: "optimized_zh".into(),
+                text: "两字".into(),
+                app: SampleAppContext {
+                    app_exe: Some("Code.exe".into()),
+                    app_path: None,
+                    app_title: Some("文档".into()),
+                    app_class: None,
+                    delivery_mode: Some("auto_paste".into()),
+                },
+                delivered_at: "2026-07-25 09:00:00".into(),
+            },
+        )
+        .unwrap();
+
+        // 后续增量打字：累计全文覆盖同一行；抓拍这次为空 → COALESCE 保留原有应用上下文。
+        let hit = repository::update_scene_text(
+            &conn,
+            id,
+            "两字变成了六个字",
+            &SampleAppContext::default(),
+            "2026-07-25 09:00:03",
+        )
+        .unwrap();
+        assert!(hit);
+
+        let s = repository::scene_stats(&conn, "2026-07-25").unwrap();
+        assert_eq!(s.total, 1, "还是一行，没被切成半截话");
+        assert_eq!(s.total_chars, 8, "字数按累计全文重算，不累加旧片段");
+        assert_eq!(s.top_apps[0].app_exe.as_deref(), Some("Code.exe"));
+        assert_eq!(
+            s.top_titles[0].app_title.as_deref(),
+            Some("文档"),
+            "抓拍为空时保留原有窗口标题，不被抹成 NULL"
+        );
+        assert_eq!(s.last_at.as_deref(), Some("2026-07-25 09:00:03"));
+
+        // 行已不在（用户清过库）→ 返回 false，调用方据此改走新增。
+        assert!(!repository::update_scene_text(
+            &conn,
+            9999,
+            "无主文本",
+            &SampleAppContext::default(),
+            "2026-07-25 09:00:04"
+        )
+        .unwrap());
     }
 
     /// 待办 3：按「应用 + 窗口标题」聚合。浏览器 exe 相同、title 才区分具体场景。
