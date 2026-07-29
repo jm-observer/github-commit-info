@@ -97,6 +97,40 @@ pub(crate) fn run_migrations(conn: &Connection) -> Result<()> {
         conn.execute_batch("ALTER TABLE speech_scenes ADD COLUMN correction_sample_id INTEGER;")
             .context("failed to add speech_scenes.correction_sample_id")?;
     }
+    // 历史回标：回标逻辑（capture 侧 mark_scenes_corrected）上线前采集的纠错样本，其对应
+    // 场景行的 correction_sample_id 全空，统计「真实表达风格」时排除不掉。这里按样本的
+    // segment_ids（JSON 数组，缺失回退单列 segment_id）把空行补上。守卫与运行时同一精神：
+    // - 只补 NULL 行，不抢标（运行时已标的行优先级更高）;
+    // - 只认真有纠正的样本（correction 非空且 label ≠ ok）;
+    // - 时间窗：交付须落在样本标注前 1 天内——段号是服务端自增计数器，换服务端后会重头
+    //   再来，无界会把同号历史行误标（运行时用的是分钟级采集窗，这里放宽到天级是因为
+    //   历史数据只有「标注晚于交付」这一个可靠锚点）;
+    // - 会话过滤：仅两侧都已知且不同时排除（老行 session_id 恒 NULL，须放行）。
+    // 每次启动都跑，天然幂等（补完即无 NULL 可补）；也顺带兜住运行时回标失败的漏行。
+    conn.execute_batch(
+        "UPDATE speech_scenes SET correction_sample_id = (
+             SELECT sp.id FROM speech_samples sp
+             JOIN json_each(COALESCE(sp.segment_ids, json_array(sp.segment_id))) je
+               ON je.value = speech_scenes.segment_id
+             WHERE sp.correction IS NOT NULL AND sp.label <> 'ok'
+               AND speech_scenes.delivered_at <= sp.marked_at
+               AND speech_scenes.delivered_at >= datetime(sp.marked_at, '-1 day')
+               AND (speech_scenes.session_id IS NULL OR sp.session_id IS NULL
+                    OR speech_scenes.session_id = sp.session_id)
+             ORDER BY sp.marked_at, sp.id LIMIT 1
+         )
+         WHERE correction_sample_id IS NULL AND EXISTS (
+             SELECT 1 FROM speech_samples sp
+             JOIN json_each(COALESCE(sp.segment_ids, json_array(sp.segment_id))) je
+               ON je.value = speech_scenes.segment_id
+             WHERE sp.correction IS NOT NULL AND sp.label <> 'ok'
+               AND speech_scenes.delivered_at <= sp.marked_at
+               AND speech_scenes.delivered_at >= datetime(sp.marked_at, '-1 day')
+               AND (speech_scenes.session_id IS NULL OR sp.session_id IS NULL
+                    OR speech_scenes.session_id = sp.session_id)
+         );",
+    )
+    .context("failed to backfill speech_scenes.correction_sample_id")?;
     Ok(())
 }
 
@@ -532,6 +566,84 @@ mod tests {
         assert!(t
             .iter()
             .any(|x| x.app_exe.as_deref() == Some("Code.exe") && x.app_title.is_none()));
+    }
+
+    /// 历史回标：回标逻辑上线前采集的样本，重跑迁移时把对应场景行的
+    /// correction_sample_id 补上；无纠正的样本（label=ok）不参与；已标行不被抢标。
+    #[test]
+    fn migration_backfills_correction_links() {
+        use crate::modules::speech::db::repository::NewScene;
+
+        let conn = Connection::open_in_memory().unwrap();
+        run_migrations(&conn).unwrap();
+
+        let scene = |seg: i64, at: &str| NewScene {
+            session_id: None,
+            segment_id: seg,
+            delivery_mode: "auto_paste".into(),
+            content_kind: "optimized_zh".into(),
+            text: "文本".into(),
+            app: SampleAppContext::default(),
+            delivered_at: at.into(),
+        };
+        // seg 1/2 = 被纠错样本覆盖的历史交付；seg 3 = 无关交付；
+        // seg 4 = 同号但在时间窗外（样本标注前 1 天以上），不得误标。
+        repository::insert_scene(&conn, &scene(1, "2026-07-25 09:00:00")).unwrap();
+        repository::insert_scene(&conn, &scene(2, "2026-07-25 09:00:05")).unwrap();
+        repository::insert_scene(&conn, &scene(3, "2026-07-25 09:30:00")).unwrap();
+        repository::insert_scene(&conn, &scene(1, "2026-07-20 09:00:00")).unwrap();
+
+        let sample = |seg: i64, ids: &str, label: &str, correction: Option<&str>| NewSample {
+            segment_id: seg,
+            session_id: None,
+            label: label.into(),
+            text_raw: "原文".into(),
+            text_optimized: None,
+            text_english: None,
+            text_secondary: None,
+            correction: correction.map(str::to_string),
+            note: None,
+            audio_status: "skipped".into(),
+            marked_at: "2026-07-25 09:05:00".into(),
+            source: "copy".into(),
+            segment_ids: Some(ids.into()),
+            app: SampleAppContext::default(),
+        };
+        let sid =
+            repository::insert_sample(&conn, &sample(1, "[1,2]", "other", Some("改好的"))).unwrap();
+        // ok 样本（无纠正）覆盖 seg 3——不得把 seg 3 标成「被改过」。
+        repository::insert_sample(&conn, &sample(3, "[3]", "ok", None)).unwrap();
+
+        // 模拟「回标逻辑上线前」：样本在库、场景行全空 → 重跑迁移即回补。
+        run_migrations(&conn).unwrap();
+
+        let corrected: Vec<(i64, Option<i64>)> = {
+            let mut stmt = conn
+                .prepare("SELECT segment_id, correction_sample_id FROM speech_scenes ORDER BY id")
+                .unwrap();
+            let rows = stmt
+                .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))
+                .unwrap()
+                .collect::<std::result::Result<Vec<_>, _>>()
+                .unwrap();
+            rows
+        };
+        assert_eq!(corrected[0], (1, Some(sid)), "窗内 seg 1 应被回补");
+        assert_eq!(corrected[1], (2, Some(sid)), "窗内 seg 2 应被回补");
+        assert_eq!(corrected[2], (3, None), "ok 样本不算纠错");
+        assert_eq!(corrected[3], (1, None), "时间窗外的同号历史行不得误标");
+
+        // 已标行不被抢标：再插一条覆盖 seg 1 的新样本后重跑，归属不变。
+        repository::insert_sample(&conn, &sample(1, "[1]", "other", Some("又改"))).unwrap();
+        run_migrations(&conn).unwrap();
+        let still: Option<i64> = conn
+            .query_row(
+                "SELECT correction_sample_id FROM speech_scenes WHERE id = 1",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(still, Some(sid));
     }
 
     /// 老库形态：改名前的 speech_deliveries（无 correction_sample_id、索引名带旧表名）。
