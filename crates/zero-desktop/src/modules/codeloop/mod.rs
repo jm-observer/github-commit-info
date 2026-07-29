@@ -414,6 +414,11 @@ struct LoopCtx {
     /// 评估方案最优性（仅 Design 系入口生效）：true → render_codex_prompt 切 ALTERNATIVES SCOPE。
     /// 不持久化（续跑时回落默认）；见 prompt::DESIGN_SCOPE_WITH_ALTERNATIVES。
     evaluate_alternatives: bool,
+    /// 每轮核心指令模板（DB 可配：`codeloop_codex_review` / `codeloop_claude_revision`）。
+    /// 启动时经 [`resolve_db_templates`] 解析一次（DB 覆盖 > 内置默认，拉取失败回退内置），
+    /// 一次循环内不变；continuation / implement 等未登记模板仍走内置常量。
+    codex_template: String,
+    claude_template: String,
 }
 
 impl LoopCtx {
@@ -462,6 +467,53 @@ impl LoopCtx {
         }))
         .await;
     }
+}
+
+/// 循环启动时从 toolkit-server 可配提示词目录拉一次生效模板（DB 覆盖 > 内置默认）。
+/// 任何失败（G10 未配置 / 不可达 / 老版本缺路由）回退 crate 内置常量并 warn，
+/// 绝不阻塞启动；headless smoke 等无 AppState 的入口直接用内置常量。
+async fn resolve_db_templates(state: &AppState) -> (String, String) {
+    let (codex, claude) = tokio::join!(
+        crate::modules::llm::fetch_prompt_text(state, prompt::PROMPT_NAME_CODEX_REVIEW),
+        crate::modules::llm::fetch_prompt_text(state, prompt::PROMPT_NAME_CLAUDE_REVISION),
+    );
+    let codex = match codex {
+        Ok(t) => {
+            if t != prompt::DEFAULT_CODEX_TEMPLATE {
+                log::info!(
+                    "[codeloop] 应用 DB 覆盖模板 {}",
+                    prompt::PROMPT_NAME_CODEX_REVIEW
+                );
+            }
+            t
+        }
+        Err(e) => {
+            log::warn!(
+                "[codeloop] 拉取模板 {} 失败，回退内置：{e}",
+                prompt::PROMPT_NAME_CODEX_REVIEW
+            );
+            prompt::DEFAULT_CODEX_TEMPLATE.to_string()
+        }
+    };
+    let claude = match claude {
+        Ok(t) => {
+            if t != prompt::DEFAULT_CLAUDE_TEMPLATE {
+                log::info!(
+                    "[codeloop] 应用 DB 覆盖模板 {}",
+                    prompt::PROMPT_NAME_CLAUDE_REVISION
+                );
+            }
+            t
+        }
+        Err(e) => {
+            log::warn!(
+                "[codeloop] 拉取模板 {} 失败，回退内置：{e}",
+                prompt::PROMPT_NAME_CLAUDE_REVISION
+            );
+            prompt::DEFAULT_CLAUDE_TEMPLATE.to_string()
+        }
+    };
+    (codex, claude)
 }
 
 /// send_and_resolve 的结果：拿到回复，或等用户答超时。
@@ -763,7 +815,7 @@ async fn drive(ctx: &LoopCtx, start_round: u32) -> Result<()> {
             )
         } else {
             prompt::render_codex_prompt(
-                prompt::DEFAULT_CODEX_TEMPLATE,
+                &ctx.codex_template,
                 &target,
                 ctx.mode,
                 n,
@@ -855,7 +907,7 @@ async fn drive(ctx: &LoopCtx, start_round: u32) -> Result<()> {
             )
         } else {
             prompt::render_claude_prompt(
-                prompt::DEFAULT_CLAUDE_TEMPLATE,
+                &ctx.claude_template,
                 &target,
                 &review,
                 claude_first_turn,
@@ -969,7 +1021,7 @@ async fn dispatch_review_seed(ctx: &LoopCtx) -> Result<()> {
     let mut force_locator = false;
     let claude_first_turn = !ctx.established_claude;
     let mut claude_prompt = prompt::render_claude_prompt(
-        prompt::DEFAULT_CLAUDE_TEMPLATE,
+        &ctx.claude_template,
         &target,
         &wrapped,
         claude_first_turn,
@@ -1570,6 +1622,9 @@ pub async fn codeloop_start(
         answer_timeout: ANSWER_TIMEOUT,
     });
 
+    // 启动时拉一次 DB 可配模板（失败回退内置），随 ctx 进入循环。
+    let (codex_template, claude_template) = resolve_db_templates(&state).await;
+
     let ctx = LoopCtx {
         events,
         confirm,
@@ -1594,6 +1649,8 @@ pub async fn codeloop_start(
         seed_review_inline: input.seed_review_inline.clone(),
         is_continue: false,
         evaluate_alternatives: input.evaluate_alternatives,
+        codex_template,
+        claude_template,
     };
 
     let handle = tokio::spawn(run_loop(ctx));
@@ -2208,6 +2265,9 @@ pub async fn codeloop_continue(
     let claude_sid = claude.session_id.clone();
     let codex_sid = codex.session_id.clone();
 
+    // 续跑同样重新拉一次 DB 可配模板（失败回退内置）。
+    let (codex_template, claude_template) = resolve_db_templates(&state).await;
+
     let ctx = LoopCtx {
         events,
         confirm,
@@ -2236,6 +2296,8 @@ pub async fn codeloop_continue(
         is_continue: true,
         // 续跑回落默认 SCOPE（不持久化），与设计一致。
         evaluate_alternatives: false,
+        codex_template,
+        claude_template,
     };
 
     let handle = tokio::spawn(run_loop(ctx));
@@ -2597,6 +2659,9 @@ pub async fn run_codeloop(deps: RunLoopDeps, input: RunLoopInput) -> Result<RunL
         seed_review_inline: input.seed_review_inline.clone(),
         is_continue: false,
         evaluate_alternatives: input.evaluate_alternatives,
+        // headless 无 AppState，不接 DB 可配模板，直接用内置常量。
+        codex_template: prompt::DEFAULT_CODEX_TEMPLATE.to_string(),
+        claude_template: prompt::DEFAULT_CLAUDE_TEMPLATE.to_string(),
     };
 
     // 直接 await，不 spawn —— smoke runner 串行编排，等本段终态再起下一段。

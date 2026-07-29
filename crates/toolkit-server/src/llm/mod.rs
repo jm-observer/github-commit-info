@@ -20,8 +20,8 @@ use toolkit_llm::{prompt_hash, LlmClient, LlmConfig};
 // ---- 内置提示词名字（其他模块引用，避免裸字符串散落）----
 pub const NAME_DOUYIN_REFINE: &str = "douyin_refine";
 pub const NAME_CHAT_SUMMARY: &str = "chat_summary";
-pub const NAME_CODELOOP_CODEX_REVIEW: &str = "codeloop_codex_review";
-pub const NAME_CODELOOP_CLAUDE_REVISION: &str = "codeloop_claude_revision";
+pub const NAME_CODELOOP_CODEX_REVIEW: &str = codeloop_core::prompt::PROMPT_NAME_CODEX_REVIEW;
+pub const NAME_CODELOOP_CLAUDE_REVISION: &str = codeloop_core::prompt::PROMPT_NAME_CLAUDE_REVISION;
 /// ASR 中文优化系统提示词（orchestrator 的 vLLM 润色调用）。orchestrator 经裸字符串
 /// `"asr_optimize_zh"` 读取（不依赖 toolkit-server crate）；两边名称必须一致。
 pub const NAME_ASR_OPTIMIZE_ZH: &str = "asr_optimize_zh";

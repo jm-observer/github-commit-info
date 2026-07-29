@@ -13,6 +13,12 @@ use std::path::Path;
 /// 模板语义版本。改内置模板文案时同步 bump。
 pub const TEMPLATE_VERSION: &str = "v5";
 
+/// DB 可配提示词目录（toolkit-server llm 层）里的登记名。server 端 `builtins()` 与
+/// zero-desktop 内嵌 codeloop 的拉取端共用，两边名称必须一致，故收拢在此。
+pub const PROMPT_NAME_CODEX_REVIEW: &str = "codeloop_codex_review";
+/// 说明同 [`PROMPT_NAME_CODEX_REVIEW`]。
+pub const PROMPT_NAME_CLAUDE_REVISION: &str = "codeloop_claude_revision";
+
 /// Codex 复核模板支持的占位符（供控制台提示）。
 ///
 /// 仅列「每轮核心指令」模板（DB 可配部分）的占位符；目标定位占位符（`{REPO_ROOT}` /

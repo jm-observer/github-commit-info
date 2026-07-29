@@ -152,7 +152,9 @@ pwsh ./deploy-g10.ps1 -SkipBuild # 仅复制已有产物
   （DELETE=重置内置）、`POST /ping`（连通性自测）、`POST /summarize`（对话总结，用 `chat_summary`）。
 - **codeloop 提示词**：走 Codex/Claude **CLI 会话**通道，纳入此目录仅为统一管理文案，与 HTTP 大模型
   通道无关；`kind.rs` 在任务启动时按 name 从 DB 解析模板（缺失回退 `codeloop_core` 内置常量）。
-  zero-desktop 内嵌的 codeloop 直接用内置常量（暂不接 DB 配置）。
+  zero-desktop 内嵌的 codeloop 也接入：循环启动时经 `/api/web/llm/prompts/{name}` 拉一次生效模板
+  （失败回退内置，绝不阻塞循环；headless smoke 无 AppState，恒用内置）。登记名常量收拢在
+  `codeloop_core::prompt::PROMPT_NAME_*`，两端共用。continuation / implement 等未登记模板仍走内置。
 
 ## 抖音知识管线（流 A，Phase 2）
 
