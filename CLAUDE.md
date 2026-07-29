@@ -150,6 +150,12 @@ pwsh ./deploy-g10.ps1 -SkipBuild # 仅复制已有产物
   **新增可配提示词 = 在 `builtins()` 加一行**。
 - **HTTP（`/api/web/llm`）**：`GET/PUT /config`、`GET /prompts`、`GET/PUT/DELETE /prompts/{name}`
   （DELETE=重置内置）、`POST /ping`（连通性自测）、`POST /summarize`（对话总结，用 `chat_summary`）。
+- **会话（`llm_sessions` / `llm_messages` 两表）**：`GET/POST /sessions`、
+  `GET/PUT/DELETE /sessions/{id}`（PUT=重命名，DELETE=连消息一并删；两表无外键无级联，
+  删除在事务里显式删两次）、`POST /sessions/{id}/messages`（续聊）。续聊准入走
+  `routes.rs::can_continue` 白名单（当前仅 `chat_test`；**新 kind 如 agent 需显式加入**）。
+  发给模型的历史经 `context_window` 截窗（`MAX_CONTEXT_MESSAGES=40`，保留开头连续 system +
+  尾部最近若干条），**落库仍是全量**；后续可迭代为用 `chat_summary` 压缩被裁的旧轮。
 - **codeloop 提示词**：走 Codex/Claude **CLI 会话**通道，纳入此目录仅为统一管理文案，与 HTTP 大模型
   通道无关；`kind.rs` 在任务启动时按 name 从 DB 解析模板（缺失回退 `codeloop_core` 内置常量）。
   zero-desktop 内嵌的 codeloop 也接入：循环启动时经 `/api/web/llm/prompts/{name}` 拉一次生效模板

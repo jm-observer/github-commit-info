@@ -313,6 +313,8 @@ fn run_gui(workspace: PathBuf) -> Result<()> {
             modules::llm::llm_get_session,
             modules::llm::llm_create_chat,
             modules::llm::llm_chat_send,
+            modules::llm::llm_rename_session,
+            modules::llm::llm_delete_session,
             // egress 模块（出口代理 worker 列表，只读观测面）
             modules::egress::egress_list_workers,
             // codeloop 模块（Codex⇄Claude 复核循环）

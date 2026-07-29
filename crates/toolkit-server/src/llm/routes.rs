@@ -32,7 +32,12 @@ pub fn router() -> Router<AppState> {
         .route("/ping", post(ping))
         .route("/summarize", post(summarize))
         .route("/sessions", get(list_sessions_h).post(create_chat_h))
-        .route("/sessions/{id}", get(get_session_h))
+        .route(
+            "/sessions/{id}",
+            get(get_session_h)
+                .put(rename_session_h)
+                .delete(delete_session_h),
+        )
         .route("/sessions/{id}/messages", post(chat_send_h))
 }
 
@@ -350,6 +355,43 @@ async fn get_session_h(
 }
 
 #[derive(Debug, Deserialize)]
+struct RenameSessionBody {
+    title: String,
+}
+
+/// PUT /sessions/{id} —— 重命名会话（仅改标题）。
+async fn rename_session_h(
+    State(s): State<AppState>,
+    Path(id): Path<String>,
+    Json(body): Json<RenameSessionBody>,
+) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    let title = body.title.trim();
+    if title.is_empty() {
+        return Err(err(StatusCode::BAD_REQUEST, "title 不能为空".to_string()));
+    }
+    let hit = llm_sessions::rename_session(&s.pool, &id, title).map_err(internal)?;
+    if !hit {
+        return Err(err(StatusCode::NOT_FOUND, format!("会话不存在 {id}")));
+    }
+    let session = llm_sessions::get_session(&s.pool, &id)
+        .map_err(internal)?
+        .ok_or_else(|| err(StatusCode::NOT_FOUND, format!("会话不存在 {id}")))?;
+    Ok(Json(session_json(&session)))
+}
+
+/// DELETE /sessions/{id} —— 删除会话及其全部消息。
+async fn delete_session_h(
+    State(s): State<AppState>,
+    Path(id): Path<String>,
+) -> Result<Json<Value>, (StatusCode, Json<Value>)> {
+    let hit = llm_sessions::delete_session(&s.pool, &id).map_err(internal)?;
+    if !hit {
+        return Err(err(StatusCode::NOT_FOUND, format!("会话不存在 {id}")));
+    }
+    Ok(Json(json!({ "ok": true })))
+}
+
+#[derive(Debug, Deserialize)]
 struct CreateChatBody {
     /// 可选首条用户消息；带则立刻跑一轮对话。
     #[serde(default)]
@@ -412,7 +454,7 @@ async fn chat_send_h(
     let session = llm_sessions::get_session(&s.pool, &id)
         .map_err(internal)?
         .ok_or_else(|| err(StatusCode::NOT_FOUND, format!("会话不存在 {id}")))?;
-    if session.kind != "chat_test" {
+    if !can_continue(&session.kind) {
         return Err(err(
             StatusCode::BAD_REQUEST,
             "该会话不可续聊（仅对话测试支持）".to_string(),
@@ -427,8 +469,42 @@ async fn chat_send_h(
     })))
 }
 
-/// 跑一轮对话：先持久化 user（即便模型出错也保住该轮）→ 用全量历史调 chat →
-/// 成功落 assistant 返回；失败置会话 error 并 502。
+/// 可续聊的会话 kind 白名单。当前仅「对话测试」支持追加消息；未来新 kind（如 agent
+/// 交互式接入）需在此显式加入，不再靠散落各处的字符串比较判断。
+fn can_continue(kind: &str) -> bool {
+    matches!(kind, "chat_test")
+}
+
+/// 发给模型的上下文窗口上限（约 20 轮对话）。**仅限制发给模型的消息数**，历史仍
+/// 全量落库不受影响；后续可迭代为用 `chat_summary` 压缩被裁掉的旧轮，而非直接丢弃。
+const MAX_CONTEXT_MESSAGES: usize = 40;
+
+/// 从全量历史消息中截出发给模型的上下文窗口：
+/// - 消息数 ≤ max：原样返回（不裁）。
+/// - 消息数 > max：保留**开头连续的 system 消息**（若有，通常是系统提示词）+
+///   末尾最近的消息，总数不超过 max，避免因裁剪丢失长期生效的系统指令。
+fn context_window(
+    msgs: Vec<llm_sessions::LlmMessage>,
+    max: usize,
+) -> Vec<llm_sessions::LlmMessage> {
+    if msgs.len() <= max {
+        return msgs;
+    }
+    let leading_system = msgs.iter().take_while(|m| m.role == "system").count();
+    // system 消息本身就已超过上限的极端情况：退化为只保留这些 system 消息的尾部。
+    let leading_system = leading_system.min(max);
+    let tail_budget = max - leading_system;
+    let mut iter = msgs.into_iter();
+    let mut out: Vec<llm_sessions::LlmMessage> = iter.by_ref().take(leading_system).collect();
+    let rest: Vec<llm_sessions::LlmMessage> = iter.collect();
+    let tail_start = rest.len().saturating_sub(tail_budget);
+    out.extend(rest.into_iter().skip(tail_start));
+    out
+}
+
+/// 跑一轮对话：先持久化 user（即便模型出错也保住该轮，全量落库不受窗口影响）→
+/// 用**上下文窗口**（见 [`context_window`]）截出的历史调 chat → 成功落 assistant
+/// 返回；失败置会话 error 并 502。
 async fn run_chat_turn(
     s: &AppState,
     client: &toolkit_llm::LlmClient,
@@ -437,7 +513,8 @@ async fn run_chat_turn(
 ) -> Result<llm_sessions::LlmMessage, (StatusCode, Json<Value>)> {
     llm_sessions::append_message(&s.pool, id, "user", user_msg, None).map_err(internal)?;
     let history = llm_sessions::get_messages(&s.pool, id).map_err(internal)?;
-    let msgs: Vec<toolkit_llm::Message> = history
+    let windowed = context_window(history, MAX_CONTEXT_MESSAGES);
+    let msgs: Vec<toolkit_llm::Message> = windowed
         .iter()
         .map(|m| toolkit_llm::Message {
             role: m.role.clone(),
@@ -454,5 +531,68 @@ async fn run_chat_turn(
             let _ = llm_sessions::set_session_status(&s.pool, id, "error");
             Err(err(StatusCode::BAD_GATEWAY, format!("调用失败：{e:#}")))
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// 造一条测试用消息，只关心 role/content/seq，其余字段填占位值。
+    fn msg(seq: i64, role: &str, content: &str) -> llm_sessions::LlmMessage {
+        llm_sessions::LlmMessage {
+            id: format!("m{seq}"),
+            session_id: "s".to_string(),
+            seq,
+            role: role.to_string(),
+            content: content.to_string(),
+            meta: "{}".to_string(),
+            created_at: "2026-01-01T00:00:00Z".to_string(),
+        }
+    }
+
+    #[test]
+    fn can_continue_only_allows_chat_test() {
+        assert!(can_continue("chat_test"));
+        assert!(!can_continue("douyin_refine"));
+        assert!(!can_continue("chat_summary"));
+        assert!(!can_continue("agent"));
+    }
+
+    #[test]
+    fn context_window_keeps_all_when_within_limit() {
+        let msgs: Vec<_> = (0..5).map(|i| msg(i, "user", "hi")).collect();
+        let out = context_window(msgs.clone(), 40);
+        assert_eq!(out.len(), 5);
+        assert_eq!(
+            out.iter().map(|m| m.seq).collect::<Vec<_>>(),
+            msgs.iter().map(|m| m.seq).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn context_window_truncates_tail_when_over_limit() {
+        // 50 条无 system 消息，max=40 → 只保留最后 40 条（seq 10..=49）。
+        let msgs: Vec<_> = (0..50).map(|i| msg(i, "user", "hi")).collect();
+        let out = context_window(msgs, 40);
+        assert_eq!(out.len(), 40);
+        assert_eq!(out.first().unwrap().seq, 10);
+        assert_eq!(out.last().unwrap().seq, 49);
+    }
+
+    #[test]
+    fn context_window_preserves_leading_system_messages() {
+        // 开头 2 条 system + 48 条 user，max=10 → 2 条 system 全保留 + 尾部最近 8 条 user。
+        let mut msgs = vec![msg(0, "system", "sys0"), msg(1, "system", "sys1")];
+        msgs.extend((2..50).map(|i| msg(i, "user", "hi")));
+        let out = context_window(msgs, 10);
+        assert_eq!(out.len(), 10);
+        assert_eq!(out[0].role, "system");
+        assert_eq!(out[0].seq, 0);
+        assert_eq!(out[1].role, "system");
+        assert_eq!(out[1].seq, 1);
+        // 剩余 8 个位置留给尾部最近的 user 消息（seq 42..=49）。
+        assert_eq!(out[2].seq, 42);
+        assert_eq!(out.last().unwrap().seq, 49);
     }
 }

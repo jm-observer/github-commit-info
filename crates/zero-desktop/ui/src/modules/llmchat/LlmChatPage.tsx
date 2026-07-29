@@ -12,7 +12,7 @@
 
 import { useEffect, useRef, useState } from 'react'
 import { invoke } from '@tauri-apps/api/core'
-import { Send, MessageCircle, History, Plus, XCircle, RefreshCw } from 'lucide-react'
+import { Send, MessageCircle, History, Plus, XCircle, RefreshCw, Trash2, Pencil, Check, X } from 'lucide-react'
 
 // ── 类型 ────────────────────────────────────────────────────────────────────
 
@@ -57,6 +57,7 @@ function kindBadgeCls(kind: string): string {
     case 'chat_test': return 'bg-blue-100 text-blue-700 dark:bg-blue-900/30 dark:text-blue-300'
     case 'douyin_refine': return 'bg-pink-100 text-pink-700 dark:bg-pink-900/30 dark:text-pink-300'
     case 'chat_summary': return 'bg-emerald-100 text-emerald-700 dark:bg-emerald-900/30 dark:text-emerald-300'
+    case 'agent': return 'bg-violet-100 text-violet-700 dark:bg-violet-900/30 dark:text-violet-300'
     default: return 'bg-gray-100 text-gray-600 dark:bg-gray-800 dark:text-gray-300'
   }
 }
@@ -232,6 +233,7 @@ const FILTERS: { label: string; origin: string | null }[] = [
   { label: '对话测试', origin: 'chat_test' },
   { label: '抖音整理', origin: 'douyin_refine' },
   { label: '对话总结', origin: 'chat_summary' },
+  { label: KIND_LABEL.agent, origin: 'agent' },
 ]
 
 function RecordsView() {
@@ -241,6 +243,9 @@ function RecordsView() {
   const [loadingList, setLoadingList] = useState(false)
   const [loadingDetail, setLoadingDetail] = useState(false)
   const [error, setError] = useState<string | null>(null)
+  // 重命名：null = 未在改；否则为编辑中的标题文本。
+  const [renaming, setRenaming] = useState<string | null>(null)
+  const [busyId, setBusyId] = useState<string | null>(null)
 
   const loadList = async (o: string | null) => {
     setLoadingList(true)
@@ -260,6 +265,7 @@ function RecordsView() {
 
   const openSession = async (id: string) => {
     setLoadingDetail(true)
+    setRenaming(null)
     try {
       const r = await invoke<SessionDetail>('llm_get_session', { id })
       setSelected(r)
@@ -267,6 +273,42 @@ function RecordsView() {
       setError(errMsg(e))
     } finally {
       setLoadingDetail(false)
+    }
+  }
+
+  // 删除会话（连同全部消息，不可恢复）：确认 → 调命令 → 本地移除，正在看的详情一并清空。
+  const removeSession = async (s: SessionSummary) => {
+    if (!window.confirm(`删除会话「${s.title || '(无标题)'}」？其全部对话消息将一并删除，不可恢复。`)) return
+    setBusyId(s.id)
+    setError(null)
+    try {
+      await invoke('llm_delete_session', { id: s.id })
+      setSessions(prev => prev.filter(x => x.id !== s.id))
+      setSelected(prev => (prev?.id === s.id ? null : prev))
+    } catch (e) {
+      setError(errMsg(e))
+    } finally {
+      setBusyId(null)
+    }
+  }
+
+  // 提交重命名：空标题按取消处理；成功后同步刷新详情与左侧列表项。
+  const submitRename = async () => {
+    if (!selected) return
+    const title = (renaming ?? '').trim()
+    if (!title) { setRenaming(null); return }
+    if (title === selected.title) { setRenaming(null); return }
+    setBusyId(selected.id)
+    setError(null)
+    try {
+      await invoke('llm_rename_session', { id: selected.id, title })
+      setSelected(prev => (prev ? { ...prev, title } : prev))
+      setSessions(prev => prev.map(x => (x.id === selected.id ? { ...x, title } : x)))
+      setRenaming(null)
+    } catch (e) {
+      setError(errMsg(e))
+    } finally {
+      setBusyId(null)
     }
   }
 
@@ -306,32 +348,47 @@ function RecordsView() {
             <div className="px-2 py-4 text-xs text-gray-400">暂无会话记录</div>
           )}
           {sessions.map(s => (
-            <button
+            // 外层用 div 承载边框/选中态：删除按钮不能嵌在打开会话的 button 里。
+            <div
               key={s.id}
-              type="button"
-              onClick={() => void openSession(s.id)}
               className={[
-                'flex w-full flex-col gap-1 rounded-md border px-2.5 py-2 text-left transition-colors',
+                'group relative rounded-md border transition-colors',
                 selected?.id === s.id
                   ? 'border-blue-300 bg-blue-50 dark:border-blue-700 dark:bg-blue-900/20'
                   : 'border-gray-200 hover:bg-gray-50 dark:border-gray-700 dark:hover:bg-gray-800/50',
               ].join(' ')}
             >
-              <div className="flex items-center gap-1.5">
-                <span className={`rounded px-1.5 py-0.5 text-[10px] ${kindBadgeCls(s.kind)}`}>
-                  {kindLabel(s.kind)}
-                </span>
-                {s.status === 'error' && (
-                  <span className="rounded bg-red-100 px-1.5 py-0.5 text-[10px] text-red-600 dark:bg-red-900/30 dark:text-red-400">
-                    失败
+              <button
+                type="button"
+                onClick={() => void openSession(s.id)}
+                className="flex w-full flex-col gap-1 px-2.5 py-2 text-left"
+              >
+                <div className="flex items-center gap-1.5">
+                  <span className={`rounded px-1.5 py-0.5 text-[10px] ${kindBadgeCls(s.kind)}`}>
+                    {kindLabel(s.kind)}
                   </span>
-                )}
-              </div>
-              <span className="truncate text-xs text-gray-700 dark:text-gray-200">
-                {s.title || '(无标题)'}
-              </span>
-              <span className="text-[10px] text-gray-400">{s.created_at}</span>
-            </button>
+                  {s.status === 'error' && (
+                    <span className="rounded bg-red-100 px-1.5 py-0.5 text-[10px] text-red-600 dark:bg-red-900/30 dark:text-red-400">
+                      失败
+                    </span>
+                  )}
+                </div>
+                {/* 右侧留出删除按钮的位置，避免长标题压在图标下 */}
+                <span className="truncate pr-5 text-xs text-gray-700 dark:text-gray-200">
+                  {s.title || '(无标题)'}
+                </span>
+                <span className="text-[10px] text-gray-400">{s.created_at}</span>
+              </button>
+              <button
+                type="button"
+                onClick={() => void removeSession(s)}
+                disabled={busyId === s.id}
+                title="删除该会话"
+                className="absolute right-1 top-1 rounded p-1 text-gray-400 opacity-0 transition-opacity hover:bg-red-50 hover:text-red-600 focus:opacity-100 group-hover:opacity-100 disabled:opacity-40 dark:hover:bg-red-900/30 dark:hover:text-red-400"
+              >
+                <Trash2 size={12} />
+              </button>
+            </div>
           ))}
         </div>
       </div>
@@ -359,9 +416,51 @@ function RecordsView() {
                 <span className={`rounded px-1.5 py-0.5 text-[10px] ${kindBadgeCls(selected.kind)}`}>
                   {kindLabel(selected.kind)}
                 </span>
-                <h2 className="truncate text-sm font-medium text-gray-700 dark:text-gray-200">
-                  {selected.title || '(无标题)'}
-                </h2>
+                {renaming === null ? (
+                  <>
+                    <h2 className="truncate text-sm font-medium text-gray-700 dark:text-gray-200">
+                      {selected.title || '(无标题)'}
+                    </h2>
+                    <button
+                      type="button"
+                      onClick={() => setRenaming(selected.title)}
+                      title="重命名"
+                      className="rounded p-1 text-gray-400 hover:bg-gray-100 hover:text-gray-600 dark:hover:bg-gray-800 dark:hover:text-gray-200"
+                    >
+                      <Pencil size={12} />
+                    </button>
+                  </>
+                ) : (
+                  <>
+                    <input
+                      autoFocus
+                      value={renaming}
+                      onChange={e => setRenaming(e.target.value)}
+                      onKeyDown={e => {
+                        if (e.key === 'Enter') void submitRename()
+                        if (e.key === 'Escape') setRenaming(null)
+                      }}
+                      className="min-w-0 flex-1 rounded border border-gray-300 bg-white px-2 py-1 text-sm text-gray-700 outline-none focus:border-blue-400 dark:border-gray-600 dark:bg-gray-900 dark:text-gray-200"
+                    />
+                    <button
+                      type="button"
+                      onClick={() => void submitRename()}
+                      disabled={busyId === selected.id}
+                      title="保存"
+                      className="rounded p-1 text-emerald-600 hover:bg-emerald-50 disabled:opacity-40 dark:hover:bg-emerald-900/30"
+                    >
+                      <Check size={13} />
+                    </button>
+                    <button
+                      type="button"
+                      onClick={() => setRenaming(null)}
+                      title="取消"
+                      className="rounded p-1 text-gray-400 hover:bg-gray-100 dark:hover:bg-gray-800"
+                    >
+                      <X size={13} />
+                    </button>
+                  </>
+                )}
               </div>
               <div className="mt-1 flex flex-wrap gap-x-3 gap-y-0.5 text-[10px] text-gray-400">
                 {selected.model && <span>模型 {selected.model}</span>}

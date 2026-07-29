@@ -136,6 +136,40 @@ pub fn touch_session(pool: &SqlitePool, session_id: &str) -> Result<()> {
     Ok(())
 }
 
+/// 删除会话及其全部消息。`llm_sessions` / `llm_messages` 两表**无外键无级联**，
+/// 必须在一个事务里显式执行两条 DELETE（先子表 llm_messages 再主表 llm_sessions），
+/// 避免半途失败留下孤儿消息行。返回该会话是否存在过（真删了 `llm_sessions` 行）。
+pub fn delete_session(pool: &SqlitePool, session_id: &str) -> Result<bool> {
+    let mut conn = pool.get()?;
+    let tx = conn.transaction().context("开启删除会话事务")?;
+    tx.execute(
+        "DELETE FROM llm_messages WHERE session_id = ?1",
+        params![session_id],
+    )
+    .context("删除会话消息")?;
+    let affected = tx
+        .execute(
+            "DELETE FROM llm_sessions WHERE id = ?1",
+            params![session_id],
+        )
+        .context("删除会话")?;
+    tx.commit().context("提交删除会话事务")?;
+    Ok(affected > 0)
+}
+
+/// 重命名会话（写 title，并按 touch_session 同样的写法刷新 updated_at）。
+/// 返回是否命中已有会话（未命中即会话不存在）。
+pub fn rename_session(pool: &SqlitePool, session_id: &str, title: &str) -> Result<bool> {
+    let conn = pool.get()?;
+    let affected = conn
+        .execute(
+            "UPDATE llm_sessions SET title = ?2, updated_at = ?3 WHERE id = ?1",
+            params![session_id, title, now_iso8601()],
+        )
+        .context("重命名 llm_session")?;
+    Ok(affected > 0)
+}
+
 /// 列会话（按 created_at 倒序），可选按 kind 过滤，limit 限量。
 pub fn list_sessions(pool: &SqlitePool, kind: Option<&str>, limit: i64) -> Result<Vec<LlmSession>> {
     let conn = pool.get()?;
@@ -274,6 +308,58 @@ mod tests {
         // status 翻转。
         set_session_status(&p, &id, "error").unwrap();
         assert_eq!(get_session(&p, &id).unwrap().unwrap().status, "error");
+    }
+
+    #[test]
+    fn rename_session_updates_title_and_updated_at() {
+        let tmp = tempfile::tempdir().unwrap();
+        let p = pool(tmp.path());
+        let id = create_session(
+            &p,
+            NewSession {
+                kind: "chat_test",
+                title: "旧标题",
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let before = get_session(&p, &id).unwrap().unwrap();
+
+        // 命中：标题更新，updated_at 不早于原值。
+        assert!(rename_session(&p, &id, "新标题").unwrap());
+        let after = get_session(&p, &id).unwrap().unwrap();
+        assert_eq!(after.title, "新标题");
+        assert!(after.updated_at >= before.updated_at);
+
+        // 未命中：会话不存在时返回 false，不报错。
+        assert!(!rename_session(&p, "tk_nope", "无所谓").unwrap());
+    }
+
+    #[test]
+    fn delete_session_removes_session_and_messages() {
+        let tmp = tempfile::tempdir().unwrap();
+        let p = pool(tmp.path());
+        let id = create_session(
+            &p,
+            NewSession {
+                kind: "chat_test",
+                title: "待删除",
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        append_message(&p, &id, "user", "hi", None).unwrap();
+        append_message(&p, &id, "assistant", "你好", None).unwrap();
+        assert_eq!(get_messages(&p, &id).unwrap().len(), 2);
+
+        // 命中：会话行 + 全部消息行都被删掉。
+        assert!(delete_session(&p, &id).unwrap());
+        assert!(get_session(&p, &id).unwrap().is_none());
+        assert!(get_messages(&p, &id).unwrap().is_empty());
+
+        // 未命中：重复删除 / 删不存在的会话返回 false，不报错。
+        assert!(!delete_session(&p, &id).unwrap());
+        assert!(!delete_session(&p, "tk_nope").unwrap());
     }
 
     #[test]

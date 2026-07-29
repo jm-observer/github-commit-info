@@ -362,3 +362,44 @@ pub async fn llm_chat_send(
     )
     .await
 }
+
+/// 重命名会话（仅改标题）。
+#[tauri::command]
+pub async fn llm_rename_session(
+    state: State<'_, AppState>,
+    id: String,
+    title: String,
+) -> Result<serde_json::Value, String> {
+    if title.trim().is_empty() {
+        return Err("标题不能为空".to_string());
+    }
+    let path = format!("/sessions/{id}");
+    let body = serde_json::json!({ "title": title });
+    request_json(
+        &state,
+        reqwest::Method::PUT,
+        &path,
+        Some(body),
+        QUICK_TIMEOUT,
+        "重命名会话失败",
+    )
+    .await
+}
+
+/// 删除会话及其全部消息。
+#[tauri::command]
+pub async fn llm_delete_session(
+    state: State<'_, AppState>,
+    id: String,
+) -> Result<serde_json::Value, String> {
+    let path = format!("/sessions/{id}");
+    request_json(
+        &state,
+        reqwest::Method::DELETE,
+        &path,
+        None,
+        QUICK_TIMEOUT,
+        "删除会话失败",
+    )
+    .await
+}
