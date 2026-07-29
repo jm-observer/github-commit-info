@@ -276,6 +276,7 @@ fn run_gui(workspace: PathBuf) -> Result<()> {
             modules::speech::commands::clean::speech_clean_recording,
             modules::speech::commands::clean::speech_pick_audio_file,
             modules::speech::commands::clean::speech_open_in_folder,
+            modules::speech::commands::samples::speech_fetch_segment_audio,
             modules::speech::commands::samples::speech_mark_sample,
             modules::speech::commands::samples::speech_list_samples,
             modules::speech::commands::samples::speech_export_samples,

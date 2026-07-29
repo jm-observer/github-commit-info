@@ -169,6 +169,9 @@ export const SpeechAPI = {
   getSettings: () => invoke<AppSettings>('speech_get_settings'),
   applySettings: (newSettings: AppSettings) =>
     invoke('speech_apply_settings', { newSettings }),
+  /** 试听某段识别的原始音频（base64 WAV）。服务端只保留 1 天，过期报错。 */
+  fetchSegmentAudio: (segmentId: number) =>
+    invoke<string>('speech_fetch_segment_audio', { segmentId }),
   markSample: (args: MarkSampleArgs) => invoke<Sample>('speech_mark_sample', args),
   listSamples: () => invoke<Sample[]>('speech_list_samples'),
   exportSamples: () => invoke<string>('speech_export_samples'),

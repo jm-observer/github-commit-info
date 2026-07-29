@@ -1,4 +1,4 @@
-import React, { useState } from 'react';
+import React, { useEffect, useRef, useState } from 'react';
 import { cn, stripYear } from '../utils';
 import type { Sample, SampleLabel, Segment } from '../api/tauri-client';
 import { SpeechAPI } from '../api/tauri-client';
@@ -60,6 +60,57 @@ export const SegmentCard: React.FC<SegmentCardProps> = ({
   const [markError, setMarkError] = useState('');
   const [marked, setMarked] = useState(false);
   const [markResult, setMarkResult] = useState<Sample | null>(null);
+  // 试听该段原始音频（判断到底是没说清还是识别错了）。音频在服务端只保留 1 天。
+  const [audioState, setAudioState] = useState<'idle' | 'loading' | 'playing'>('idle');
+  const [audioError, setAudioError] = useState('');
+  const audioRef = useRef<HTMLAudioElement | null>(null);
+  // base64 结果按卡片缓存，重播不重拉。
+  const audioB64Ref = useRef<string | null>(null);
+
+  // 卡片卸载时停掉还在播的音频。
+  useEffect(
+    () => () => {
+      audioRef.current?.pause();
+      audioRef.current = null;
+    },
+    []
+  );
+
+  const handleAudition = async () => {
+    if (audioState === 'playing') {
+      audioRef.current?.pause();
+      audioRef.current = null;
+      setAudioState('idle');
+      return;
+    }
+    if (audioState === 'loading') return;
+    setAudioError('');
+    try {
+      let b64 = audioB64Ref.current;
+      if (!b64) {
+        setAudioState('loading');
+        const segId = (segment.segment_id ?? segment.id) ?? 0;
+        b64 = await SpeechAPI.fetchSegmentAudio(segId);
+        audioB64Ref.current = b64;
+      }
+      const audio = new Audio(`data:audio/wav;base64,${b64}`);
+      audioRef.current = audio;
+      audio.onended = () => {
+        audioRef.current = null;
+        setAudioState('idle');
+      };
+      audio.onerror = () => {
+        audioRef.current = null;
+        setAudioState('idle');
+        setAudioError('播放失败');
+      };
+      await audio.play();
+      setAudioState('playing');
+    } catch (err) {
+      setAudioState('idle');
+      setAudioError(typeof err === 'string' ? err : (err as Error)?.message || String(err));
+    }
+  };
 
   const handleCopyZh = () => {
     onCopyChinese(segment.text_optimized || segment.text_raw);
@@ -159,7 +210,30 @@ export const SegmentCard: React.FC<SegmentCardProps> = ({
 
           <div className="flex-1" />
 
-          <div className="flex items-center gap-1 opacity-0 group-hover:opacity-100 transition-opacity">
+          <div
+            className={cn(
+              'flex items-center gap-1 transition-opacity',
+              // 播放中 / 加载中保持可见，避免按钮随 hover 消失后停不下来。
+              audioState === 'idle' && 'opacity-0 group-hover:opacity-100'
+            )}
+          >
+            <Button
+              variant="ghost"
+              size="sm"
+              className={cn(
+                'h-7 px-2 text-[11px] gap-1.5 transition-colors',
+                audioState === 'playing' && 'text-[var(--primary-deep)] bg-[var(--primary-soft)]'
+              )}
+              onClick={handleAudition}
+              title="试听这段识别的原始音频（服务端保留 1 天）"
+            >
+              <Icon
+                name={audioState === 'loading' ? 'refresh' : audioState === 'playing' ? 'stop' : 'play'}
+                size={12}
+                className={cn(audioState === 'loading' && 'animate-spin')}
+              />
+              {audioState === 'playing' ? '停止' : audioState === 'loading' ? '加载中' : '试听'}
+            </Button>
             <Button
               variant="ghost"
               size="sm"
@@ -233,6 +307,11 @@ export const SegmentCard: React.FC<SegmentCardProps> = ({
             </p>
           )}
         </div>
+
+        {/* 试听失败提示（音频过期 / 网络问题）。 */}
+        {audioError && (
+          <p className="text-[11px] text-[var(--danger)]">试听失败: {audioError}</p>
+        )}
 
         {/* 标注结果小字（保存成功后展示）。 */}
         {marked && markResult && !panelOpen && (

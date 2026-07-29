@@ -247,6 +247,41 @@ async fn sync_hotword_to_orchestrator(base: &str, correction: Option<&str>) -> S
     }
 }
 
+/// 试听：从编排器拉取该段音频，base64 返回给前端播放。**不落盘、不落库**——
+/// 与标注存档（`fetch_and_store_audio`）是两条线，这里只是「听一下再决定怎么标」。
+/// 编排器只保留 1 天内的音频 blob（每小时清理），过期 404 → 明确报「已过期」。
+#[tauri::command]
+pub async fn speech_fetch_segment_audio(
+    segment_id: i64,
+    state: State<'_, AppState>,
+) -> Result<String, String> {
+    let Some(base) = remote_http_base_from_state(&state.speech.remote_url) else {
+        return Err("远程识别地址未配置".to_string());
+    };
+    let url = format!("{base}/api/segments/{segment_id}/audio");
+    let client = reqwest::Client::builder()
+        .timeout(AUDIO_TIMEOUT)
+        .build()
+        .map_err(|e| format!("构建 HTTP 客户端失败: {e}"))?;
+    let resp = client
+        .get(&url)
+        .send()
+        .await
+        .map_err(|e| format!("拉取音频失败: {e}"))?;
+    match resp.status().as_u16() {
+        200 => {}
+        404 => return Err("音频已过期（服务端只保留 1 天）".to_string()),
+        other => return Err(format!("拉取音频失败: HTTP {other}")),
+    }
+    let bytes = resp
+        .bytes()
+        .await
+        .map_err(|e| format!("读取音频内容失败: {e}"))?;
+    info!(target: "speech", "[sample] audition seg={segment_id} ({} bytes)", bytes.len());
+    use base64::Engine;
+    Ok(base64::engine::general_purpose::STANDARD.encode(&bytes))
+}
+
 #[allow(clippy::too_many_arguments)]
 #[tauri::command]
 pub async fn speech_mark_sample(
