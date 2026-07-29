@@ -175,6 +175,9 @@ export const SpeechAPI = {
   markSample: (args: MarkSampleArgs) => invoke<Sample>('speech_mark_sample', args),
   listSamples: () => invoke<Sample[]>('speech_list_samples'),
   exportSamples: () => invoke<string>('speech_export_samples'),
+  /** 同音候选挖掘导出（P2a）：对纠错样本跑挖掘，写 JSON 供人工审读，返回文件路径。 */
+  exportHomophoneCandidates: () =>
+    invoke<string>('speech_export_homophone_candidates'),
   sceneStats: () => invoke<SceneStats>('speech_scene_stats'),
   openInFolder: (path: string) => invoke('speech_open_in_folder', { path }),
 };

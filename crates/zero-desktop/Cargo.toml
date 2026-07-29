@@ -59,6 +59,7 @@ rubato = "0.16"
 rtrb = "0.3"
 lofty = "0.24"
 crossbeam-channel = "0.5"
+pinyin = "0.11.0"
 
 [target.'cfg(windows)'.dependencies]
 windows-sys = { version = "0.59", features = [

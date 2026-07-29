@@ -604,6 +604,7 @@ export default function SpeechPage() {
   };
 
   const [exporting, setExporting] = useState(false);
+  const [exportingHomophone, setExportingHomophone] = useState(false);
 
   const handleExportSamples = async () => {
     setExporting(true);
@@ -615,6 +616,20 @@ export default function SpeechPage() {
       store.setErrorMessage(typeof err === 'string' ? err : (err as Error)?.message || String(err));
     } finally {
       setExporting(false);
+    }
+  };
+
+  // P2a：对纠错样本跑同音候选挖掘，导出 JSON 供人工审读（不建表、不改配置）。
+  const handleExportHomophone = async () => {
+    setExportingHomophone(true);
+    try {
+      const path = await SpeechAPI.exportHomophoneCandidates();
+      await SpeechAPI.openInFolder(path);
+    } catch (err) {
+      console.error('export homophone candidates failed', err);
+      store.setErrorMessage(typeof err === 'string' ? err : (err as Error)?.message || String(err));
+    } finally {
+      setExportingHomophone(false);
     }
   };
 
@@ -725,7 +740,16 @@ export default function SpeechPage() {
               onUpdateConfig={updateVoiceConfig}
             />
 
-            <div className="flex justify-end">
+            <div className="flex justify-end gap-1">
+              <button
+                onClick={handleExportHomophone}
+                disabled={exportingHomophone}
+                className="inline-flex items-center gap-1.5 h-7 px-2.5 text-[11px] rounded-md text-[var(--ink-4)] hover:text-[var(--ink-2)] hover:bg-[var(--bg-soft)] transition-colors disabled:opacity-50"
+                title="对纠错样本挖掘同音替换候选，导出 JSON 供人工审读（exact 级才可考虑入表）"
+              >
+                <Icon name={exportingHomophone ? 'refresh' : 'wand'} size={12} className={exportingHomophone ? 'animate-spin' : undefined} />
+                {exportingHomophone ? '挖掘中...' : '导出同音候选'}
+              </button>
               <button
                 onClick={handleExportSamples}
                 disabled={exporting}
