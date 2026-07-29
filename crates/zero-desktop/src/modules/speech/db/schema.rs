@@ -59,6 +59,33 @@ pub(crate) fn run_migrations(conn: &Connection) -> Result<()> {
             .with_context(|| format!("failed to run sqlite migration 0007 ({column} column)"))?;
         }
     }
+    // 0009：老库里这张表叫 speech_deliveries（改名前的名字）。必须赶在 0008 建表**之前**处理，
+    // 否则 IF NOT EXISTS 会先建出一张空的 speech_scenes，历史行永远留在旧表里成为孤儿。
+    // 见 migrations/0009_rename_speech_deliveries.sql。
+    if table_exists(conn, "speech_deliveries")? {
+        if table_exists(conn, "speech_scenes")? {
+            // 两表并存（先跑过新版、又退回老版写了旧表）：按列子集搬行，不带 id，交给自增避免
+            // 主键冲突；搬完删旧表，收敛到「旧表不存在」。
+            conn.execute_batch(
+                "INSERT INTO speech_scenes
+                   (session_id, segment_id, delivery_mode, content_kind, text, char_count,
+                    app_exe, app_path, app_title, app_class, delivered_at)
+                 SELECT session_id, segment_id, delivery_mode, content_kind, text, char_count,
+                        app_exe, app_path, app_title, app_class, delivered_at
+                 FROM speech_deliveries;
+                 DROP TABLE speech_deliveries;",
+            )
+            .context("failed to merge legacy speech_deliveries into speech_scenes")?;
+        } else {
+            // 旧索引名基于旧表名，留着会与 0008 以新名重建的同定义索引重复 —— 先删再改名。
+            conn.execute_batch(
+                "DROP INDEX IF EXISTS idx_speech_deliveries_time;
+                 DROP INDEX IF EXISTS idx_speech_deliveries_app_time;
+                 ALTER TABLE speech_deliveries RENAME TO speech_scenes;",
+            )
+            .context("failed to rename speech_deliveries to speech_scenes")?;
+        }
+    }
     // 0008：场景记录表（每次交付都记，与手动采集的 speech_samples 分开）。
     // 建表 + 索引都是 IF NOT EXISTS，幂等，无条件执行。
     let sql_0008 = include_str!("../../../../migrations/0008_speech_scenes.sql");
@@ -71,6 +98,17 @@ pub(crate) fn run_migrations(conn: &Connection) -> Result<()> {
             .context("failed to add speech_scenes.correction_sample_id")?;
     }
     Ok(())
+}
+
+fn table_exists(conn: &Connection, table: &str) -> Result<bool> {
+    let n: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = ?1",
+            [table],
+            |row| row.get(0),
+        )
+        .with_context(|| format!("failed to check table existence for {table}"))?;
+    Ok(n > 0)
 }
 
 fn column_exists(conn: &Connection, table: &str, column: &str) -> Result<bool> {
@@ -494,6 +532,145 @@ mod tests {
         assert!(t
             .iter()
             .any(|x| x.app_exe.as_deref() == Some("Code.exe") && x.app_title.is_none()));
+    }
+
+    /// 老库形态：改名前的 speech_deliveries（无 correction_sample_id、索引名带旧表名）。
+    fn make_legacy_deliveries(conn: &Connection) {
+        conn.execute_batch(
+            "DROP TABLE IF EXISTS speech_scenes;
+             CREATE TABLE speech_deliveries (
+               id            INTEGER PRIMARY KEY AUTOINCREMENT,
+               session_id    TEXT,
+               segment_id    INTEGER NOT NULL,
+               delivery_mode TEXT NOT NULL,
+               content_kind  TEXT NOT NULL,
+               text          TEXT NOT NULL,
+               char_count    INTEGER NOT NULL,
+               app_exe       TEXT,
+               app_path      TEXT,
+               app_title     TEXT,
+               app_class     TEXT,
+               delivered_at  TEXT NOT NULL
+             );
+             CREATE INDEX idx_speech_deliveries_time ON speech_deliveries(delivered_at);
+             CREATE INDEX idx_speech_deliveries_app_time
+               ON speech_deliveries(app_exe, delivered_at);
+             INSERT INTO speech_deliveries
+               (session_id, segment_id, delivery_mode, content_kind, text, char_count,
+                app_exe, app_title, delivered_at)
+             VALUES (NULL, 5, 'auto_paste', 'optimized_zh', '四个字啊', 4,
+                     'claude.exe', 'Claude', '2026-07-25 09:00:00');",
+        )
+        .unwrap();
+    }
+
+    fn index_exists(conn: &Connection, name: &str) -> bool {
+        let n: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type = 'index' AND name = ?1",
+                [name],
+                |r| r.get(0),
+            )
+            .unwrap();
+        n > 0
+    }
+
+    /// 0009：老库的 speech_deliveries 改名成 speech_scenes，历史行不丢、id 不变。
+    #[test]
+    fn migration_0009_renames_legacy_deliveries_table() {
+        let conn = Connection::open_in_memory().unwrap();
+        run_migrations(&conn).unwrap();
+        make_legacy_deliveries(&conn);
+
+        run_migrations(&conn).unwrap();
+
+        assert!(
+            !table_exists(&conn, "speech_deliveries").unwrap(),
+            "旧表应已消失"
+        );
+        assert!(column_exists(&conn, "speech_scenes", "correction_sample_id").unwrap());
+        // 旧索引名删干净，只留 0008 以新名重建的那套，避免同定义索引重复。
+        assert!(!index_exists(&conn, "idx_speech_deliveries_time"));
+        assert!(!index_exists(&conn, "idx_speech_deliveries_app_time"));
+        assert!(index_exists(&conn, "idx_speech_scenes_time"));
+
+        let s = repository::scene_stats(&conn, "2026-07-25").unwrap();
+        assert_eq!(s.total, 1, "改名前的历史行必须还在");
+        assert_eq!(s.total_chars, 4);
+        assert_eq!(s.top_apps[0].app_exe.as_deref(), Some("claude.exe"));
+        // id 原样保留（correction_sample_id 之类的外部引用不能错位）。
+        let id: i64 = conn
+            .query_row("SELECT id FROM speech_scenes", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(id, 1);
+
+        // 再跑一次：旧表已不存在，守卫整段跳过。
+        run_migrations(&conn).unwrap();
+        assert_eq!(
+            repository::scene_stats(&conn, "2026-07-25").unwrap().total,
+            1
+        );
+    }
+
+    /// 0009 的另一条路径：两表并存（跑过新版又退回老版）时按列子集合并，不留孤儿行。
+    #[test]
+    fn migration_0009_merges_when_both_tables_exist() {
+        use crate::modules::speech::db::repository::NewScene;
+
+        let conn = Connection::open_in_memory().unwrap();
+        run_migrations(&conn).unwrap();
+        repository::insert_scene(
+            &conn,
+            &NewScene {
+                session_id: None,
+                segment_id: 1,
+                delivery_mode: "auto_paste".into(),
+                content_kind: "optimized_zh".into(),
+                text: "两字".into(),
+                app: SampleAppContext::default(),
+                delivered_at: "2026-07-25 08:00:00".into(),
+            },
+        )
+        .unwrap();
+        // 新表保留，旁边再造一张老版写出来的旧表。
+        make_legacy_deliveries_keeping_scenes(&conn);
+
+        run_migrations(&conn).unwrap();
+
+        assert!(!table_exists(&conn, "speech_deliveries").unwrap());
+        let s = repository::scene_stats(&conn, "2026-07-25").unwrap();
+        assert_eq!(s.total, 2, "两边的行都在");
+        assert_eq!(s.total_chars, 2 + 4);
+        assert!(s
+            .top_apps
+            .iter()
+            .any(|a| a.app_exe.as_deref() == Some("claude.exe")));
+    }
+
+    /// 同 `make_legacy_deliveries`，但不删已有的 speech_scenes。
+    fn make_legacy_deliveries_keeping_scenes(conn: &Connection) {
+        conn.execute_batch(
+            "CREATE TABLE speech_deliveries (
+               id            INTEGER PRIMARY KEY AUTOINCREMENT,
+               session_id    TEXT,
+               segment_id    INTEGER NOT NULL,
+               delivery_mode TEXT NOT NULL,
+               content_kind  TEXT NOT NULL,
+               text          TEXT NOT NULL,
+               char_count    INTEGER NOT NULL,
+               app_exe       TEXT,
+               app_path      TEXT,
+               app_title     TEXT,
+               app_class     TEXT,
+               delivered_at  TEXT NOT NULL
+             );
+             INSERT INTO speech_deliveries
+               (session_id, segment_id, delivery_mode, content_kind, text, char_count,
+                app_exe, app_title, delivered_at)
+             VALUES (NULL, 5, 'auto_paste', 'optimized_zh', '四个字啊', 4,
+                     'claude.exe', 'Claude', '2026-07-25 09:00:00');",
+        )
+        .unwrap();
     }
 
     /// 老库（已有 0005/0006 但无 0007 列）重跑迁移应幂等补列，且不丢已有行。
