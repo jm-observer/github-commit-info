@@ -105,7 +105,10 @@ mod tests {
             ("class", &app.class),
         ] {
             if let Some(v) = value {
-                assert!(!v.is_empty(), "{name} 取到了空串，应为 None 而非 Some(\"\")");
+                assert!(
+                    !v.is_empty(),
+                    "{name} 取到了空串，应为 None 而非 Some(\"\")"
+                );
                 assert!(
                     !v.contains('\0'),
                     "{name} 含 NUL，说明按 UTF-16 长度截断有误: {v:?}"
