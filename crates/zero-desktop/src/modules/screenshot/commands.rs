@@ -376,10 +376,12 @@ pub struct HistoryItem {
     pub width: u32,
     /// 像素高（读 PNG 头，失败为 0）。
     pub height: u32,
+    /// 是否已收藏（来自 `index.json` sidecar）。收藏 = 永久保留。
+    pub starred: bool,
 }
 
 /// 命令：列出历史截图（`<workspace>/screenshots/*.png`，按修改时间新→旧）。
-/// 排除冻结帧临时文件与设置文件。
+/// 排除冻结帧临时文件与设置文件。收藏标记来自 `meta::load` 的 sidecar 索引。
 #[tauri::command]
 pub fn screenshot_list_history(app: AppHandle) -> Result<Vec<HistoryItem>, String> {
     let workspace = app.state::<AppState>().workspace.clone();
@@ -391,6 +393,7 @@ pub fn screenshot_list_history(app: AppHandle) -> Result<Vec<HistoryItem>, Strin
         Err(e) => return Err(format!("读取截图目录失败: {e}")),
     };
 
+    let index = super::meta::load(&workspace);
     let mut items = Vec::new();
     for entry in entries.flatten() {
         let path = entry.path();
@@ -421,6 +424,7 @@ pub fn screenshot_list_history(app: AppHandle) -> Result<Vec<HistoryItem>, Strin
             .map(|d| d.as_millis() as i64)
             .unwrap_or(0);
         let (width, height) = png_dimensions(&path).unwrap_or((0, 0));
+        let starred = index.is_starred(&name);
         items.push(HistoryItem {
             name,
             path: path.to_string_lossy().into_owned(),
@@ -428,6 +432,7 @@ pub fn screenshot_list_history(app: AppHandle) -> Result<Vec<HistoryItem>, Strin
             size: meta.len(),
             width,
             height,
+            starred,
         });
     }
     items.sort_by_key(|item| std::cmp::Reverse(item.modified_ms));
@@ -448,11 +453,32 @@ pub fn screenshot_open_folder(app: AppHandle) -> Result<(), String> {
 }
 
 /// 命令：删除一张历史截图（路径须在截图目录内，防越权删除）。
+/// 删文件成功后同步清掉 sidecar 里的元数据，避免索引堆积孤儿条目。
 #[tauri::command]
 pub fn screenshot_delete(app: AppHandle, path: String) -> Result<(), String> {
     let workspace = app.state::<AppState>().workspace.clone();
     let target = ensure_in_screenshots(&workspace, &path)?;
-    std::fs::remove_file(&target).map_err(|e| format!("删除失败: {e}"))
+    std::fs::remove_file(&target).map_err(|e| format!("删除失败: {e}"))?;
+    if let Some(name) = target.file_name().and_then(|s| s.to_str()) {
+        // 索引清理失败不影响「已删除」这个既成事实，仅告警。
+        if let Err(e) = super::meta::forget(&workspace, name) {
+            log::warn!(target: "screenshot", "清理截图索引失败: {e}");
+        }
+    }
+    Ok(())
+}
+
+/// 命令：设置/取消一张截图的收藏标记（路径须在截图目录内）。
+/// 收藏 = 永久保留，后续的自动清理不会碰它。
+#[tauri::command]
+pub fn screenshot_set_starred(app: AppHandle, path: String, starred: bool) -> Result<(), String> {
+    let workspace = app.state::<AppState>().workspace.clone();
+    let target = ensure_in_screenshots(&workspace, &path)?;
+    let name = target
+        .file_name()
+        .and_then(|s| s.to_str())
+        .ok_or_else(|| "非法文件名".to_string())?;
+    super::meta::set_starred(&workspace, name, starred)
 }
 
 /// 命令：把一张历史截图复制到剪贴板（路径须在截图目录内）。

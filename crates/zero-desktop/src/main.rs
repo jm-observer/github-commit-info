@@ -367,6 +367,7 @@ fn run_gui(workspace: PathBuf) -> Result<()> {
             modules::screenshot::screenshot_list_history,
             modules::screenshot::screenshot_open_folder,
             modules::screenshot::screenshot_delete,
+            modules::screenshot::screenshot_set_starred,
             modules::screenshot::screenshot_copy_to_clipboard,
             modules::screenshot::screenshot_reveal_in_folder,
             modules::screenshot::screenshot_save_as,

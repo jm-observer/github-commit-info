@@ -1,6 +1,6 @@
-import { useCallback, useEffect, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { invoke, convertFileSrc } from "@tauri-apps/api/core";
-import { Camera, FolderOpen, RefreshCw, Copy, Trash2, X, Settings as SettingsIcon, FolderSearch, Download } from "lucide-react";
+import { Camera, FolderOpen, RefreshCw, Copy, Trash2, X, Settings as SettingsIcon, FolderSearch, Download, Star, ChevronLeft, ChevronRight } from "lucide-react";
 
 interface HistoryItem {
   name: string;
@@ -9,7 +9,12 @@ interface HistoryItem {
   size: number;
   width: number;
   height: number;
+  /** 已收藏 = 永久保留。 */
+  starred: boolean;
 }
+
+/** 已收藏区折叠阈值：超过这个数量先只显示前 N 张，避免把「最近截图」挤出首屏。 */
+const STARRED_COLLAPSE = 12;
 
 interface ScreenshotSettings {
   hotkey: string;
@@ -28,9 +33,12 @@ export default function ScreenshotPage() {
   const [items, setItems] = useState<HistoryItem[]>([]);
   const [loading, setLoading] = useState(false);
   const [err, setErr] = useState<string | null>(null);
-  const [preview, setPreview] = useState<HistoryItem | null>(null);
+  // 预览上下文：打开预览时快照当前分区的路径序列 + 位置，用于上/下一张切换。
+  // 存 path 而非对象，收藏状态变化、列表刷新后仍能重新解析到最新的 item。
+  const [previewCtx, setPreviewCtx] = useState<{ paths: string[]; index: number } | null>(null);
   const [toast, setToast] = useState<string | null>(null);
   const [showSettings, setShowSettings] = useState(false);
+  const [starredExpanded, setStarredExpanded] = useState(false);
   const [settings, setSettings] = useState<ScreenshotSettings | null>(null);
   const [savingSettings, setSavingSettings] = useState(false);
 
@@ -61,6 +69,58 @@ export default function ScreenshotPage() {
   const flash = (msg: string) => {
     setToast(msg);
     window.setTimeout(() => setToast(null), 1800);
+  };
+
+  // 分区：收藏的永久保留，单独一段置顶；其余按时间倒序。
+  const starred = useMemo(() => items.filter((it) => it.starred), [items]);
+  const recent = useMemo(() => items.filter((it) => !it.starred), [items]);
+  // 「最近截图」再按天分组（收藏区是精选、量少，不分组，保持纯时间倒序）。
+  const recentGroups = useMemo(() => groupByDay(recent), [recent]);
+
+  /** 当前预览的图（按 path 从最新 items 里解析；已被删除则为 null）。 */
+  const preview = useMemo(() => {
+    if (!previewCtx) return null;
+    const path = previewCtx.paths[previewCtx.index];
+    return items.find((it) => it.path === path) ?? null;
+  }, [previewCtx, items]);
+
+  /** 打开预览：快照该分区的顺序，之后在这份快照里翻页。 */
+  const openPreview = (list: HistoryItem[], it: HistoryItem) => {
+    const paths = list.map((x) => x.path);
+    setPreviewCtx({ paths, index: Math.max(0, paths.indexOf(it.path)) });
+  };
+
+  /** 翻页（-1 上一张 / +1 下一张）。到头即停，不循环。 */
+  const step = useCallback((delta: number) => {
+    setPreviewCtx((ctx) => {
+      if (!ctx) return ctx;
+      const next = ctx.index + delta;
+      if (next < 0 || next >= ctx.paths.length) return ctx;
+      return { ...ctx, index: next };
+    });
+  }, []);
+
+  // 预览态下的键盘操作：← / → 翻页，Esc 关闭。
+  useEffect(() => {
+    if (!previewCtx) return;
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key === "Escape") setPreviewCtx(null);
+      else if (e.key === "ArrowLeft") step(-1);
+      else if (e.key === "ArrowRight") step(1);
+      else return;
+      e.preventDefault();
+    };
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  }, [previewCtx, step]);
+
+  // 滚轮翻页节流：一次滚动手势会连发几十个 wheel 事件，不节流会一口气翻到底。
+  const wheelAt = useRef(0);
+  const onWheel = (e: React.WheelEvent) => {
+    const now = Date.now();
+    if (now - wheelAt.current < 250) return;
+    wheelAt.current = now;
+    step(e.deltaY > 0 ? 1 : -1);
   };
 
   const capture = async () => {
@@ -122,16 +182,118 @@ export default function ScreenshotPage() {
     }
   };
 
+  /** 切换收藏。乐观更新（预览层按 path 解析，自动跟着变），失败回滚并提示。
+   *  预览态下改收藏不影响当前翻页序列——序列是打开时的快照。 */
+  const toggleStar = async (it: HistoryItem) => {
+    const next = !it.starred;
+    const apply = (starred: boolean) =>
+      setItems((arr) => arr.map((x) => (x.path === it.path ? { ...x, starred } : x)));
+    apply(next);
+    try {
+      await invoke("screenshot_set_starred", { path: it.path, starred: next });
+    } catch (e) {
+      apply(it.starred);
+      flash(`${next ? "收藏" : "取消收藏"}失败：${String(e)}`);
+    }
+  };
+
   const remove = async (it: HistoryItem) => {
     if (!window.confirm(`删除 ${it.name}？此操作不可恢复。`)) return;
     try {
       await invoke("screenshot_delete", { path: it.path });
       setItems((arr) => arr.filter((x) => x.path !== it.path));
-      if (preview?.path === it.path) setPreview(null);
+      // 预览序列里同步剔除：停留在同一位置（即原来的下一张），越界则退到上一张，空了就关闭。
+      setPreviewCtx((ctx) => {
+        if (!ctx) return ctx;
+        const at = ctx.paths.indexOf(it.path);
+        if (at < 0) return ctx;
+        const paths = ctx.paths.filter((p) => p !== it.path);
+        if (paths.length === 0) return null;
+        const shifted = at < ctx.index ? ctx.index - 1 : ctx.index;
+        const index = Math.min(shifted, paths.length - 1);
+        return { paths, index };
+      });
     } catch (e) {
       flash(`删除失败：${String(e)}`);
     }
   };
+
+  // 收藏多了先只显示两行，别把「最近截图」挤出首屏。
+  const visibleStarred = starredExpanded ? starred : starred.slice(0, STARRED_COLLAPSE);
+
+  /** 画廊卡片。`list` = 所在分区，决定放大后左右翻页的范围。 */
+  const renderCard = (it: HistoryItem, list: HistoryItem[]) => (
+    <div
+      key={it.path}
+      className="group relative overflow-hidden rounded-lg border border-gray-200 bg-gray-50 dark:border-gray-800 dark:bg-gray-900"
+    >
+      <button
+        onClick={() => openPreview(list, it)}
+        className="block aspect-video w-full overflow-hidden bg-[repeating-conic-gradient(#e5e7eb_0_25%,#f3f4f6_0_50%)] bg-[length:16px_16px]"
+        title="点击放大"
+      >
+        <img
+          src={convertFileSrc(it.path)}
+          alt={it.name}
+          className="h-full w-full object-contain"
+          loading="lazy"
+        />
+      </button>
+      {/* 收藏是高频动作，星标常驻显示，不藏在 hover 里 */}
+      <button
+        onClick={() => void toggleStar(it)}
+        title={it.starred ? "取消收藏" : "收藏（永久保留）"}
+        className={[
+          "absolute right-1.5 top-1.5 rounded-full p-1.5 transition-colors",
+          it.starred
+            ? "bg-black/40 text-yellow-400 hover:bg-black/60"
+            : "bg-black/25 text-white/70 hover:bg-black/50 hover:text-yellow-300",
+        ].join(" ")}
+      >
+        <Star size={15} fill={it.starred ? "currentColor" : "none"} />
+      </button>
+      <div className="flex items-center justify-between px-2 py-1.5">
+        <div className="min-w-0">
+          <div className="truncate text-xs text-gray-600 dark:text-gray-300" title={it.name}>
+            {it.name}
+          </div>
+          <div className="text-[10px] text-gray-400">
+            {it.width}×{it.height} · {fmtSize(it.size)}
+          </div>
+        </div>
+        <div className="flex shrink-0 gap-1 opacity-0 transition-opacity group-hover:opacity-100">
+          <button
+            onClick={() => void copy(it)}
+            title="复制到剪贴板"
+            className="rounded p-1 text-gray-500 hover:bg-gray-200 hover:text-blue-600 dark:hover:bg-gray-700"
+          >
+            <Copy size={15} />
+          </button>
+          <button
+            onClick={() => void saveAs(it)}
+            title="另存为…"
+            className="rounded p-1 text-gray-500 hover:bg-gray-200 hover:text-blue-600 dark:hover:bg-gray-700"
+          >
+            <Download size={15} />
+          </button>
+          <button
+            onClick={() => void reveal(it)}
+            title="在文件夹中显示"
+            className="rounded p-1 text-gray-500 hover:bg-gray-200 hover:text-blue-600 dark:hover:bg-gray-700"
+          >
+            <FolderSearch size={15} />
+          </button>
+          <button
+            onClick={() => void remove(it)}
+            title="删除"
+            className="rounded p-1 text-gray-500 hover:bg-gray-200 hover:text-red-600 dark:hover:bg-gray-700"
+          >
+            <Trash2 size={15} />
+          </button>
+        </div>
+      </div>
+    </div>
+  );
 
   return (
     <div className="mx-auto max-w-6xl">
@@ -315,80 +477,88 @@ export default function ScreenshotPage() {
           <p className="mt-2 text-sm">还没有截图，按 Ctrl+Alt+A 或点「立即截图」</p>
         </div>
       ) : (
-        <div className="grid grid-cols-2 gap-4 sm:grid-cols-3 lg:grid-cols-4">
-          {items.map((it) => (
-            <div
-              key={it.path}
-              className="group relative overflow-hidden rounded-lg border border-gray-200 bg-gray-50 dark:border-gray-800 dark:bg-gray-900"
-            >
-              <button
-                onClick={() => setPreview(it)}
-                className="block aspect-video w-full overflow-hidden bg-[repeating-conic-gradient(#e5e7eb_0_25%,#f3f4f6_0_50%)] bg-[length:16px_16px]"
-                title="点击放大"
-              >
-                <img
-                  src={convertFileSrc(it.path)}
-                  alt={it.name}
-                  className="h-full w-full object-contain"
-                  loading="lazy"
-                />
-              </button>
-              <div className="flex items-center justify-between px-2 py-1.5">
-                <div className="min-w-0">
-                  <div className="truncate text-xs text-gray-600 dark:text-gray-300" title={it.name}>
-                    {it.name}
-                  </div>
-                  <div className="text-[10px] text-gray-400">
-                    {it.width}×{it.height} · {fmtSize(it.size)}
-                  </div>
-                </div>
-                <div className="flex shrink-0 gap-1 opacity-0 transition-opacity group-hover:opacity-100">
+        <div className="space-y-6">
+          {/* 已收藏区：为空时整段不渲染，不留空标题 */}
+          {starred.length > 0 && (
+            <section>
+              <div className="mb-2 flex items-center justify-between">
+                <h2 className="flex items-center gap-1.5 text-sm font-medium text-gray-700 dark:text-gray-200">
+                  <Star size={15} className="text-yellow-500" fill="currentColor" />
+                  已收藏
+                  <span className="text-gray-400">({starred.length})</span>
+                  <span className="ml-1 text-xs font-normal text-gray-400">永久保留</span>
+                </h2>
+                {starred.length > STARRED_COLLAPSE && (
                   <button
-                    onClick={() => void copy(it)}
-                    title="复制到剪贴板"
-                    className="rounded p-1 text-gray-500 hover:bg-gray-200 hover:text-blue-600 dark:hover:bg-gray-700"
+                    onClick={() => setStarredExpanded((v) => !v)}
+                    className="text-xs text-blue-600 hover:underline dark:text-blue-400"
                   >
-                    <Copy size={15} />
+                    {starredExpanded ? "收起" : `展开全部 ${starred.length} 张`}
                   </button>
-                  <button
-                    onClick={() => void saveAs(it)}
-                    title="另存为…"
-                    className="rounded p-1 text-gray-500 hover:bg-gray-200 hover:text-blue-600 dark:hover:bg-gray-700"
-                  >
-                    <Download size={15} />
-                  </button>
-                  <button
-                    onClick={() => void reveal(it)}
-                    title="在文件夹中显示"
-                    className="rounded p-1 text-gray-500 hover:bg-gray-200 hover:text-blue-600 dark:hover:bg-gray-700"
-                  >
-                    <FolderSearch size={15} />
-                  </button>
-                  <button
-                    onClick={() => void remove(it)}
-                    title="删除"
-                    className="rounded p-1 text-gray-500 hover:bg-gray-200 hover:text-red-600 dark:hover:bg-gray-700"
-                  >
-                    <Trash2 size={15} />
-                  </button>
-                </div>
+                )}
               </div>
-            </div>
-          ))}
+              <div className="grid grid-cols-2 gap-4 sm:grid-cols-3 lg:grid-cols-4">
+                {visibleStarred.map((it) => renderCard(it, starred))}
+              </div>
+            </section>
+          )}
+
+          {/* 最近截图区（未收藏） */}
+          <section>
+            <h2 className="mb-2 flex items-center gap-1.5 text-sm font-medium text-gray-700 dark:text-gray-200">
+              最近截图
+              <span className="text-gray-400">({recent.length})</span>
+            </h2>
+            {recent.length === 0 ? (
+              <p className="rounded-lg border border-dashed border-gray-300 px-3 py-6 text-center text-sm text-gray-400 dark:border-gray-700">
+                没有未收藏的截图
+              </p>
+            ) : (
+              <div className="space-y-4">
+                {recentGroups.map((g) => (
+                  <div key={g.key}>
+                    <div className="mb-1.5 flex items-center gap-2 text-xs text-gray-400">
+                      <span>{g.label}</span>
+                      <span className="text-gray-300 dark:text-gray-600">{g.items.length}</span>
+                      <span className="h-px flex-1 bg-gray-200 dark:bg-gray-800" />
+                    </div>
+                    {/* 翻页序列仍是整个「最近截图」区：放大后能连续翻过日期边界 */}
+                    <div className="grid grid-cols-2 gap-4 sm:grid-cols-3 lg:grid-cols-4">
+                      {g.items.map((it) => renderCard(it, recent))}
+                    </div>
+                  </div>
+                ))}
+              </div>
+            )}
+          </section>
         </div>
       )}
 
-      {/* 放大预览 */}
-      {preview && (
+      {/* 放大预览：点图片以外任意处关闭；← / → 或滚轮上下切换 */}
+      {preview && previewCtx && (
         <div
           className="fixed inset-0 z-50 flex flex-col bg-black/80 p-6"
-          onClick={() => setPreview(null)}
+          onClick={() => setPreviewCtx(null)}
+          onWheel={onWheel}
         >
           <div className="mb-3 flex items-center justify-between text-white" onClick={(e) => e.stopPropagation()}>
             <span className="text-sm">
               {preview.name} · {preview.width}×{preview.height}
+              <span className="ml-2 text-white/60">
+                {previewCtx.index + 1} / {previewCtx.paths.length}
+              </span>
             </span>
             <div className="flex gap-2">
+              <button
+                onClick={() => void toggleStar(preview)}
+                className={[
+                  "flex items-center gap-1 rounded px-2 py-1 text-sm",
+                  preview.starred ? "bg-yellow-500/90 text-black hover:bg-yellow-400" : "bg-white/15 hover:bg-white/25",
+                ].join(" ")}
+              >
+                <Star size={15} fill={preview.starred ? "currentColor" : "none"} />{" "}
+                {preview.starred ? "已收藏" : "收藏"}
+              </button>
               <button
                 onClick={() => void copy(preview)}
                 className="flex items-center gap-1 rounded bg-white/15 px-2 py-1 text-sm hover:bg-white/25"
@@ -414,19 +584,46 @@ export default function ScreenshotPage() {
                 <Trash2 size={15} /> 删除
               </button>
               <button
-                onClick={() => setPreview(null)}
+                onClick={() => setPreviewCtx(null)}
                 className="flex items-center gap-1 rounded bg-white/15 px-2 py-1 text-sm hover:bg-white/25"
               >
                 <X size={15} /> 关闭
               </button>
             </div>
           </div>
-          <img
-            src={convertFileSrc(preview.path)}
-            alt={preview.name}
-            className="min-h-0 flex-1 object-contain"
-            onClick={(e) => e.stopPropagation()}
-          />
+
+          <div className="relative flex min-h-0 flex-1 items-center justify-center">
+            {previewCtx.index > 0 && (
+              <button
+                onClick={(e) => {
+                  e.stopPropagation();
+                  step(-1);
+                }}
+                title="上一张（←）"
+                className="absolute left-0 z-10 rounded-full bg-white/15 p-2 text-white hover:bg-white/30"
+              >
+                <ChevronLeft size={24} />
+              </button>
+            )}
+            <img
+              src={convertFileSrc(preview.path)}
+              alt={preview.name}
+              className="max-h-full max-w-full object-contain"
+              onClick={(e) => e.stopPropagation()}
+            />
+            {previewCtx.index < previewCtx.paths.length - 1 && (
+              <button
+                onClick={(e) => {
+                  e.stopPropagation();
+                  step(1);
+                }}
+                title="下一张（→）"
+                className="absolute right-0 z-10 rounded-full bg-white/15 p-2 text-white hover:bg-white/30"
+              >
+                <ChevronRight size={24} />
+              </button>
+            )}
+          </div>
         </div>
       )}
 
@@ -437,6 +634,34 @@ export default function ScreenshotPage() {
       )}
     </div>
   );
+}
+
+/** 当天 0 点的毫秒时间戳（本地时区）。 */
+function startOfDay(ms: number): number {
+  const d = new Date(ms);
+  return new Date(d.getFullYear(), d.getMonth(), d.getDate()).getTime();
+}
+
+/** 日期小标题：今天 / 昨天 / M月D日（跨年补年份）。 */
+function dayLabel(dayStart: number): string {
+  const today = startOfDay(Date.now());
+  if (dayStart === today) return "今天";
+  if (dayStart === today - 86400000) return "昨天";
+  const d = new Date(dayStart);
+  const md = `${d.getMonth() + 1}月${d.getDate()}日`;
+  return d.getFullYear() === new Date().getFullYear() ? md : `${d.getFullYear()}年${md}`;
+}
+
+/** 按天分组（输入已是时间倒序，分组后组间、组内都保持倒序）。 */
+function groupByDay(list: HistoryItem[]): { key: number; label: string; items: HistoryItem[] }[] {
+  const groups: { key: number; label: string; items: HistoryItem[] }[] = [];
+  for (const it of list) {
+    const key = startOfDay(it.modified_ms);
+    const last = groups[groups.length - 1];
+    if (last && last.key === key) last.items.push(it);
+    else groups.push({ key, label: dayLabel(key), items: [it] });
+  }
+  return groups;
 }
 
 function fmtSize(bytes: number): string {

@@ -60,6 +60,10 @@ rtrb = "0.3"
 lofty = "0.24"
 crossbeam-channel = "0.5"
 
+[dev-dependencies]
+# screenshot 元数据 sidecar 的单测：临时 workspace 目录
+tempfile = "3"
+
 [target.'cfg(windows)'.dependencies]
 windows-sys = { version = "0.59", features = [
     "Win32_Foundation",

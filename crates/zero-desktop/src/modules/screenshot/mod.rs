@@ -5,6 +5,7 @@
 //! 平台相关实现（`capture` / `monitor`）仅 Windows 编译；命令在所有平台注册（见 `commands`）。
 
 pub mod commands;
+pub mod meta;
 pub mod output;
 pub mod overlay;
 
