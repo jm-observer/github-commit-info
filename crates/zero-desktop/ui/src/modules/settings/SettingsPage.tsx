@@ -233,7 +233,7 @@ function G10ConfigSection() {
         icon={<Globe size={13} />}
         value={wanHost}
         onChange={setWanHost}
-        placeholder="www.for-memory.cloud:28080"
+        placeholder="spark.for-memory.site:38788"
         hint="只填外网域名（含反代端口）；https + wss、ASR 路径全部自动派生。"
       />
 

@@ -29,6 +29,7 @@
       "identifier": "http:allow-fetch",
       "allow": [
         { "url": "http://*:8788/*" },
+        { "url": "http://*:38788/*" },
         { "url": "https://*:28080/*" },
         { "url": "http://localhost:*" },
         { "url": "http://127.0.0.1:*" },

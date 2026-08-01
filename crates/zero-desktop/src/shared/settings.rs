@@ -21,8 +21,9 @@ const PROBE_TIMEOUT: Duration = Duration::from_millis(800);
 /// 探测结果缓存时长；保存配置 / 网络变化时通过 [`NetResolver::invalidate`] 主动失效。
 const PROBE_TTL: Duration = Duration::from_secs(30);
 
-/// 默认外网 host（含端口，与既有 G10 反代一致）。
-const DEFAULT_WAN_HOST: &str = "www.for-memory.cloud:28080";
+/// 默认外网 host（含端口，与 G10 上 english 持有的 Let's Encrypt 证书域名一致：
+/// SAN = `*.for-memory.site` / `for-memory.site`）。
+const DEFAULT_WAN_HOST: &str = "spark.for-memory.site:38788";
 
 /// 一种到达路径（局域网 / 外网）的协议与默认端口约定——**部署事实，非用户配置**。
 /// `host` 不含端口时补 `default_port`；含端口则原样用。
@@ -41,12 +42,22 @@ const LAN_SCHEME: NetScheme = NetScheme {
     ws: "ws",
     default_port: 8788,
 };
-/// 外网：反向代理发布端口 28080 + TLS https/wss。
+/// 外网：toolkit-server 的对外入口 38788，**纯端口映射到 G10 的 8788，没有 TLS 终止**，
+/// 所以协议是明文 http/ws（与 LAN 相同，仅端口不同）。english 不在这条路上——它有自己的
+/// 外网入口 [`ENGLISH_WAN_PORT`]（真证书 https）。
+///
+/// TODO：38788 前补 TLS 终止后，这里改回 https/wss。当前明文过公网，且 toolkit-server
+/// 尚无鉴权，`/api/web/*` 处于全裸状态。
 const WAN_SCHEME: NetScheme = NetScheme {
-    http: "https",
-    ws: "wss",
-    default_port: 28080,
+    http: "http",
+    ws: "ws",
+    default_port: 38788,
 };
+
+/// english 的外网入口端口——**独立于 toolkit-server 的外网入口**：38788 映射到 G10 的
+/// toolkit-server:8788，28080 仍是 english 自己（自持真证书）。故 WAN 下 english 端点须
+/// 用主机名 + 本端口重新拼，不能沿用 `g10_base`。
+const ENGLISH_WAN_PORT: u16 = 28080;
 
 /// ASR WebSocket 在 toolkit-server 下的挂载路径（orchestrator 并入后）。
 const ASR_PATH: &str = "/api/asr/stream";
@@ -78,7 +89,7 @@ pub struct AppSettings {
     /// 局域网 host（IP，可含 `:port`；不含端口则用 8788）。留空表示未配局域网。
     #[serde(default)]
     pub lan_host: String,
-    /// 外网 host（域名，可含 `:port`；不含端口则用 28080）。
+    /// 外网 host（域名，可含 `:port`；不含端口则用 38788）。
     #[serde(default = "default_wan_host")]
     pub wan_host: String,
     /// 可选 Bearer token（若 G10 server 启用了鉴权；内外网共用）。
@@ -229,7 +240,9 @@ impl ResolvedEndpoint {
     /// english 后端的可达 base。english 与 toolkit-server **不在一个进程**：
     /// - LAN：english 自签 HTTPS 直连会被 Tauri plugin-http 拒，须经 toolkit-server 的
     ///   `/api/english` 反代（明文 http :8788）。
-    /// - WAN：:28080 反代有真证书且按路径分流到 english，直接用 `g10_base` 即可。
+    /// - WAN：english 有**自己的对外入口** `https://<主机名>:28080`（真证书），与
+    ///   toolkit-server 的外网入口（38788 → G10:8788）是两个端口，所以不能直接用
+    ///   `g10_base`——须剥掉端口后拼 [`ENGLISH_WAN_PORT`]。
     ///
     /// 与 `english::english_get_g10_base`（前端 ApiService 用）派生口径一致。
     fn english_base(&self) -> Option<String> {
@@ -239,7 +252,11 @@ impl ResolvedEndpoint {
         let base = self.g10_base.trim_end_matches('/');
         Some(match self.picked {
             NetMode::Lan => format!("{base}/api/english"),
-            NetMode::Wan | NetMode::Auto => base.to_string(),
+            NetMode::Wan | NetMode::Auto => {
+                let no_scheme = base.split("://").last().unwrap_or(base);
+                let host = no_scheme.split(':').next().unwrap_or(no_scheme);
+                format!("https://{host}:{ENGLISH_WAN_PORT}")
+            }
         })
     }
 
@@ -452,11 +469,12 @@ mod tests {
     }
 
     #[test]
-    fn wan_host_derives_https_and_wss() {
+    fn wan_host_derives_http_and_ws() {
+        // 38788 是到 G10:8788 的纯端口映射，没有 TLS 终止 → 明文 http/ws。
         let s = AppSettings::default();
         let r = s.resolved(NetMode::Wan);
-        assert_eq!(r.g10_base, "https://www.for-memory.cloud:28080");
-        assert_eq!(r.asr_url, "wss://www.for-memory.cloud:28080/api/asr/stream");
+        assert_eq!(r.g10_base, "http://spark.for-memory.site:38788");
+        assert_eq!(r.asr_url, "ws://spark.for-memory.site:38788/api/asr/stream");
     }
 
     #[test]
@@ -473,12 +491,12 @@ mod tests {
                 .as_deref(),
             Some("http://192.168.1.100:8788/api/english/api/sentence/replace-audio")
         );
-        // WAN 直连 :28080 反代（按路径分流到 english），不加前缀。
+        // WAN 走 english 自己的对外入口 :28080（不是 toolkit-server 的 :38788），不加前缀。
         assert_eq!(
             s.resolved(NetMode::Wan)
                 .replace_sentence_audio_endpoint()
                 .as_deref(),
-            Some("https://www.for-memory.cloud:28080/api/sentence/replace-audio")
+            Some("https://spark.for-memory.site:28080/api/sentence/replace-audio")
         );
     }
 
