@@ -135,6 +135,18 @@ fn host_with_port(host: &str, default_port: u16) -> String {
     }
 }
 
+/// 给 WS URL 追加 `?token=`（已有 query 则用 `&`）。token 为空则原样返回。
+/// WS 握手带不了 `Authorization`，服务端 `toolkit_server::auth` 因此额外认 query。
+fn with_ws_token(url: &str, token: Option<&str>) -> String {
+    match token.map(str::trim).filter(|t| !t.is_empty()) {
+        None => url.to_string(),
+        Some(t) => {
+            let sep = if url.contains('?') { '&' } else { '?' };
+            format!("{url}{sep}token={t}")
+        }
+    }
+}
+
 impl AppSettings {
     fn host_for(&self, mode: NetMode) -> (&str, &NetScheme) {
         match mode {
@@ -145,21 +157,28 @@ impl AppSettings {
     }
 
     /// 按选定路径，从 host 派生运行时端点（g10_base + asr_url）。
+    ///
+    /// ASR 是 WebSocket，浏览器/webview 的 `WebSocket` 构造器无法设置请求头，所以 token
+    /// 只能进 query（服务端 `toolkit_server::auth` 对 Bearer 与 `?token=` 两种都认）。
     fn resolved(&self, picked: NetMode) -> ResolvedEndpoint {
         let (host, scheme) = self.host_for(picked);
         let hostport = host_with_port(host, scheme.default_port);
+        let token = self.g10_token.clone().filter(|s| !s.trim().is_empty());
         let (g10_base, asr_url) = if hostport.is_empty() {
             (String::new(), String::new())
         } else {
             (
                 format!("{}://{hostport}", scheme.http),
-                format!("{}://{hostport}{ASR_PATH}", scheme.ws),
+                with_ws_token(
+                    &format!("{}://{hostport}{ASR_PATH}", scheme.ws),
+                    token.as_deref(),
+                ),
             )
         };
         ResolvedEndpoint {
             g10_base,
             asr_url,
-            g10_token: self.g10_token.clone().filter(|s| !s.trim().is_empty()),
+            g10_token: token,
             picked,
         }
     }
@@ -219,12 +238,13 @@ impl ResolvedEndpoint {
 
     /// 跟读**流式**评测 WS 端点：`{g10_base}/api/web/shadow/stream`，scheme 换成 ws/wss。
     /// 桌面端 webview 直连(与 speech/voice 的 WS 同模式);消费 GOP 流式发音评测。
+    /// token 同 `asr_url` 走 query（WS 握手带不了 Authorization）。
     pub fn shadow_stream_endpoint(&self) -> Option<String> {
         let http = self.join("/api/web/shadow/stream")?;
-        Some(
-            http.replacen("https://", "wss://", 1)
-                .replacen("http://", "ws://", 1),
-        )
+        let ws = http
+            .replacen("https://", "wss://", 1)
+            .replacen("http://", "ws://", 1);
+        Some(with_ws_token(&ws, self.g10_token.as_deref()))
     }
 
     /// 公共大模型层端点 `{g10_base}/api/web/llm{path}`（`path` 以 `/` 开头，如 `/config`）。
@@ -548,6 +568,32 @@ mod tests {
         let raw = r#"{"g10_token":null}"#;
         let s = parse_app_settings(raw).unwrap();
         assert_eq!(s.wan_host, DEFAULT_WAN_HOST);
+    }
+
+    #[test]
+    fn ws_endpoints_carry_token_in_query() {
+        // WS 握手带不了 Authorization，token 必须进 query（服务端 auth 两种都认）。
+        let s = AppSettings {
+            lan_host: "192.168.1.100".to_string(),
+            g10_token: Some("tok".to_string()),
+            ..AppSettings::default()
+        };
+        let r = s.resolved(NetMode::Lan);
+        assert_eq!(
+            r.asr_url,
+            "ws://192.168.1.100:8788/api/asr/stream?token=tok"
+        );
+        assert_eq!(
+            r.shadow_stream_endpoint().as_deref(),
+            Some("ws://192.168.1.100:8788/api/web/shadow/stream?token=tok")
+        );
+        // 无 token 时不加 query。
+        let r = AppSettings {
+            lan_host: "192.168.1.100".to_string(),
+            ..AppSettings::default()
+        }
+        .resolved(NetMode::Lan);
+        assert_eq!(r.asr_url, "ws://192.168.1.100:8788/api/asr/stream");
     }
 
     #[test]

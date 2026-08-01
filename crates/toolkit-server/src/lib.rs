@@ -2,6 +2,7 @@
 
 pub mod audioforge;
 mod audiostore;
+pub mod auth;
 pub mod codeloop;
 pub mod config;
 #[path = "douyin/mod.rs"]
@@ -101,7 +102,18 @@ pub async fn serve_with_web(
     // 只在真正 serve 时 spawn —— bootstrap() 是同步装配、测试也复用它，不应带副作用。
     tokio::spawn(egress_sessions::run_reaper(state.egress_sessions.clone()));
 
-    let app = build_router(state, web_dir).nest("/api/asr", orchestrator::router(orch_ctx));
+    // 鉴权挂在最外层（含 nest 进来的 /api/asr）：未设 TOOLKIT_API_TOKEN 则整层放行。
+    if std::env::var(auth::TOKEN_ENV).is_ok_and(|v| !v.trim().is_empty()) {
+        log::info!("API 鉴权已启用（{}）", auth::TOKEN_ENV);
+    } else {
+        log::warn!(
+            "未设 {}，/api/* 无鉴权——公网暴露时务必配置",
+            auth::TOKEN_ENV
+        );
+    }
+    let app = build_router(state, web_dir)
+        .nest("/api/asr", orchestrator::router(orch_ctx))
+        .layer(axum::middleware::from_fn(auth::require_token));
     let listener = tokio::net::TcpListener::bind(bind)
         .await
         .with_context(|| format!("bind {bind}"))?;
