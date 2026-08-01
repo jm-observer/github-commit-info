@@ -4,7 +4,9 @@
 //! （音频在编排器只留 1 天，`GET {http_base}/api/segments/:id/audio`，过期 404）。
 //! 热词标签可选把「正确词」同步进编排器的 `asr.hotwords` 配置。
 //!
-//! 标签语义见 docs（asr_wrong / hotword / bad_optimize / ok / other）。
+//! 标签语义见 docs（asr_wrong / speaker_wrong / hotword / bad_optimize / ok / other）。
+//! `speaker_wrong` = 声纹把说话人认错（与 `asr_wrong` 的「文字识别错」正交）：
+//! `speaker` 列记被识别成的人，`correction` 记正确的人（可空，表示只知道错了）。
 
 use std::collections::HashSet;
 use std::time::Duration;
@@ -49,6 +51,7 @@ pub struct Sample {
     pub app_title: Option<String>,
     pub app_class: Option<String>,
     pub delivery_mode: Option<String>,
+    pub speaker: Option<String>,
 }
 
 impl From<SampleRow> for Sample {
@@ -75,6 +78,7 @@ impl From<SampleRow> for Sample {
             app_title: r.app_title,
             app_class: r.app_class,
             delivery_mode: r.delivery_mode,
+            speaker: r.speaker,
         }
     }
 }
@@ -260,6 +264,8 @@ pub async fn speech_mark_sample(
     correction: Option<String>,
     note: Option<String>,
     sync_hotword: Option<bool>,
+    // speaker: 该段被识别成的说话人（前端把卡片上的 speaker 原样带下来，未知传 None）。
+    speaker: Option<String>,
     state: State<'_, AppState>,
 ) -> Result<Sample, String> {
     let workspace = state.workspace.clone();
@@ -291,6 +297,7 @@ pub async fn speech_mark_sample(
         segment_ids: None,
         // 手工标注面板没有「交付动作」这一时刻，应用上下文留空（只有自动交付链路才抓拍）。
         app: Default::default(),
+        speaker,
     };
     let sample_id = db.insert_sample(new).await.map_err(|e| e.to_string())?;
 
@@ -390,6 +397,8 @@ pub async fn speech_export_samples(state: State<'_, AppState>) -> Result<String,
                 "text_secondary": r.text_secondary,
                 "correction": r.correction,
                 "note": r.note,
+                // 声纹标注：speaker = 被识别成的人，correction = 正确的人。
+                "speaker": r.speaker,
                 "audio_path": r.audio_path,
                 "audio_rel_path": audio_rel,
                 "audio_status": r.audio_status,

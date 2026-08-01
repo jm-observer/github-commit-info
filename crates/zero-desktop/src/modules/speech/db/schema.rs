@@ -59,6 +59,11 @@ pub(crate) fn run_migrations(conn: &Connection) -> Result<()> {
             .with_context(|| format!("failed to run sqlite migration 0007 ({column} column)"))?;
         }
     }
+    // 0008：标注时该段被识别成的说话人（声纹识别错误标注 speaker_wrong 的「错成谁」）。
+    if !column_exists(conn, "speech_samples", "speaker")? {
+        conn.execute_batch("ALTER TABLE speech_samples ADD COLUMN speaker TEXT;")
+            .context("failed to run sqlite migration 0008 (speaker column)")?;
+    }
     Ok(())
 }
 
@@ -105,6 +110,7 @@ mod tests {
                 "0007 column missing: {column}"
             );
         }
+        assert!(column_exists(&conn, "speech_samples", "speaker").unwrap());
 
         // 插入 → 列出 → 读回。
         let id = repository::insert_sample(
@@ -130,6 +136,7 @@ mod tests {
                     app_class: Some("Chrome_WidgetWin_1".into()),
                     delivery_mode: Some("auto_paste".into()),
                 },
+                speaker: None,
             },
         )
         .unwrap();
@@ -175,6 +182,7 @@ mod tests {
                 source: "copy".into(),
                 segment_ids: None,
                 app: SampleAppContext::default(),
+                speaker: None,
             },
         )
         .unwrap();
@@ -188,5 +196,40 @@ mod tests {
         // 无交付上下文时五列为空，不编造。
         assert!(rows[0].app_exe.is_none());
         assert!(rows[0].delivery_mode.is_none());
+        // 0008：未提供说话人时留空。
+        assert!(rows[0].speaker.is_none());
+    }
+
+    /// 0008：声纹识别错误样本的「错成谁 → 应该是谁」成对往返。
+    #[test]
+    fn speaker_wrong_sample_roundtrip() {
+        let conn = Connection::open_in_memory().unwrap();
+        run_migrations(&conn).unwrap();
+        let id = repository::insert_sample(
+            &conn,
+            &NewSample {
+                segment_id: 7,
+                session_id: None,
+                label: "speaker_wrong".into(),
+                text_raw: "Thank you.".into(),
+                text_optimized: None,
+                text_english: None,
+                text_secondary: None,
+                correction: Some("fengqi".into()),
+                note: None,
+                audio_status: "skipped".into(),
+                marked_at: "2026-07-30 19:41:46".into(),
+                source: "ui".into(),
+                segment_ids: None,
+                app: SampleAppContext::default(),
+                speaker: Some("guest-2".into()),
+            },
+        )
+        .unwrap();
+
+        let one = repository::get_sample(&conn, id).unwrap().unwrap();
+        assert_eq!(one.label, "speaker_wrong");
+        assert_eq!(one.speaker.as_deref(), Some("guest-2"));
+        assert_eq!(one.correction.as_deref(), Some("fengqi"));
     }
 }

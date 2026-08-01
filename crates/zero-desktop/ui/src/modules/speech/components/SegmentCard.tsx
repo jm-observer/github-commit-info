@@ -9,6 +9,8 @@ import { Switch } from './ui/Switch';
 
 const LABEL_OPTIONS: { label: string; value: SampleLabel }[] = [
   { label: '识别错误', value: 'asr_wrong' },
+  // 与「识别错误」正交：那个是文字识别错，这个是说话人认错（文字可能完全正确）。
+  { label: '声纹识别错误', value: 'speaker_wrong' },
   { label: '热词纠错', value: 'hotword' },
   { label: '优化不当', value: 'bad_optimize' },
   { label: '正常无需过滤', value: 'ok' },
@@ -99,12 +101,20 @@ export const SegmentCard: React.FC<SegmentCardProps> = ({
       setCorrection(segment.text_raw || '');
     } else if (next === 'bad_optimize') {
       setCorrection(segment.text_optimized || '');
-    } else if (next === 'hotword') {
+    } else {
+      // 声纹 / 热词 / ok / other：correction 语义变了（正确说话人 / 正确词 / 无），
+      // 残留的整段文本没有意义，清掉。
       setCorrection('');
     }
   };
 
-  const handleSaveMark = async () => {
+  // 落库一条样本。面板保存与顶部快捷按钮共用，差别只在传入的标签/纠正内容。
+  const submitMark = async (args: {
+    label: SampleLabel;
+    correction: string | null;
+    note: string | null;
+    syncHotword: boolean;
+  }) => {
     setSaving(true);
     setMarkError('');
     try {
@@ -115,10 +125,12 @@ export const SegmentCard: React.FC<SegmentCardProps> = ({
         textOptimized: segment.text_optimized ?? null,
         textEnglish: segment.text_english ?? null,
         textSecondary: segment.text_secondary ?? null,
-        label,
-        correction: label === 'ok' ? null : label === 'other' ? null : (correction || null),
-        note: label === 'other' ? (note || null) : null,
-        syncHotword: label === 'hotword' ? syncHotword : false,
+        label: args.label,
+        correction: args.correction,
+        note: args.note,
+        syncHotword: args.syncHotword,
+        // 说话人快照：任何标签都带，声纹样本靠它记「错成谁」。
+        speaker: segment.speaker ?? null,
       });
       setMarkResult(result);
       setMarked(true);
@@ -129,6 +141,24 @@ export const SegmentCard: React.FC<SegmentCardProps> = ({
       setSaving(false);
     }
   };
+
+  const handleSaveMark = () =>
+    submitMark({
+      label,
+      correction: label === 'ok' || label === 'other' ? null : (correction || null),
+      note: label === 'other' ? (note || null) : null,
+      syncHotword: label === 'hotword' ? syncHotword : false,
+    });
+
+  // 顶部快捷按钮：一键标「声纹识别错误」，不填正确说话人（只记「这段认错了」）。
+  // 想指明应该是谁，走标注面板选同一标签再填。
+  const handleQuickSpeakerWrong = () => {
+    setLabel('speaker_wrong');
+    setCorrection('');
+    return submitMark({ label: 'speaker_wrong', correction: null, note: null, syncHotword: false });
+  };
+
+  const speakerMarked = markResult?.label === 'speaker_wrong';
 
   const showSecondaryRow = showSecondary && !!segment.text_secondary;
 
@@ -185,6 +215,24 @@ export const SegmentCard: React.FC<SegmentCardProps> = ({
             <Button
               variant="ghost"
               size="sm"
+              className={cn(
+                'h-7 px-2 text-[11px] gap-1.5 transition-colors',
+                speakerMarked && 'text-[var(--primary-deep)]'
+              )}
+              disabled={saving}
+              onClick={handleQuickSpeakerWrong}
+              title={
+                segment.speaker
+                  ? `一键标注：声纹认错（当前识别为 ${segment.speaker}）`
+                  : '一键标注：声纹识别错误'
+              }
+            >
+              <Icon name={speakerMarked ? 'check' : 'user'} size={12} />
+              {speakerMarked ? '已标声纹错' : '声纹错'}
+            </Button>
+            <Button
+              variant="ghost"
+              size="sm"
               className={cn('h-7 px-2 text-[11px] gap-1.5 transition-colors', marked && 'text-[var(--primary-deep)]')}
               onClick={() => (panelOpen ? setPanelOpen(false) : openPanel())}
               title="标注样本"
@@ -234,12 +282,23 @@ export const SegmentCard: React.FC<SegmentCardProps> = ({
           )}
         </div>
 
+        {/* 快捷按钮失败时面板没开，错误也要看得见。 */}
+        {markError && !panelOpen && (
+          <p className="text-[11px] text-[var(--danger)]">标注失败: {markError}</p>
+        )}
+
         {/* 标注结果小字（保存成功后展示）。 */}
         {marked && markResult && !panelOpen && (
           <div className="flex flex-wrap items-center gap-2 text-[11px] text-[var(--ink-4)]">
             <span className="px-1.5 py-0.5 rounded bg-[var(--primary-soft)] text-[var(--primary-deep)]">
               已标注 · {LABEL_OPTIONS.find((o) => o.value === markResult.label)?.label || markResult.label}
             </span>
+            {markResult.label === 'speaker_wrong' && markResult.speaker && (
+              <span>
+                识别为 {markResult.speaker}
+                {markResult.correction ? ` → 应为 ${markResult.correction}` : ''}
+              </span>
+            )}
             <span>{AUDIO_STATUS_TEXT[markResult.audio_status] || markResult.audio_status}</span>
             {markResult.hotword_sync && (
               <span>{HOTWORD_SYNC_TEXT[markResult.hotword_sync] || markResult.hotword_sync}</span>
@@ -266,6 +325,20 @@ export const SegmentCard: React.FC<SegmentCardProps> = ({
                 rows={2}
                 className="w-full px-3 py-2 text-[13px] rounded-lg bg-[var(--bg-card)] border border-[var(--line)] text-[var(--ink-2)] resize-y focus:outline-none focus:border-[var(--primary)]"
               />
+            )}
+
+            {label === 'speaker_wrong' && (
+              <div className="flex flex-col gap-1.5">
+                <input
+                  value={correction}
+                  onChange={(e) => setCorrection(e.target.value)}
+                  placeholder="正确的说话人（不确定可留空，只记「这段认错了」）"
+                  className="w-full h-9 px-3 text-[13px] rounded-lg bg-[var(--bg-card)] border border-[var(--line)] text-[var(--ink-2)] focus:outline-none focus:border-[var(--primary)]"
+                />
+                <p className="text-[11px] text-[var(--ink-4)]">
+                  当前识别为 {segment.speaker || '（未识别到说话人）'}；文字识别错请另选「识别错误」。
+                </p>
+              </div>
             )}
 
             {label === 'bad_optimize' && (

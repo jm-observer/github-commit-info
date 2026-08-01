@@ -331,6 +331,8 @@ pub async fn run_capture_worker(
             audio_status: "skipped".to_string(),
             marked_at: now_str,
             app: app_ctx,
+            // 快捷键采集走的是文本纠错线，不关心说话人。
+            speaker: None,
         };
 
         let db_handle = mutex_lock(&db).clone();

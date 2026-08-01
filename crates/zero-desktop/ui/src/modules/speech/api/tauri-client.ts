@@ -82,7 +82,14 @@ export interface SegmentUpdatedEvent {
 
 // 音频清洗 API/类型已迁至 modules/audio-clean/api/clean-client.ts（CleanAPI）。
 
-export type SampleLabel = 'asr_wrong' | 'hotword' | 'bad_optimize' | 'ok' | 'other';
+// speaker_wrong = 声纹把说话人认错（与 asr_wrong 的「文字识别错」正交，同一段可能只错一个）。
+export type SampleLabel =
+  | 'asr_wrong'
+  | 'speaker_wrong'
+  | 'hotword'
+  | 'bad_optimize'
+  | 'ok'
+  | 'other';
 
 export interface Sample {
   id: number;
@@ -95,6 +102,8 @@ export interface Sample {
   text_secondary?: string | null;
   correction?: string | null;
   note?: string | null;
+  /** 标注时该段被识别成的说话人；speaker_wrong 下与 correction（正确的人）成对。 */
+  speaker?: string | null;
   audio_path?: string | null;
   audio_status: 'saved' | 'expired' | 'fetch_failed' | 'skipped' | string;
   hotword_sync?: 'added' | 'exists' | 'failed' | null;
@@ -114,6 +123,8 @@ export interface MarkSampleArgs extends Record<string, unknown> {
   correction?: string | null;
   note?: string | null;
   syncHotword?: boolean;
+  /** 卡片上当前识别到的说话人，原样带下去做快照（未知传 null）。 */
+  speaker?: string | null;
 }
 
 // All commands prefixed with speech_ to match zero-desktop backend naming.

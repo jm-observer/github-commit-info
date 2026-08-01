@@ -1,0 +1,12 @@
+-- 声纹识别错误标注（speaker_wrong）：记录标注时该段**被识别成的说话人**。
+--
+-- 与 `asr_wrong` 的区别：asr_wrong 是「文字识别错」（correction = 音频真实文本），
+-- speaker_wrong 是「说话人归属错」（correction = 正确的说话人，可留空表示只知道错了）。
+-- 两者正交，同一段可能只错一个。
+--
+-- 本列对所有标签都写（与 text_raw 一样是快照冗余），便于导出后直接看
+-- 「speaker → correction」这对，不必回表 join segments。
+--
+-- 实际 ALTER 语句在 db/schema.rs::run_migrations 里按列存在性守卫执行（沿用 0006/0007 的做法），
+-- 此文件仅作记录。
+ALTER TABLE speech_samples ADD COLUMN speaker TEXT;  -- 标注时该段被识别成的说话人（可空）

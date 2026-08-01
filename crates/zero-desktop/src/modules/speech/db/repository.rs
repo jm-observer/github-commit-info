@@ -34,6 +34,9 @@ pub struct SampleRow {
     pub app_class: Option<String>,
     /// 交付模式：`"auto_paste"` | `"auto_copy"`；手工标注或未开启自动交付时为 `None`。
     pub delivery_mode: Option<String>,
+    /// 标注时该段**被识别成的说话人**（快照冗余）。声纹识别错误（`speaker_wrong`）标注下，
+    /// 它与 `correction`（正确的说话人）成对，直接给出「错成谁 → 应该是谁」。
+    pub speaker: Option<String>,
 }
 
 /// 一次交付时的应用上下文（`speech_samples` 的 `app_*` / `delivery_mode` 五列）。
@@ -65,6 +68,8 @@ pub struct NewSample {
     pub segment_ids: Option<String>,
     /// 交付时的应用上下文；手工标注路径传 `Default::default()`。
     pub app: SampleAppContext,
+    /// 标注时该段被识别成的说话人；未知留 `None`。
+    pub speaker: Option<String>,
 }
 
 /// 插入一条样本，返回自增 id。`audio_path`/`hotword_sync` 暂为空，后续 update。
@@ -75,9 +80,10 @@ pub fn insert_sample(conn: &Connection, s: &NewSample) -> Result<i64> {
             text_english, text_secondary, correction, note,
             audio_path, audio_status, hotword_sync, marked_at,
             source, segment_ids,
-            app_exe, app_path, app_title, app_class, delivery_mode
+            app_exe, app_path, app_title, app_class, delivery_mode,
+            speaker
         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, NULL, ?10, NULL, ?11, ?12, ?13,
-                  ?14, ?15, ?16, ?17, ?18)",
+                  ?14, ?15, ?16, ?17, ?18, ?19)",
         params![
             s.segment_id,
             s.session_id,
@@ -97,6 +103,7 @@ pub fn insert_sample(conn: &Connection, s: &NewSample) -> Result<i64> {
             s.app.app_title,
             s.app.app_class,
             s.app.delivery_mode,
+            s.speaker,
         ],
     )
     .context("failed to insert speech sample")?;
@@ -151,6 +158,7 @@ fn row_to_sample(row: &rusqlite::Row<'_>) -> rusqlite::Result<SampleRow> {
         app_title: row.get(18)?,
         app_class: row.get(19)?,
         delivery_mode: row.get(20)?,
+        speaker: row.get(21)?,
     })
 }
 
@@ -158,7 +166,8 @@ const SAMPLE_COLS: &str = "id, segment_id, session_id, label, text_raw, text_opt
         text_english, text_secondary, correction, note,
         audio_path, audio_status, hotword_sync, marked_at,
         source, segment_ids,
-        app_exe, app_path, app_title, app_class, delivery_mode";
+        app_exe, app_path, app_title, app_class, delivery_mode,
+        speaker";
 
 /// 读取单条样本。
 pub fn get_sample(conn: &Connection, id: i64) -> Result<Option<SampleRow>> {
