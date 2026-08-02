@@ -42,21 +42,18 @@ const LAN_SCHEME: NetScheme = NetScheme {
     ws: "ws",
     default_port: 8788,
 };
-/// 外网：toolkit-server 的对外入口 38788，**纯端口映射到 G10 的 8788，没有 TLS 终止**，
-/// 所以协议是明文 http/ws（与 LAN 相同，仅端口不同）。english 不在这条路上——它有自己的
-/// 外网入口 [`ENGLISH_WAN_PORT`]（真证书 https）。
-///
-/// TODO：38788 前补 TLS 终止后，这里改回 https/wss。当前明文过公网，且 toolkit-server
-/// 尚无鉴权，`/api/web/*` 处于全裸状态。
+/// 外网：toolkit-server 的对外入口 38788 → G10 上 caddy 的 :8443（TLS 终止，用 acme.sh
+/// 续期的 `*.for-memory.site` 证书）→ 明文转 127.0.0.1:8788。故协议是 https/wss。
+/// english 不在这条路上——它有自己的外网入口 [`ENGLISH_WAN_PORT`]（自持同一份证书）。
 const WAN_SCHEME: NetScheme = NetScheme {
-    http: "http",
-    ws: "ws",
+    http: "https",
+    ws: "wss",
     default_port: 38788,
 };
 
-/// english 的外网入口端口——**独立于 toolkit-server 的外网入口**：38788 映射到 G10 的
-/// toolkit-server:8788，28080 仍是 english 自己（自持真证书）。故 WAN 下 english 端点须
-/// 用主机名 + 本端口重新拼，不能沿用 `g10_base`。
+/// english 的外网入口端口——**独立于 toolkit-server 的外网入口**：38788 走 caddy 到
+/// toolkit-server，28080 仍是 english 自己。故 WAN 下 english 端点须用主机名 + 本端口
+/// 重新拼，不能沿用 `g10_base`。
 const ENGLISH_WAN_PORT: u16 = 28080;
 
 /// ASR WebSocket 在 toolkit-server 下的挂载路径（orchestrator 并入后）。
@@ -489,12 +486,15 @@ mod tests {
     }
 
     #[test]
-    fn wan_host_derives_http_and_ws() {
-        // 38788 是到 G10:8788 的纯端口映射，没有 TLS 终止 → 明文 http/ws。
+    fn wan_host_derives_https_and_wss() {
+        // 38788 → caddy:8443 终止 TLS → 明文转 8788，故外网是 https/wss。
         let s = AppSettings::default();
         let r = s.resolved(NetMode::Wan);
-        assert_eq!(r.g10_base, "http://spark.for-memory.site:38788");
-        assert_eq!(r.asr_url, "ws://spark.for-memory.site:38788/api/asr/stream");
+        assert_eq!(r.g10_base, "https://spark.for-memory.site:38788");
+        assert_eq!(
+            r.asr_url,
+            "wss://spark.for-memory.site:38788/api/asr/stream"
+        );
     }
 
     #[test]
