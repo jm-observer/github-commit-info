@@ -5,14 +5,18 @@ edition.workspace = true
 
 [dependencies]
 egress-pool = { path = "../egress-pool" }
+# remote-exec 第一期执行内核（线格式 proto + PowerShell 执行器），见 crates/worker-core。
+worker-core = { workspace = true }
 # 代发出站请求;cookies 特性用于 per-session 自动 cookie jar(连续登录态)。
 reqwest = { workspace = true, features = ["cookies"] }
-tokio = { workspace = true, features = ["rt-multi-thread", "macros", "time", "signal", "net", "io-util"] }
+tokio = { workspace = true, features = ["rt-multi-thread", "macros", "time", "signal", "net", "io-util", "process", "sync"] }
 serde = { workspace = true }
 serde_json = { workspace = true }
 anyhow = { workspace = true }
 clap = { workspace = true, features = ["env"] }
 uuid = { workspace = true }
+# worker id 的稳定派生:sm3(物理网卡 MAC + 主机名)。
+sm3 = { workspace = true }
 log = { workspace = true }
 # Linux 守护进程能力:日志 + systemd 安装 + 自更新 + watchdog + trace。
 custom-utils = { workspace = true, features = ["updater", "trace"] }

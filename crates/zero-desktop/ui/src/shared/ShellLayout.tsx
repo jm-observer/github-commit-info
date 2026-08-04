@@ -1,6 +1,6 @@
 import { NavLink, Outlet, useLocation } from 'react-router-dom'
 import { useEffect, useState } from 'react'
-import { BookOpen, Mic, Wand2, Cookie, GitCompareArrows, MessageSquareText, MessagesSquare, Music, Rocket, Settings, Crop, Network } from 'lucide-react'
+import { BookOpen, Mic, Wand2, Cookie, GitCompareArrows, MessageSquareText, MessagesSquare, Music, Rocket, Settings, Crop, Network, ShieldCheck } from 'lucide-react'
 import { invoke } from '@tauri-apps/api/core'
 import { listen } from '@tauri-apps/api/event'
 import EnvConfigService from '../modules/english/services/EnvConfigService'
@@ -20,6 +20,7 @@ const navItems = [
   { to: '/screenshot', icon: Crop, label: '截图' },
   { to: '/g10-deploy', icon: Rocket, label: 'G10 部署' },
   { to: '/egress-workers', icon: Network, label: '出口 Worker' },
+  { to: '/exec-nodes', icon: ShieldCheck, label: '远程节点' },
   { to: '/settings', icon: Settings, label: '设置' },
 ]
 

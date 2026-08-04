@@ -10,7 +10,11 @@
 //! **豁免**（见 [`is_exempt`]）：
 //! - `OPTIONS`：CORS 预检不带 Authorization。
 //! - `/api/web/health`：桌面端 `auto` 模式靠它探测局域网可达性，必须先于鉴权可达。
-//! - `/api/internal/*`：有自己的 `x-egress-token` 中间件，不叠加。
+//! - `/api/internal/*`：有自己的 `x-egress-token` 中间件，不叠加（`/api/internal/exec/*`
+//!   同理，有自己的 per-worker secret 中间件）。
+//! - `/api/web/exec/*`：remote-exec 消费面只认独立的 `TOOLKIT_EXEC_TOKEN`（见
+//!   `exec::routes::exec_token_auth`），不叠加全局 `TOOLKIT_API_TOKEN`，避免调用方
+//!   要同时带两个 token。
 //! - 非 `/api` 路径：内嵌控制台的静态资源（HTML/JS/CSS 本身不含数据）。
 //!
 //! **已知影响**：一旦设了 token，浏览器打开的 web 控制台调 `/api/web/*` 会 401——
@@ -30,6 +34,7 @@ fn is_exempt(method: &Method, path: &str) -> bool {
     method == Method::OPTIONS
         || path == "/api/web/health"
         || path.starts_with("/api/internal")
+        || path.starts_with("/api/web/exec")
         || !path.starts_with("/api")
 }
 
@@ -91,6 +96,11 @@ mod tests {
         assert!(is_exempt(&Method::GET, "/hub.js"));
         // internal 有自己的 x-egress-token 中间件。
         assert!(is_exempt(&Method::POST, "/api/internal/egress/next"));
+        // exec 内部面有自己的 per-worker secret 中间件。
+        assert!(is_exempt(&Method::POST, "/api/internal/exec/register"));
+        // exec 消费面有自己的 TOOLKIT_EXEC_TOKEN 中间件，不叠加全局 token。
+        assert!(is_exempt(&Method::POST, "/api/web/exec/run"));
+        assert!(is_exempt(&Method::GET, "/api/web/exec/workers"));
         // CORS 预检不带 Authorization。
         assert!(is_exempt(&Method::OPTIONS, "/api/web/llm/config"));
     }

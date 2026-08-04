@@ -17,6 +17,7 @@ members = [
     "crates/egress-pool",
     "crates/egress-client",
     "crates/toolkit-worker",
+    "crates/worker-core",
     "crates/egress-tester",
 ]
 resolver = "2"
@@ -48,6 +49,7 @@ regex = "1"
 agent-session = { path = "crates/agent-session" }
 codeloop-core = { path = "crates/codeloop-core" }
 toolkit-llm = { path = "crates/toolkit-llm" }
+worker-core = { path = "crates/worker-core" }
 
 [profile.release]
 strip = true

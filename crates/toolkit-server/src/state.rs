@@ -19,4 +19,9 @@ pub struct AppState {
     /// 出口代理消费 HTTP 面(F4)的 session 存根:server 侧持有 `egress_pool::Session` guard,
     /// 外部进程经 `session_handle` 间接指挥。详见 [`crate::egress_sessions`]。
     pub egress_sessions: Arc<crate::egress_sessions::SessionStore>,
+    /// 远程执行(remote-exec)第一期调度器:per-worker 单任务槽,in-memory,进程内共享。
+    /// 与 `egress` 刻意独立(只共享 `worker_id` 概念),详见 [`crate::exec`]。
+    pub exec: Arc<crate::exec::Coordinator>,
+    /// remote-exec 集中审计:JSONL 落 `<workspace>/remote-exec/audit/`。
+    pub exec_audit: Arc<crate::exec::audit::AuditLog>,
 }

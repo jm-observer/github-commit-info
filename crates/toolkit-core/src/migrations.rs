@@ -13,6 +13,9 @@ pub fn migrate(pool: &SqlitePool) -> Result<()> {
     // 本仓无增量迁移框架，纯加列同 DDL 一样不 bump SCHEMA_VERSION。
     add_column_if_missing(&conn, "shadow_attempt", "detail_json", "TEXT")
         .context("add shadow_attempt.detail_json")?;
+    // 临时授权到期时间：存量库的 exec_worker_creds 建表时没这列（早期只有手工永久签发）。
+    add_column_if_missing(&conn, "exec_worker_creds", "expires_at", "INTEGER")
+        .context("add exec_worker_creds.expires_at")?;
 
     let current: Option<String> = conn
         .query_row(

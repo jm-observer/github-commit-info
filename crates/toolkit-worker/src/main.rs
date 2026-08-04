@@ -6,18 +6,21 @@
 //! per-session cookie:请求带 `session_id` 时用一个带 cookie jar 的独立 client(按 session_id
 //! 惰性建、复用),使同一 session 的登录态在多次请求间连续;匿名请求走无 cookie 的共享 client。
 //!
-//! 出口选择(F1):本机可能有多个网卡/网关(如「直连」和「VPN」)。`--local-address`(或环境变量
-//! `EGRESS_LOCAL_ADDRESS`)指定代发流量绑定的本地源 IP —— 源 IP 决定实际走哪个网关。该选项作用于
-//! 所有**代发**client(`anon` / per-session)以及出口 IP 探测(`detect_egress_ip`),但**不**作用于
-//! 连 controller 的 `ctrl` client(controller 可能在另一网段,绑定会导致连不通)。不传则行为与之前
-//! 完全一致(不绑定,走系统默认路由)。
+//! **零参数运行**:身份(MAC 派生的稳定 id)、controller、凭据全部落在 workspace
+//! (`~/.config/toolkit-worker/`,见 [`config`])。首次 `run` 会自行派生 id、提交远程执行
+//! 权限申请,并停在「等待批准」——你在 zero-desktop 面板批准 N 小时后它自动继续
+//! (见 [`identity`])。凭据到期时回到同一条路续期,进程不退出。
 //!
-//! 出口选择(F2,仅 Linux):`--interface <name>`(或环境变量 `EGRESS_INTERFACE`)按网卡名绑定
-//! (`SO_BINDTODEVICE`,`reqwest` 的 `ClientBuilder::interface`),比 `--local-address` 更贴近
-//! 「就是要走这张网卡」的语义,且能绑定没有固定 IP 的网卡。**该方法只有 Linux/Android 才有**——
-//! 本 crate 在 Windows 开发机上也要能编译,所以所有 `.interface(..)` 调用都 `#[cfg(target_os =
-//! "linux")]` 包起来,非 Linux 分支打印警告并忽略。`--interface` 与 `--local-address` 可以同传
-//! (两者都会被调用,不冲突),`--interface` 优先级更高(语义上更精确)。
+//! 两个面共用 `worker_id`,其余完全独立:
+//!
+//! - **egress 面**(借出口):`/api/internal/egress/*`,共享 token,可并发代发。
+//! - **exec 面**(远程排查):`/api/internal/exec/*`,per-worker 临时凭据,单任务。
+//!
+//! 出口选择(历史包袱,**实测只有 Linux 有效**):`--local-address` 绑本地源 IP、
+//! `--interface` 绑网卡名(`SO_BINDTODEVICE`)。后者只有 Linux/Android 有,故整个参数
+//! 只在 Linux 编译进 CLI;前者在 Windows 上绑非默认路由网卡会直接发不出包(实测每个
+//! 非默认网卡的探测全部失败),所以**别指望在 Windows 上靠它换出口**——换出口走
+//! net-policy(已拆独立仓)。
 //!
 //! 正经 Linux 守护进程:复用 `custom-utils` 的日志 + systemd 安装(rootless `systemctl --user`)+
 //! 自更新 + watchdog + trace 能力(见 `linux_service()`),形态照抄 `toolkit-server`。
@@ -30,8 +33,12 @@ use log::LevelFilter::Info;
 use std::collections::HashMap;
 use std::net::IpAddr;
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 use tokio::sync::Mutex;
+
+mod config;
+mod exec;
+mod identity;
 
 /// 长轮询请求的客户端超时(> controller 端 25s 挂起上限)。
 const LONG_POLL_TIMEOUT: Duration = Duration::from_secs(40);
@@ -68,28 +75,36 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Command {
-    /// 启动 worker(register → 心跳 → 长轮询代发)。
+    /// 启动 worker。**零参数即可**:身份、controller、凭据全部读 workspace 配置
+    /// (`~/.config/toolkit-worker/`);首次启动会自动派生 id 并提交权限申请,等你在
+    /// zero-desktop 面板批准后自动继续。下面这些参数只是临时覆盖,平时不用传。
     Run {
-        /// controller 基址,如 http://127.0.0.1:8788
+        /// controller 基址覆盖(默认读配置,配置也没有则用内置外网入口)。
         #[arg(long, env = "EGRESS_CONTROLLER")]
-        controller: String,
-        /// 共享鉴权 token(须与 controller 的 EGRESS_WORKER_TOKEN 一致;为空则不带)
-        #[arg(long, env = "EGRESS_WORKER_TOKEN", default_value = "")]
-        token: String,
-        /// worker id 持久化文件(重启保持同一 id → cookie 绑定可复用)
-        #[arg(long, default_value = "egress-worker-id")]
-        id_file: String,
-        /// 出口 IP 覆盖(默认启动时探测 https://api.ipify.org)
+        controller: Option<String>,
+        /// 人类可读名,面板上用它认机器(默认取主机名);传了会写进配置。
+        #[arg(long)]
+        label: Option<String>,
+        /// 出口代理(egress)面的共享 token 覆盖。
+        #[arg(long, env = "EGRESS_WORKER_TOKEN")]
+        token: Option<String>,
+        /// 关闭远程命令执行面,只跑出口代理。
+        #[arg(long, default_value_t = false)]
+        no_exec: bool,
+        /// 出口 IP 覆盖(默认启动时探测 https://api.ipify.org)。
         #[arg(long)]
         egress_ip: Option<String>,
-        /// 代发流量绑定的本地源 IP(决定走哪个网关;不传则不绑定,走系统默认路由)
+        /// 代发流量绑定的本地源 IP。**高级选项,实际只在 Linux 有意义**:Windows 上绑非
+        /// 默认路由网卡的源 IP 会直接发不出包(实测),换出口请改用 net-policy。
         #[arg(long, env = "EGRESS_LOCAL_ADDRESS")]
         local_address: Option<IpAddr>,
-        /// 代发流量绑定的网卡名(`SO_BINDTODEVICE`,仅 Linux;与 --local-address 可并存,
-        /// 优先级更高)。非 Linux 传了此项会打印警告并忽略。
+        /// 代发流量绑定的网卡名(`SO_BINDTODEVICE`)。仅 Linux 提供该参数。
+        #[cfg(target_os = "linux")]
         #[arg(long, env = "EGRESS_INTERFACE")]
         interface: Option<String>,
     },
+    /// 打印本机状态:workspace 路径、id/label、凭据剩余有效期、controller 连通性。
+    Status,
     /// 安装为 systemd 用户级服务(rootless,`~/.local/bin` + `~/.config/toolkit-worker`)。
     Install {
         #[arg(long, short = 'n', help = "只打印渲染后的 unit 不真正安装")]
@@ -119,17 +134,10 @@ enum Command {
         #[arg(short, long, help = "即使版本未升级也强制更新")]
         force: bool,
     },
-    /// 列出本机网卡 IP,辅助挑选 `run --local-address <IP>`。
+    /// 列出本机网卡 IP,辅助挑选 `run --local-address <IP>`。仅 Linux 提供
+    /// (Windows 上源 IP 绑定选不了出口,这个清单没有意义)。
+    #[cfg(target_os = "linux")]
     List,
-    /// 扫描本机可用出口网卡 + ping controller 候选,打印可直接复制运行的 `run` 命令。
-    Scan {
-        /// controller 基址,可重复传多个一起探测;总会额外并入内置默认候选。
-        #[arg(long)]
-        controller: Vec<String>,
-        /// 共享鉴权 token;不传则取环境变量 `EGRESS_WORKER_TOKEN`,都没有则命令里填占位符。
-        #[arg(long)]
-        token: Option<String>,
-    },
     /// 启动 HTTP 转发代理:浏览器/App 把代理指向它,流量就从本 worker 的出口发出
     /// (整体换 IP 场景,如 THS headless Chrome、手机 App)。支持 `CONNECT`(HTTPS 隧道)
     /// 与明文 HTTP(absolute-form)两种请求。
@@ -316,76 +324,6 @@ impl Worker {
     }
 }
 
-/// 读取 `path` 里已有的非空 id;不存在/为空返回 `None`(不写文件,交给上层决定写什么)。
-fn read_existing_id(path: &str) -> Option<String> {
-    let s = std::fs::read_to_string(path).ok()?;
-    let s = s.trim().to_string();
-    if s.is_empty() {
-        None
-    } else {
-        Some(s)
-    }
-}
-
-/// 取网卡 MAC 地址的规范化短串(去冒号、转小写),拿不到则 `None`。
-fn mac_suffix(interface: &str) -> Option<String> {
-    match mac_address::mac_address_by_name(interface) {
-        Ok(Some(mac)) => Some(mac.to_string().replace(':', "").to_lowercase()),
-        _ => None,
-    }
-}
-
-/// 按 `local_address` 反查其所属网卡名(`if_addrs` 枚举匹配),找不到则 `None`。
-fn interface_name_for_ip(ip: IpAddr) -> Option<String> {
-    if_addrs::get_if_addrs()
-        .ok()?
-        .into_iter()
-        .find(|i| i.ip() == ip)
-        .map(|i| i.name)
-}
-
-/// 派生/加载 worker id,优先级:
-///
-/// 1. `id_file` 里已有非空 id → 直接用(重启保持同一 id,cookie 绑定可复用)。
-/// 2. 否则若指定了 `--interface <name>` → `w-{name}-{mac}`(mac 拿不到则退化 `w-{name}`)。
-/// 3. 否则若指定了 `--local-address <ip>` → 反查所属网卡取 mac → `w-{ip}-{mac}`
-///    (网卡名/mac 任一拿不到则退化 `w-{ip}`)。
-/// 4. 都没有 → 退回随机 `w_<uuid>` 并持久化到 `id_file`。
-///
-/// 分支 2/3 派生出的 id 会写回 `id_file`(下次重启命中分支 1,保持稳定)。
-fn resolve_worker_id(
-    id_file: &str,
-    interface: Option<&str>,
-    local_address: Option<IpAddr>,
-) -> Result<String> {
-    if let Some(id) = read_existing_id(id_file) {
-        return Ok(id);
-    }
-
-    let derived = if let Some(name) = interface {
-        Some(match mac_suffix(name) {
-            Some(mac) => format!("w-{name}-{mac}"),
-            None => format!("w-{name}"),
-        })
-    } else {
-        local_address.map(|ip| {
-            match interface_name_for_ip(ip)
-                .and_then(|name| mac_suffix(&name).map(|mac| (name, mac)))
-            {
-                Some((_, mac)) => format!("w-{ip}-{mac}"),
-                None => format!("w-{ip}"),
-            }
-        })
-    };
-
-    let id = match derived {
-        Some(id) => id,
-        None => format!("w_{}", uuid::Uuid::new_v4()),
-    };
-    std::fs::write(id_file, &id).with_context(|| format!("write worker id file {id_file}"))?;
-    Ok(id)
-}
-
 async fn detect_egress_ip(local: Option<IpAddr>, interface: Option<&str>) -> Option<String> {
     let mut builder = reqwest::Client::builder().timeout(Duration::from_secs(10));
     if let Some(ip) = local {
@@ -404,33 +342,205 @@ async fn detect_egress_ip(local: Option<IpAddr>, interface: Option<&str>) -> Opt
     Some(text.trim().to_string())
 }
 
-/// `run` 子命令:register → 心跳 → 长轮询代发主循环。实际网络逻辑与升级前一字不改。
-async fn run_worker(
-    controller: String,
-    token: String,
-    id_file: String,
+/// 提前多久视为「已过期」——留出续期余量,避免正好在执行任务时凭据到点。
+const EXPIRY_SLACK_SECS: i64 = 60;
+
+/// 取一份可用的 exec 凭据：本地有且没过期就直接用；否则走「申请 → 等你在面板批准」。
+///
+/// **不会因为没凭据就退出进程**：对方机器上跑的是常驻进程,卡在等待批准是正常状态,
+/// 期间出口代理面照常工作。
+async fn ensure_credential(
+    paths: &config::Paths,
+    cfg: &config::WorkerConfig,
+    controller: &str,
+) -> Result<config::StoredSecret> {
+    let now = toolkit_now();
+    if let Some(s) = config::load_secret(&paths.secret)? {
+        if !s.is_expired(now, EXPIRY_SLACK_SECS) {
+            match s.expires_at {
+                Some(exp) => log::info!("[exec] 已有凭据,剩余 {} 分钟", (exp - now) / 60),
+                None => log::info!("[exec] 已有长期凭据(无到期时间)"),
+            }
+            return Ok(s);
+        }
+        log::warn!("[exec] 凭据已过期,重新申请授权");
+    }
+
+    let client = reqwest::Client::new();
+    let fresh = identity::acquire_credential(&client, controller, cfg).await?;
+    config::save_secret(&paths.secret, &fresh)?;
+    if let Some(exp) = fresh.expires_at {
+        log::info!(
+            "[exec] 已获批准,有效期至 unix {exp}(约 {} 分钟)",
+            (exp - toolkit_now()) / 60
+        );
+    }
+    Ok(fresh)
+}
+
+/// 当前 unix 秒。
+fn toolkit_now() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0)
+}
+
+/// `status` 子命令:一屏看完本机状态(路径 / 身份 / 凭据剩余 / controller 连通性)。
+async fn run_status() -> Result<()> {
+    let paths = config::Paths::resolve()?;
+    let cfg = config::load(&paths.config)?;
+    println!("workspace : {}", paths.root.display());
+    println!(
+        "配置文件  : {} {}",
+        paths.config.display(),
+        if paths.config.exists() {
+            ""
+        } else {
+            "(尚未生成,首次 run 时创建)"
+        }
+    );
+    println!(
+        "worker id : {}",
+        if cfg.worker_id.is_empty() {
+            format!("(尚未派生,预计为 {})", identity::derive_id())
+        } else {
+            cfg.worker_id.clone()
+        }
+    );
+    println!(
+        "label     : {}",
+        if cfg.label.is_empty() {
+            identity::hostname()
+        } else {
+            cfg.label.clone()
+        }
+    );
+    println!("controller: {}", cfg.controller);
+    println!(
+        "远程执行  : {}",
+        if cfg.allow_exec { "启用" } else { "关闭" }
+    );
+
+    match config::load_secret(&paths.secret)? {
+        None => println!("凭据      : 无(下次 run 会自动申请)"),
+        Some(s) => {
+            let now = toolkit_now();
+            match s.expires_at {
+                None => println!("凭据      : 长期有效(手工签发)"),
+                Some(exp) if exp > now => {
+                    println!("凭据      : 有效,剩余 {} 分钟", (exp - now) / 60)
+                }
+                Some(_) => println!("凭据      : 已过期(下次 run 会自动重新申请)"),
+            }
+        }
+    }
+
+    let url = format!("{}/api/web/health", cfg.controller.trim_end_matches('/'));
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(5))
+        .build()?;
+    match client.get(&url).send().await {
+        Ok(r) if r.status().is_success() => println!("controller: 可达 (HTTP {})", r.status()),
+        Ok(r) => println!("controller: 不可达 (HTTP {})", r.status()),
+        Err(e) => println!("controller: 不可达 ({e})"),
+    }
+    Ok(())
+}
+
+/// `run` 子命令的覆盖项(全部可选;不传就用配置里的值)。
+#[derive(Default)]
+struct RunOverrides {
+    controller: Option<String>,
+    label: Option<String>,
+    token: Option<String>,
+    no_exec: bool,
     egress_ip: Option<String>,
     local_address: Option<IpAddr>,
     interface: Option<String>,
-) -> Result<()> {
+}
+
+/// `run` 子命令:读配置 →(缺凭据就申请并等批准)→ register → 心跳 → 长轮询主循环。
+///
+/// **零参数可跑**:身份、controller、凭据全在 workspace 里。首次启动的完整路径是
+/// 「派生 id → 写配置 → 提交申请 → 每 10s 轮询 → 你在面板批准 → 落凭据 → 进主循环」;
+/// 凭据过期时同样回到这条路续期,进程不退出(见 [`identity::acquire_credential`])。
+async fn run_worker(ov: RunOverrides) -> Result<()> {
     // systemd watchdog 心跳(Type=notify 需要 READY=1;非 systemd 环境下自动 no-op)。
     let _watchdog = linux_service().spawn_watchdog();
 
-    if interface.is_some() && cfg!(not(target_os = "linux")) {
-        log::warn!("接口绑定仅 Linux 支持,已忽略 --interface");
+    // ---------- 配置：加载 → 合并覆盖 → 补齐身份 → 回写 ----------
+    let paths = config::Paths::resolve()?;
+    paths.ensure_dir()?;
+    let mut cfg = config::load(&paths.config)?;
+    let mut dirty = false;
+    if let Some(c) = ov.controller {
+        let c = c.trim_end_matches('/').to_string();
+        if cfg.controller != c {
+            cfg.controller = c;
+            dirty = true;
+        }
+    }
+    if let Some(t) = ov.token {
+        cfg.egress_token = t;
+        dirty = true;
+    }
+    if ov.no_exec && cfg.allow_exec {
+        cfg.allow_exec = false;
+        dirty = true;
+    }
+    if ov.egress_ip.is_some() {
+        cfg.egress_ip = ov.egress_ip.clone();
+        dirty = true;
+    }
+    if ov.local_address.is_some() {
+        cfg.local_address = ov.local_address.map(|ip| ip.to_string());
+        dirty = true;
+    }
+    if ov.interface.is_some() {
+        cfg.interface = ov.interface.clone();
+        dirty = true;
+    }
+    dirty |= identity::ensure_identity(&mut cfg, ov.label.as_deref());
+    if dirty {
+        config::save(&paths.config, &cfg)?;
     }
 
-    let controller = controller.trim_end_matches('/').to_string();
-    let worker_id = resolve_worker_id(&id_file, interface.as_deref(), local_address)?;
-    let egress_ip = match egress_ip {
+    let controller = cfg.controller.trim_end_matches('/').to_string();
+    let worker_id = cfg.worker_id.clone();
+    let token = cfg.egress_token.clone();
+    let local_address: Option<IpAddr> = cfg.local_address.as_deref().and_then(|s| s.parse().ok());
+    let interface = cfg.interface.clone();
+    if interface.is_some() && cfg!(not(target_os = "linux")) {
+        log::warn!("网卡绑定仅 Linux 支持,已忽略配置里的 interface");
+    }
+    log::info!(
+        "workspace={} id={worker_id} label={} controller={controller}",
+        paths.root.display(),
+        cfg.label
+    );
+
+    // ---------- exec 凭据：没有 / 已过期就地申请，等你在面板批准 ----------
+    let exec_secret = if cfg.allow_exec {
+        exec::validate_exec_controller(&controller)
+            .context("exec 面 controller 传输安全校验失败")?;
+        Some(ensure_credential(&paths, &cfg, &controller).await?)
+    } else {
+        log::info!("配置里 allow_exec=false:只跑出口代理,不启用远程命令执行面");
+        None
+    };
+
+    // exec 面用的 controller/worker_id 副本:下面 `Worker` 结构体会把 egress 面的
+    // `controller` 移进去,exec 面循环是完全独立的任务,需要自己的一份。
+    let exec_controller = controller.clone();
+    let exec_worker_id = worker_id.clone();
+    let egress_ip = match cfg.egress_ip.clone() {
         Some(ip) => ip,
         None => detect_egress_ip(local_address, interface.as_deref())
             .await
             .unwrap_or_else(|| "unknown".to_string()),
     };
-    log::info!(
-        "id={worker_id} egress_ip={egress_ip} controller={controller} local_address={local_address:?} interface={interface:?}"
-    );
+    log::info!("egress_ip={egress_ip} local_address={local_address:?} interface={interface:?}");
 
     let mut anon_builder = reqwest::Client::builder();
     if let Some(ip) = local_address {
@@ -490,6 +600,24 @@ async fn run_worker(
         });
     }
 
+    // exec 面(remote-exec 第一期):独立 task 跑,与上面 egress 面互不干扰;
+    // 配置里 allow_exec=false 时完全不 spawn。
+    if let Some(secret) = exec_secret {
+        let root = paths.exec_root.clone();
+        log::info!("[exec] 已启用远程命令执行面,工作根目录={root:?}");
+        tokio::spawn(async move {
+            let opts = exec::ExecOpts {
+                controller: exec_controller,
+                secret: secret.secret,
+                worker_id: exec_worker_id,
+                root,
+            };
+            if let Err(e) = exec::run_exec_loop(opts).await {
+                log::error!("[exec] exec 循环异常退出: {e:#}");
+            }
+        });
+    }
+
     // 主循环:长轮询取活儿 → 代发 → 回传。
     let next_path = format!("/egress/next?worker_id={worker_id}");
     loop {
@@ -535,203 +663,6 @@ async fn run_worker(
             }
         }
     }
-}
-
-/// `list-egress` 子命令:枚举本机网卡 IPv4 地址,辅助挑选 `--local-address`。
-fn list_egress() -> Result<()> {
-    let ifaces = if_addrs::get_if_addrs().context("枚举本机网卡失败")?;
-    println!("本机可用出口(源 IP)——挑一个传给 `run --local-address <IP>`:");
-    for iface in ifaces {
-        let IpAddr::V4(ip) = iface.ip() else {
-            continue; // 只列 IPv4,--local-address 场景够用
-        };
-        if iface.is_loopback() {
-            println!("  {}\t{ip}\t[loopback,一般不用]", iface.name);
-        } else {
-            println!("  {}\t{ip}", iface.name);
-        }
-    }
-    Ok(())
-}
-
-/// 内置 controller 候选(局域网常见地址),`scan` 时与用户传入的 `--controller` 并集探测。
-const DEFAULT_CONTROLLERS: &[&str] = &["http://127.0.0.1:8788", "http://192.168.0.68:8788"];
-
-/// `scan` 子命令:一步选出「哪个 controller 能连 + 哪张网卡当出口」,打印可直接复制的 `run` 命令。
-///
-/// 分三段:1) 并集去重后逐个 ping controller 候选的 `/api/web/health`;2) 枚举本机非回环
-/// IPv4 网卡,逐个探测其外网出口 IP(Linux 用 `--interface` 绑定,非 Linux 退化用
-/// `--local-address` 近似)、算建议 id、按外网 IP 去重(重复出口只保留第一个);
-/// 3) 打印三段人类可读的报告 + 可直接复制运行的 `run` 命令。
-async fn run_scan(controllers: Vec<String>, token: Option<String>) -> Result<()> {
-    // ---------- 1. controller 候选:并集去重(保留首次出现顺序)+ 逐个 ping ----------
-    let mut candidates: Vec<String> = Vec::new();
-    for c in controllers
-        .into_iter()
-        .chain(DEFAULT_CONTROLLERS.iter().map(|s| s.to_string()))
-    {
-        let c = c.trim_end_matches('/').to_string();
-        if !candidates.contains(&c) {
-            candidates.push(c);
-        }
-    }
-
-    println!("=== controller 候选(一起 ping) ===");
-    let ping_client = reqwest::Client::builder()
-        .timeout(Duration::from_secs(3))
-        .build()
-        .context("build ping client")?;
-    let mut reachable: Option<String> = None;
-    for url in &candidates {
-        let health_url = format!("{url}/api/web/health");
-        let start = Instant::now();
-        match ping_client.get(&health_url).send().await {
-            Ok(resp) if resp.status().is_success() => {
-                let ms = start.elapsed().as_millis();
-                println!("  ✓ {url}\thealth ok ({ms}ms)");
-                if reachable.is_none() {
-                    reachable = Some(url.clone());
-                }
-            }
-            Ok(resp) => {
-                println!("  ✗ {url}\tHTTP {}", resp.status().as_u16());
-            }
-            Err(e) => {
-                let desc = if e.is_timeout() {
-                    "超时".to_string()
-                } else {
-                    e.to_string()
-                };
-                println!("  ✗ {url}\t{desc}");
-            }
-        }
-    }
-    let chosen_controller = match &reachable {
-        Some(url) => {
-            println!("  → 下面命令用 {url}");
-            url.clone()
-        }
-        None => {
-            let fallback = candidates
-                .first()
-                .cloned()
-                .unwrap_or_else(|| DEFAULT_CONTROLLERS[0].to_string());
-            println!("  均不可达,默认使用第一个候选,请检查 controller 是否在运行 → {fallback}");
-            fallback
-        }
-    };
-
-    let token_str = token
-        .or_else(|| std::env::var("EGRESS_WORKER_TOKEN").ok())
-        .filter(|t| !t.is_empty());
-    let token_display = token_str.as_deref().unwrap_or("<TOKEN>");
-
-    // ---------- 2. 枚举出口网卡,探测各自的外网出口 IP + 建议 id ----------
-    println!();
-    println!("=== 出口接口 ===");
-    println!("  接口\t源IP\t\t外网出口IP\t建议 id");
-
-    struct IfaceProbe {
-        name: String,
-        source_ip: IpAddr,
-        egress: Result<String, String>,
-        suggested_id: String,
-    }
-
-    let ifaces = if_addrs::get_if_addrs().context("枚举本机网卡失败")?;
-    let mut probes: Vec<IfaceProbe> = Vec::new();
-    for iface in &ifaces {
-        if iface.is_loopback() {
-            continue;
-        }
-        let IpAddr::V4(v4) = iface.ip() else {
-            continue; // 只看 IPv4
-        };
-        if v4.octets()[0] == 169 && v4.octets()[1] == 254 {
-            continue; // link-local,跳过
-        }
-        let ip = IpAddr::V4(v4);
-
-        let mut builder = reqwest::Client::builder().timeout(Duration::from_secs(8));
-        #[cfg(target_os = "linux")]
-        {
-            builder = apply_interface(builder, Some(iface.name.as_str()));
-        }
-        #[cfg(not(target_os = "linux"))]
-        {
-            builder = builder.local_address(ip);
-        }
-        let egress = match builder.build() {
-            Ok(c) => match c.get("https://api.ipify.org").send().await {
-                Ok(resp) => match resp.text().await {
-                    Ok(text) => Ok(text.trim().to_string()),
-                    Err(e) => Err(format!("探测失败:{e}")),
-                },
-                Err(e) => Err(format!("探测失败:{e}")),
-            },
-            Err(e) => Err(format!("探测失败:{e}")),
-        };
-
-        let suggested_id = match mac_suffix(&iface.name) {
-            Some(mac) => format!("w-{}-{mac}", iface.name),
-            None => format!("w-{}", iface.name),
-        };
-
-        probes.push(IfaceProbe {
-            name: iface.name.clone(),
-            source_ip: ip,
-            egress,
-            suggested_id,
-        });
-    }
-
-    // 按外网 IP 去重:外网IP -> 首个使用它的接口名。
-    let mut first_owner: HashMap<String, String> = HashMap::new();
-    let mut notes: Vec<String> = Vec::new();
-    let mut usable: Vec<&IfaceProbe> = Vec::new();
-    for p in &probes {
-        match &p.egress {
-            Ok(ip) => {
-                if let Some(owner) = first_owner.get(ip) {
-                    println!(
-                        "  {}\t{}\t{ip}\t(与 {owner} 同出口,跳过)",
-                        p.name, p.source_ip
-                    );
-                    notes.push(format!("{} 外网IP与 {owner} 相同 = 同出口", p.name));
-                } else {
-                    println!("  {}\t{}\t{ip}\t{}", p.name, p.source_ip, p.suggested_id);
-                    first_owner.insert(ip.clone(), p.name.clone());
-                    usable.push(p);
-                }
-            }
-            Err(e) => {
-                println!("  {}\t{}\t{e}\t-", p.name, p.source_ip);
-                notes.push(format!("{} 探测失败", p.name));
-            }
-        }
-    }
-    if !notes.is_empty() {
-        println!("  (跳过:lo 回环;{})", notes.join(";"));
-    } else {
-        println!("  (跳过:lo 回环)");
-    }
-
-    // ---------- 3. 打印可复制运行的命令 ----------
-    println!();
-    println!("=== 挑一个,复制运行 ===");
-    if usable.is_empty() {
-        println!("  (没有可用的出口网卡,无法生成命令)");
-    }
-    for p in &usable {
-        let egress_ip = p.egress.as_deref().unwrap_or("?");
-        println!("  # {} → 出口 {egress_ip}", p.name);
-        println!(
-            "  toolkit-worker run --controller {chosen_controller} --token {token_display} --interface {}",
-            p.name
-        );
-    }
-
-    Ok(())
 }
 
 /// 在出站 `TcpSocket` 上按平台绑定网卡(`SO_BINDTODEVICE`,仅 Linux)。非 Linux 分支静默跳过
@@ -986,22 +917,29 @@ async fn main() -> Result<()> {
     match cli.command {
         Command::Run {
             controller,
+            label,
             token,
-            id_file,
+            no_exec,
             egress_ip,
             local_address,
+            #[cfg(target_os = "linux")]
             interface,
         } => {
-            run_worker(
+            run_worker(RunOverrides {
                 controller,
+                label,
                 token,
-                id_file,
+                no_exec,
                 egress_ip,
                 local_address,
+                #[cfg(target_os = "linux")]
                 interface,
-            )
+                #[cfg(not(target_os = "linux"))]
+                interface: None,
+            })
             .await
         }
+        Command::Status => run_status().await,
         Command::Install {
             dry_run,
             workspace,
@@ -1046,8 +984,8 @@ async fn main() -> Result<()> {
                 .context("自更新失败")?;
             Ok(())
         }
+        #[cfg(target_os = "linux")]
         Command::List => list_egress(),
-        Command::Scan { controller, token } => run_scan(controller, token).await,
         Command::Proxy {
             listen,
             interface,

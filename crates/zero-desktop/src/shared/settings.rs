@@ -92,6 +92,13 @@ pub struct AppSettings {
     /// 可选 Bearer token（若 G10 server 启用了鉴权；内外网共用）。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub g10_token: Option<String>,
+    /// 远程执行（remote-exec）专用 token，对应 G10 的 `TOOLKIT_EXEC_TOKEN`。
+    ///
+    /// **刻意与 [`Self::g10_token`] 分开**：批准一台机器 = 授予在它上面执行任意命令的
+    /// 权限，这条链路的安全边界比普通 API 高一档，不能因为配了 g10_token 就顺带获得。
+    /// 未配置时「远程节点」页只提示去填，不会退化到全局 token。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub exec_token: Option<String>,
 }
 
 impl Default for AppSettings {
@@ -102,6 +109,7 @@ impl Default for AppSettings {
             lan_host: String::new(),
             wan_host: default_wan_host(),
             g10_token: None,
+            exec_token: None,
         }
     }
 }
@@ -176,6 +184,7 @@ impl AppSettings {
             g10_base,
             asr_url,
             g10_token: token,
+            exec_token: self.exec_token.clone().filter(|s| !s.trim().is_empty()),
             picked,
         }
     }
@@ -188,6 +197,8 @@ pub struct ResolvedEndpoint {
     pub g10_base: String,
     pub asr_url: String,
     pub g10_token: Option<String>,
+    /// 远程执行专用 token（`TOOLKIT_EXEC_TOKEN`）；与 `g10_token` 分开，见 [`AppSettings::exec_token`]。
+    pub exec_token: Option<String>,
     pub picked: NetMode,
 }
 
@@ -254,6 +265,11 @@ impl ResolvedEndpoint {
         self.join("/api/web/egress/workers")
     }
 
+    /// 远程执行消费面 `{g10_base}/api/web/exec{path}`（`path` 以 `/` 开头）。
+    pub fn exec_endpoint(&self, path: &str) -> Option<String> {
+        self.join(&format!("/api/web/exec{path}"))
+    }
+
     /// english 后端的可达 base。english 与 toolkit-server **不在一个进程**：
     /// - LAN：english 自签 HTTPS 直连会被 Tauri plugin-http 拒，须经 toolkit-server 的
     ///   `/api/english` 反代（明文 http :8788）。
@@ -317,6 +333,10 @@ fn parse_app_settings(raw: &str) -> Result<AppSettings, serde_json::Error> {
         .get("g10_token")
         .and_then(|t| t.as_str())
         .map(str::to_string);
+    let exec_token = value
+        .get("exec_token")
+        .and_then(|t| t.as_str())
+        .map(str::to_string);
 
     let (lan_host, wan_host) = if value.get("lan").is_some() || value.get("wan").is_some() {
         // schema 2：lan/wan 各有 g10_base。
@@ -350,6 +370,7 @@ fn parse_app_settings(raw: &str) -> Result<AppSettings, serde_json::Error> {
         lan_host,
         wan_host,
         g10_token,
+        exec_token,
     })
 }
 

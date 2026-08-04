@@ -296,18 +296,22 @@ pub async fn g10_deploy(
     // `-Bind` 作兜底，env 里的同名 `<SERVICE>_BIND` 后置覆盖之）。
     // 用逗号分隔（PowerShell `[string[]]` 数组的 `-File` 传参约定），故 value 不应含逗号。
     // 脚本已显式带 `-Env` 时不重复追加（registry args 优先）。
+    //
+    // **值为空的条目整条跳过**，不注入 `KEY=`：有些变量的语义是「未配置 = 关闭该能力」
+    // （如 toolkit-server 的 `TOOLKIT_EXEC_TOKEN`，未配置时 `/api/web/exec/*` 根本不挂载），
+    // 面板留空就该等于「没有这一条」。install 每次重写整份 unit，故省略即移除。
     let mut deploy_args = deploy.args.clone();
-    if !svc.env.is_empty() {
+    let env_pairs: Vec<String> = svc
+        .env
+        .iter()
+        .filter(|e| !e.key.trim().is_empty() && !e.value.trim().is_empty())
+        .map(|e| format!("{}={}", e.key, e.value))
+        .collect();
+    if !env_pairs.is_empty() {
         let has_env = deploy_args.iter().any(|a| a.eq_ignore_ascii_case("-Env"));
         if !has_env {
-            let joined = svc
-                .env
-                .iter()
-                .map(|e| format!("{}={}", e.key, e.value))
-                .collect::<Vec<_>>()
-                .join(",");
             deploy_args.push("-Env".into());
-            deploy_args.push(joined);
+            deploy_args.push(env_pairs.join(","));
         }
     }
 

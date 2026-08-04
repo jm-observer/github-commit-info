@@ -1,0 +1,13 @@
+[package]
+name = "worker-core"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+serde = { workspace = true }
+serde_json = { workspace = true }
+anyhow = { workspace = true }
+tokio = { workspace = true, features = ["rt-multi-thread", "macros", "time", "process", "io-util", "fs", "sync"] }
+log = { workspace = true }
+sm3 = { workspace = true }
+chrono = { workspace = true }

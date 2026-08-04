@@ -69,6 +69,14 @@ enum Command {
         force: bool,
     },
 
+    /// remote-exec 第一期:管理 worker 的 exec 专用凭据（见 docs/remote-exec-design.md §4.2）。
+    /// 遵守仓库 stdout 契约:每个动作只输出一行紧凑 JSON;业务失败输出
+    /// `{error, error_kind}` 且退出码 0。
+    ExecCred {
+        #[command(subcommand)]
+        action: ExecCredAction,
+    },
+
     /// 内部：后台下载 worker。由 douyin 库 spawn（current_exe），勿手动调。
     #[command(hide = true)]
     DownloadWorker {
@@ -93,6 +101,93 @@ enum Command {
         #[arg(long)]
         task_id: String,
     },
+}
+
+/// `exec-cred` 子命令：签发 / 吊销 / 列出 remote-exec worker 凭据。每个动作独立带
+/// `--workspace`（与 `serve` 一致的解析优先级：显式参数 > env > 默认），因为这条命令
+/// 通常是脱离 daemon 单独跑的一次性操作，不共享 `Serve` 的运行时状态。
+#[derive(Subcommand, Debug)]
+enum ExecCredAction {
+    /// 签发（或重新签发）一个 worker 的凭据，明文 secret 只在此刻输出一次。
+    Add {
+        #[arg(long)]
+        worker_id: String,
+        #[arg(long, env = "TOOLKIT_WORKSPACE")]
+        workspace: Option<PathBuf>,
+    },
+    /// 吊销一个 worker 的凭据（拒绝后续领取任务/回传结果，不等于杀掉正在跑的进程）。
+    Revoke {
+        #[arg(long)]
+        worker_id: String,
+        #[arg(long, env = "TOOLKIT_WORKSPACE")]
+        workspace: Option<PathBuf>,
+    },
+    /// 列出全部凭据概览（不含 secret/hash）。
+    List {
+        #[arg(long, env = "TOOLKIT_WORKSPACE")]
+        workspace: Option<PathBuf>,
+    },
+}
+
+/// 打开（必要时创建）`<workspace>/toolkit.db` 连接池，供 `exec-cred` 独立于 `serve`
+/// 单独调用。
+fn open_exec_cred_pool(workspace: Option<PathBuf>) -> Result<toolkit_core::SqlitePool> {
+    let ws = match workspace {
+        Some(p) => p,
+        None => workspace_dir()?,
+    };
+    std::fs::create_dir_all(&ws).with_context(|| format!("create workspace {}", ws.display()))?;
+    let pool = toolkit_core::open_pool(&ws.join("toolkit.db"))?;
+    toolkit_core::migrate(&pool)?;
+    Ok(pool)
+}
+
+/// 单行紧凑 JSON 输出（仓库 stdout 契约）。
+fn print_json(v: serde_json::Value) {
+    println!("{v}");
+}
+
+/// 业务失败：`{error, error_kind}`，退出码仍是 0（仅进程级异常才非 0，见仓库约定）。
+fn print_business_error(kind: &str, err: impl std::fmt::Display) {
+    print_json(serde_json::json!({ "error": err.to_string(), "error_kind": kind }));
+}
+
+fn run_exec_cred(action: ExecCredAction) {
+    match action {
+        ExecCredAction::Add {
+            worker_id,
+            workspace,
+        } => match open_exec_cred_pool(workspace) {
+            Ok(pool) => match toolkit_core::exec_creds::issue(&pool, &worker_id) {
+                Ok(secret) => print_json(serde_json::json!({
+                    "worker_id": worker_id,
+                    "secret": secret,
+                })),
+                Err(e) => print_business_error("db", e),
+            },
+            Err(e) => print_business_error("io", e),
+        },
+        ExecCredAction::Revoke {
+            worker_id,
+            workspace,
+        } => match open_exec_cred_pool(workspace) {
+            Ok(pool) => match toolkit_core::exec_creds::revoke(&pool, &worker_id) {
+                Ok(existed) => print_json(serde_json::json!({
+                    "worker_id": worker_id,
+                    "revoked": existed,
+                })),
+                Err(e) => print_business_error("db", e),
+            },
+            Err(e) => print_business_error("io", e),
+        },
+        ExecCredAction::List { workspace } => match open_exec_cred_pool(workspace) {
+            Ok(pool) => match toolkit_core::exec_creds::list(&pool) {
+                Ok(creds) => print_json(serde_json::json!({ "creds": creds })),
+                Err(e) => print_business_error("db", e),
+            },
+            Err(e) => print_business_error("io", e),
+        },
+    }
 }
 
 /// 启用 trace-hub 全链路追踪——仅当设置了环境变量 `TRACE_HUB_ENDPOINT` 时生效；
@@ -168,6 +263,10 @@ async fn main() -> Result<()> {
                 .dispatch(DeployCommand::Update { force })
                 .await
                 .context("自更新失败")?;
+            Ok(())
+        }
+        Command::ExecCred { action } => {
+            run_exec_cred(action);
             Ok(())
         }
         // 抖音长任务（list_works / download / process）由 douyin 库 spawn current_exe

@@ -2,6 +2,7 @@ pub mod codeloop;
 pub mod cookie;
 pub mod egress;
 pub mod english;
+pub mod exec;
 pub mod g10_deploy;
 pub mod llm;
 pub mod music;

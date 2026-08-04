@@ -205,4 +205,43 @@ CREATE TABLE IF NOT EXISTS llm_messages (
     created_at TEXT NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_llm_messages_session ON llm_messages(session_id, seq);
+
+-- 远程执行（remote-exec）第一期：per-worker exec 专用凭据。secret 明文只在 `exec-cred add`
+-- 时展示一次，落库只存 `sm3(salt||secret)` 的 hex（salt 随机 16 字节）。revoked_at 非空即吊绝：
+-- 拒绝该 worker 后续领取任务/回传结果（不是正在执行命令的 emergency stop，见设计 §4.2）。
+-- 纯加表、IF NOT EXISTS 幂等：同 codeloop_io / llm_* / shadow_* / audio_blob / llm_sessions，
+-- migrate() 启动即建出，故不需要、也不应 bump SCHEMA_VERSION。
+-- 见 docs/remote-exec-design.md 第一期 §4.2。
+-- expires_at：临时授权的到期时间（unix 秒）。NULL = 永不过期（`exec-cred add` 手工签发的老形态）。
+-- 走「worker 申请 → 面板批准 N 小时」通道签发的凭据都带到期时间，到点 verify 自动失败。
+-- 存量库由 migrations.rs 的幂等 ALTER 补列。
+CREATE TABLE IF NOT EXISTS exec_worker_creds (
+    worker_id   TEXT PRIMARY KEY,
+    secret_hash TEXT NOT NULL,
+    salt        TEXT NOT NULL,
+    created_at  INTEGER NOT NULL,
+    revoked_at  INTEGER,
+    expires_at  INTEGER
+);
+
+-- worker 临时权限申请：worker 端 `run` 首次启动（或凭据过期）时自行提交，落此表等人工批准；
+-- zero-desktop 的面板拉待审批列表、点批准并选时长 → 签发带 expires_at 的凭据写回本表的
+-- issued_secret（**一次性领取**：worker 轮询取走后立即清空，DB 不长期留明文）。
+--
+-- 该端点公网可达且**不需要凭据**（这是"申请"本身的前提），故靠三道兜底防刷：同 worker_id
+-- 去重（重复申请只刷新同一行）、pending 总数上限、pending 超 24h 自动过期（见 exec_requests.rs）。
+-- 纯加表、IF NOT EXISTS 幂等，不 bump SCHEMA_VERSION。
+CREATE TABLE IF NOT EXISTS exec_cred_requests (
+    worker_id     TEXT PRIMARY KEY,
+    label         TEXT NOT NULL DEFAULT '',
+    hostname      TEXT NOT NULL DEFAULT '',
+    os            TEXT NOT NULL DEFAULT '',
+    state         TEXT NOT NULL,           -- pending | approved | rejected
+    requested_at  INTEGER NOT NULL,
+    decided_at    INTEGER,
+    approved_by   TEXT,
+    expires_at    INTEGER,                 -- 批准时确定的凭据到期时间
+    issued_secret TEXT                     -- 待 worker 领取的明文 secret；领走即置 NULL
+);
+CREATE INDEX IF NOT EXISTS idx_exec_cred_requests_state ON exec_cred_requests(state, requested_at DESC);
 "#;

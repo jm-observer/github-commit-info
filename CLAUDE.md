@@ -26,7 +26,8 @@ workspace，作为 zero/Agent 生态的统一工具底座。架构目标：
 | `github-commit-info` | 独立 CLI：取 GitHub 仓库指定时间范围 commit。 |
 | `hf-watcher` | 独立 CLI：HuggingFace trending / model-card 监听。 |
 | `egress-pool` | **出口代理轻模型核心**（借出口,非分发算力）：`EgressRequest/Response` 线格式 + in-memory `Registry`（worker 通道/请求路由/session 绑定）+ `Pool`/`Session` 进程内句柄。两原语：`pool.fetch`（匿名短租轮换 IP）/ `pool.session(typ,account)`（钉死长租,同一出口 IP + 连续 cookie,按账号复用）。共用策略「同类型独占、类型间共用」。详见 [docs/distributed-worker-design.md](docs/distributed-worker-design.md) 的「轻模型」节。 |
-| `toolkit-worker` | **出口代理节点二进制**（pull 模型执行端）：register/心跳/长轮询 `/api/internal/egress/next` → 本机 reqwest 代发 → 回传;per-session cookie jar。各出口机手动/自更新拉起 `toolkit-worker --controller <公网> --token <...>`。 |
+| `toolkit-worker` | **出口代理节点二进制**（pull 模型执行端）：register/心跳/长轮询 `/api/internal/egress/next` → 本机 reqwest 代发 → 回传;per-session cookie jar。各出口机手动/自更新拉起 `toolkit-worker run`（**零参数**，配置在 `~/.config/toolkit-worker/`）。**另带 remote-exec 命令执行面**：首次启动自动申请临时权限，等你在桌面端批准，见下方专节。 |
+| `worker-core` | **远程执行（remote-exec）执行端内核 + 双端共用线格式**：`proto`（`ExecRequest/ExecResponse`、请求头常量、上限常量、`validate`/`script_hash`;controller 与 worker 都用它,不许私拼 JSON）、`Executor`（写带 BOM 的临时 ps1 → `powershell.exe -File` 逐参数 spawn → 有界捕获 → 超时 `taskkill /T /F` 杀树 → 清临时目录）、本地 JSONL 审计。**不含任何网络逻辑**（那在 `toolkit-worker`）。 |
 
 ## 常用命令
 
@@ -215,6 +216,55 @@ pwsh ./deploy-g10.ps1 -SkipBuild # 仅复制已有产物
 - **配置**：复用 Phase 1 的 `TTS_BASE_URL`（如 `http://127.0.0.1:8095`）。
 - **端到端验收**：见 [docs/runbook-audioforge-e2e.md](docs/runbook-audioforge-e2e.md)。
 
+## 远程命令执行（remote-exec，第一期）
+
+给 `toolkit-worker` 加的「命令执行面」：worker 主动出连 controller，operator 下发 PowerShell
+脚本拿 stdout/stderr/退出码。**与 egress 面共享稳定 `worker_id`，其余全部独立**（凭据 / 路由 /
+调度状态 / 审计 / 中止语义）。设计见 [docs/remote-exec-design.md](docs/remote-exec-design.md)；
+第一期只做 Windows/PowerShell + 单任务 + 同步 `/run`，异步任务/排队/远程取消/本地控制面是第二期。
+
+- **worker 侧零参数**：对方机器上只跑 `toolkit-worker run`。身份、controller、凭据全在
+  workspace（`~/.config/toolkit-worker/`：`config.json` + 单独的 `exec-secret` + `remote-exec/`）。
+  **密钥刻意不进 config.json**——配置文件是会被截图/贴出来排查的东西。controller 默认值就是外网
+  入口 `https://spark.for-memory.site:38788`（caddy TLS → G10:8788；28080 是 english 自己的入口）。
+- **worker id 自动派生**：`w-<sm3(物理网卡 MAC 排序拼接 + 主机名)[..8]>`。**排除虚拟网卡**
+  （VMware/Hyper-V/vEthernet/TUN/WSL…）、**全部 MAC 排序后一起哈希**（不是「取第一块」，
+  否则插拔网线就换 id），算出来立刻固化进 config，之后永远以配置为准。面板上认人靠单独的
+  `label`（`run --label`，默认主机名）。
+- **临时权限（申请 → 批准 N 小时）**：`run` 首次启动或凭据过期时**自动**提交申请
+  （`POST /api/internal/exec/access/request`，**该端点不要求凭据**——申请的前提就是还没有凭据），
+  然后每 10s 轮询 `access/poll` 停在「等待批准」；你在 zero-desktop「远程节点」页批准并选时长
+  （1h/8h/20h/3d，默认 20h，上限 7 天）→ worker 领到带 `expires_at` 的 secret 落盘 → 自动进主循环。
+  **到期不退出进程**，回到申请态等续期。明文 secret 在 `issued_secret` 里只暂存到 worker 领走那一刻。
+  防刷三道：同 worker_id 去重 / pending 上限 32 / pending 24h TTL（**不按来源 IP 限频**——外网在
+  caddy 反代之后，这里只能看到反代自己，`X-Forwarded-For` 可伪造）。
+- **两套凭据**：内部面 per-worker secret（`exec_worker_creds` 存 `sm3(salt||secret)` + `expires_at`，
+  请求头 `x-worker-id`/`x-exec-secret`/`x-instance-id`，每次请求查库并判过期）；消费面只认
+  `TOOLKIT_EXEC_TOKEN`（`token:operator`，operator 由命中的 token 注入），**不叠加**
+  `TOOLKIT_API_TOKEN`。未配置 exec token 则 `/api/web/exec/*` 根本不挂载。
+- **桌面端审批面**：`exec` 模块 + 「远程节点」页。用**独立的 `exec_token` 设置项**，不复用
+  `g10_token`——批准一台机器 = 授予在它上面执行任意命令的权限，安全边界高一档。
+- **手工签发仍在**：`toolkit-server exec-cred add|revoke|list`（永久凭据，`expires_at` 为 NULL），
+  用于不方便走申请流程的场景。第一期 `revoke`/到期都只阻止**领取新任务**，**杀不掉已在执行的命令**
+  （远程可靠中止是第二期）。
+- **端点**：内部 `/api/internal/exec/{register,heartbeat,next,result}` + 免凭据的
+  `/api/internal/exec/access/{request,poll}`；消费 `/api/web/exec/{workers,run,requests,creds}` +
+  `requests/{id}/{approve,reject}`。`/run` 返回 `{state,source,id,exec,reason}`；
+  `404 worker_not_exec_capable` / `409 worker_offline|worker_busy` / `504 not_picked_up` /
+  `502 unknown`（**命令可能已执行，禁止自动重试**）。
+- **执行语义**：脚本写带 BOM 的 `user.ps1`（保 `param()`/`#requires`），`wrapper.ps1` 设 UTF-8 后
+  `& user.ps1 @Args` 并以 `exit $LASTEXITCODE` 回传真实退出码（**少这行会把 `exit N` 吞成 0**）；
+  `powershell.exe -NoProfile -NonInteractive -File` 逐参数传；超时 `taskkill /T /F /PID` 杀整棵树
+  后仍 `wait()` 回收，`timed_out` 的 exit_code 为 null。
+- **审计**：controller（`<workspace>/remote-exec/audit/`）与 worker（`<workspace>/remote-exec/audit/`）
+  双写 JSONL，保留 30 天，**只记元信息 + 脚本 SM3 短哈希，绝不记正文**。
+- **CLI 只剩**：`run`（零参数）/ `status` / `update` / `install`(Linux) / `proxy`；`list` 仅 Linux。
+  **`scan` 已删**。出口选择参数是历史包袱且**实测只有 Linux 有效**：`--interface`
+  （`SO_BINDTODEVICE`）只在 Linux 编译进 CLI；`--local-address` 在 Windows 上绑非默认路由网卡
+  会直接发不出包（实测每张非默认网卡探测全失败）——换出口走 net-policy（已拆独立仓）。
+- **已知取舍**：Windows 上临时目录/脚本只靠继承 ACL（凭据文件用 `icacls` 收紧了）；Unix 杀树只
+  `kill -9` 直接 pid；controller 重启后在途任务只能得到连接失败或 `unknown`。
+
 ## 文档目录（动手前按主题查）
 
 - [docs/toolkit-design.md](docs/toolkit-design.md) — 中台整体设计。
@@ -230,6 +280,9 @@ pwsh ./deploy-g10.ps1 -SkipBuild # 仅复制已有产物
 - [docs/runbook-shadow-realtime-e2e.md](docs/runbook-shadow-realtime-e2e.md) — 跟读实时发音评测端到端验收 runbook（直连 :8098 → toolkit 中继 → 桌面 三层 + 落库/降级校验）。
 - [docs/english-shadow-scoring-ui-design.md](docs/english-shadow-scoring-ui-design.md) — 评分可解释 + 对齐明细 UI 设计：评分细则透明化 + 新增「对齐可靠性/uncertain」(把没对齐上的音素从 bad 改判存疑,不冤枉用户) + 音素明细表展示。
 - [docs/english-pron-evaluator-design.md](docs/english-pron-evaluator-design.md) — 发音评测单元(PronEvaluator)设计：词/短语/句通用的可复用组件(评分+朗读+听标准TTS+听自己+LLM 二次反馈),含失败词 drill-down 单练。
+- [docs/wan-access-todo.md](docs/wan-access-todo.md) — 外网入口待办（桌面端 tokio-tungstenite 没开 TLS feature，外网档 wss 语音识别连不上）。
+- [docs/remote-exec-todo.md](docs/remote-exec-todo.md) — remote-exec 待办（部署版本落后导致面板看不到申请、worker 轮询未判状态码把 404 误报成解析失败）。
+- [docs/remote-exec-design.md](docs/remote-exec-design.md) — 远程命令执行 / 远程排查底座设计（第一期：同步 `/run` 闭环，已落地；第二期：异步任务 · 排队 · 远程取消 · 本地控制面，未做）。
 - [docs/distributed-worker-design.md](docs/distributed-worker-design.md) — 分布式爬虫底座设计（公共库 · Worker · 出口 IP 池）：统一模型（一支 fleet 两个面 / 库的两档接入：请求级 egress 代理 + 任务级 worker 分发 / cookie·匿名 IP 策略分裂 / proxy_pool 提级）+ pull 调度 + 两段式自更新。
 - **网络出口策略（net-policy）已于 2026-07 拆为独立仓** → [jm-observer/net-policy](https://github.com/jm-observer/net-policy)（本地 `D:\git\net-policy`）。六个 `net-policy-*` crate、`docs/net-policy/` 文档集、`package-net-policy.ps1` 全部迁出，本仓不再持有；历史经 `git filter-repo` 完整保留在新仓。
 - [docs/toolkit-rfc/2026-06-04-initial-skeleton/data-model.md](docs/toolkit-rfc/2026-06-04-initial-skeleton/data-model.md) — SQLite 数据模型。

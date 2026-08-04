@@ -3,6 +3,8 @@
 //! 见 `toolkit/docs/toolkit-design.md` 与 `docs/toolkit-rfc/2026-06-04-initial-skeleton/`。
 
 pub mod db;
+pub mod exec_creds;
+pub mod exec_requests;
 pub mod ids;
 pub mod llm_sessions;
 pub mod llm_store;

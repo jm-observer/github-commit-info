@@ -94,11 +94,51 @@ pub fn builtin() -> Vec<ServiceDef> {
             health_url: "http://192.168.0.68:8788/api/web/health".into(),
             remote_service: Some("toolkit-server".into()),
             web_url: "http://192.168.0.68:8788".into(),
-            env: vec![EnvVar {
-                key: "TOOLKIT_BIND".into(),
-                value: "0.0.0.0:8788".into(),
-                note: bind_note(),
-            }],
+            env: vec![
+                EnvVar {
+                    key: "TOOLKIT_BIND".into(),
+                    value: "0.0.0.0:8788".into(),
+                    note: bind_note(),
+                },
+                // 全局 API 鉴权（`Authorization: Bearer`，WS 走 `?token=`）。留空 = 不注入 →
+                // `/api/web/*` 完全无鉴权。外网入口（38788 明文映射 / caddy TLS）暴露时**务必填**；
+                // 桌面端各 handler 早就在发 g10_token，填上即刻生效。
+                EnvVar {
+                    key: "TOOLKIT_API_TOKEN".into(),
+                    value: String::new(),
+                    note: "全局 API token（桌面端 g10_token 与之对应）；留空 = /api/* 不鉴权".into(),
+                },
+                // remote-exec 第一期消费面专用 token（见 toolkit 仓 docs/remote-exec-design.md）。
+                // **默认留空 = 不注入该变量 → toolkit-server 根本不挂载 `/api/web/exec/*`**
+                // （设计要求「未配置即路由不存在」，而非挂载后鉴权拒绝）。要开远程排查时在面板
+                // 填 `token:operator`（可逗号分隔多枚……但本链路用逗号分隔多条 env，故面板里
+                // 只填一枚；多 operator 需求出现时再扩展分隔约定）。
+                // 内置默认**绝不带真实 token**：填进去的值落在 workspace 的 g10-services.json，
+                // 不进 git。
+                EnvVar {
+                    key: "TOOLKIT_EXEC_TOKEN".into(),
+                    value: String::new(),
+                    note: "远程命令执行(remote-exec)消费面专用 token，格式 `token:operator`；留空 = 不部署 exec 路由".into(),
+                },
+                // 下面三条是 GB10 同机的语音/评测下游地址。**必须列在这里**：install 每次
+                // 整份重写 unit，清单里没有的变量部署后就没了——曾经手工注入过的
+                // TTS/GOP/CLEAN 会被静默抹掉，导致 TTS 代理与发音评测 503。
+                EnvVar {
+                    key: "TTS_BASE_URL".into(),
+                    value: "http://127.0.0.1:8095".into(),
+                    note: "CosyVoice2 TTS 上游（/api/web/audio/tts 代理目标）；未配置该端点返回 503".into(),
+                },
+                EnvVar {
+                    key: "CLEAN_BASE_URL".into(),
+                    value: "http://127.0.0.1:8097".into(),
+                    note: "audio-cleanup 上游（/api/web/audio/clean 代理目标）；未配置返回 503".into(),
+                },
+                EnvVar {
+                    key: "GOP_BASE_URL".into(),
+                    value: "http://127.0.0.1:8098".into(),
+                    note: "pronunciation-assess 上游（跟读 GOP 发音评测后端）".into(),
+                },
+            ],
             deploy: Some(DeployDef {
                 script: "deploy-g10.ps1".into(),
                 args: vec!["-Service".into(), "toolkit-server".into()],

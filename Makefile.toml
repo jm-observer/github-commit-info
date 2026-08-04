@@ -33,8 +33,6 @@ cwd = "crates/zero-desktop"
 command = "cargo"
 args = ["tauri", "dev", "--no-watch"]
 
-# net-policy 已拆为独立仓（jm-observer/net-policy），打包任务随之迁出。
-
 [tasks.worker]
 command = "cargo"
-args = ["build", "-p", "toolkit-worker", "--features", "custom-utils/prod"]
+args = ["build", "-p", "toolkit-worker",  "--release"] #"--features", "custom-utils/prod",

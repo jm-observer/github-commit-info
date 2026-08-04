@@ -8,6 +8,7 @@ toolkit-core = { path = "../toolkit-core" }
 toolkit-tasks = { path = "../toolkit-tasks" }
 toolkit-llm = { workspace = true }
 egress-pool = { path = "../egress-pool" }
+worker-core = { workspace = true }
 douyin = { path = "../douyin" }
 # orchestrator(StreamSpeech 编排层)同进程挂载:其 axum 路由(/stream WS + /api/*)
 # nest 到 /api/asr 下,ASR 与工具 API 共用 toolkit-server 单端口单入口。

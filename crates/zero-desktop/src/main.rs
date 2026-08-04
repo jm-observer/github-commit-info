@@ -317,6 +317,12 @@ fn run_gui(workspace: PathBuf) -> Result<()> {
             modules::llm::llm_delete_session,
             // egress 模块（出口代理 worker 列表，只读观测面）
             modules::egress::egress_list_workers,
+            // exec 模块（远程节点：权限申请审批 + 在线节点/凭据观测）
+            modules::exec::exec_list_requests,
+            modules::exec::exec_list_workers,
+            modules::exec::exec_list_creds,
+            modules::exec::exec_approve_request,
+            modules::exec::exec_reject_request,
             // codeloop 模块（Codex⇄Claude 复核循环）
             modules::codeloop::codeloop_list_sessions,
             modules::codeloop::codeloop_new_codex_session,

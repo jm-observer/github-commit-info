@@ -35,6 +35,7 @@ interface AppSettings {
   lan_host: string
   wan_host: string
   g10_token?: string | null
+  exec_token?: string | null
 }
 
 interface NetStatus {
@@ -120,6 +121,7 @@ function G10ConfigSection() {
   const [lanHost, setLanHost] = useState('')
   const [wanHost, setWanHost] = useState('')
   const [g10Token, setG10Token] = useState('')
+  const [execToken, setExecToken] = useState('')
   const [feedback, setFeedback] = useState<{ kind: 'ok' | 'err'; msg: string } | null>(null)
   const [loading, setLoading] = useState(false)
   const [status, setStatus] = useState<NetStatus | null>(null)
@@ -139,6 +141,7 @@ function G10ConfigSection() {
       setLanHost(s.lan_host ?? '')
       setWanHost(s.wan_host ?? '')
       setG10Token(s.g10_token ?? '')
+      setExecToken(s.exec_token ?? '')
     }).catch(err => console.error('[SettingsPage] 加载 G10 配置失败:', err))
     void refreshStatus()
   }, [refreshStatus])
@@ -157,6 +160,7 @@ function G10ConfigSection() {
         lan_host: lanHost.trim(),
         wan_host: wanHost.trim(),
         g10_token: g10Token.trim() || null,
+        exec_token: execToken.trim() || null,
       }
       await invoke('cookie_save_app_settings', { settingsData })
       showFeedback('ok', 'G10 配置已保存')
@@ -244,6 +248,21 @@ function G10ConfigSection() {
           value={g10Token}
           onChange={e => setG10Token(e.target.value)}
           placeholder="留空表示不鉴权"
+          className={inputCls}
+        />
+      </div>
+
+      {/* 远程执行 token 与上面的 G10 token 刻意分开：批准一台远程节点 = 授予在它上面
+          执行任意命令的权限，安全边界高一档，不该因为配了全局 token 就顺带获得。 */}
+      <div className="flex flex-col gap-2">
+        <label className="text-xs text-gray-500 dark:text-gray-400">
+          远程执行 Token（「远程节点」页审批用，对应 G10 的 TOOLKIT_EXEC_TOKEN）
+        </label>
+        <input
+          type="password"
+          value={execToken}
+          onChange={e => setExecToken(e.target.value)}
+          placeholder="留空则「远程节点」页不可用"
           className={inputCls}
         />
       </div>

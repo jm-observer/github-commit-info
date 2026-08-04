@@ -8,6 +8,7 @@ pub mod config;
 #[path = "douyin/mod.rs"]
 pub mod douyin_mod;
 pub mod egress_sessions;
+pub mod exec;
 pub mod llm;
 pub mod routes;
 pub mod shadow;
@@ -76,6 +77,8 @@ pub fn bootstrap(cfg: &Config) -> Result<AppState> {
         session_store: Arc::new(session_store),
         egress: Arc::new(egress_pool::Registry::new()),
         egress_sessions: Arc::new(egress_sessions::SessionStore::new()),
+        exec: Arc::new(exec::Coordinator::default()),
+        exec_audit: Arc::new(exec::audit::AuditLog::new(&cfg.workspace)),
     })
 }
 
@@ -152,7 +155,23 @@ pub fn build_router(state: AppState, web_dir: &std::path::Path) -> axum::Router 
         // 出口代理 worker 专用通道(pull 模型:worker 主动连,共享 token 鉴权)。
         .nest("/api/internal", routes::internal::router())
         // 出口代理消费/观测(P0 验证入口)。
-        .nest("/api/web/egress", routes::egress::router());
+        .nest("/api/web/egress", routes::egress::router())
+        // remote-exec 第一期:worker 专用内部通道(per-worker secret 鉴权,独立于上面的
+        // 出口代理 `x-egress-token`)。始终挂载——未注册的 worker_id 本身就会被拒绝。
+        .nest(
+            "/api/internal/exec",
+            exec::routes::internal_router(state.clone()),
+        )
+        // 临时权限申请通道：**故意不在 internal_auth 之下**——worker 首次申请时还没有凭据。
+        // 单独 nest 一层前缀（与上面的 /api/internal/exec/{register,heartbeat,next,result}
+        // 不冲突，matchit 按具体路径匹配）。防刷见 exec::routes::access_router 文档。
+        .nest("/api/internal/exec/access", exec::routes::access_router());
+
+    // remote-exec 消费面:未配置 TOOLKIT_EXEC_TOKEN 时根本不挂载(设计明确要求「不存在」
+    // 而非挂载后鉴权拒绝),故用 Option 决定是否 nest。
+    if let Some(exec_web) = exec::routes::web_router() {
+        router = router.nest("/api/web/exec", exec_web);
+    }
 
     if web_dir.exists() {
         log::info!("serving static web/ from {}", web_dir.display());
