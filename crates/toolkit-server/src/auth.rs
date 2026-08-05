@@ -35,6 +35,12 @@ fn is_exempt(method: &Method, path: &str) -> bool {
         || path == "/api/web/health"
         || path.starts_with("/api/internal")
         || path.starts_with("/api/web/exec")
+        // 软件授权在线续期（`POST /api/license/refresh`）：客户端在拿到有效授权之前无从
+        // 得知/携带 TOOLKIT_API_TOKEN，续期通道本身必须免鉴权（安全边界是签名+限流，
+        // 见 license::routes::refresh 与 docs/license-impl-design.md §6.2）。注意前缀
+        // 是 `/api/license`（不带 `/web`）——管理端点 `/api/web/license/*` 仍要 Bearer，
+        // 不在此豁免范围内，下面刻意不加 `path.starts_with("/api/web/license")`。
+        || path.starts_with("/api/license")
         || !path.starts_with("/api")
 }
 
@@ -103,6 +109,10 @@ mod tests {
         assert!(is_exempt(&Method::GET, "/api/web/exec/workers"));
         // CORS 预检不带 Authorization。
         assert!(is_exempt(&Method::OPTIONS, "/api/web/llm/config"));
+        // license 在线续期免鉴权；管理端点仍受保护。
+        assert!(is_exempt(&Method::POST, "/api/license/refresh"));
+        assert!(!is_exempt(&Method::GET, "/api/web/license"));
+        assert!(!is_exempt(&Method::POST, "/api/web/license"));
     }
 
     #[test]

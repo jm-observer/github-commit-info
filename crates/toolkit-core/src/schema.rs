@@ -244,4 +244,36 @@ CREATE TABLE IF NOT EXISTS exec_cred_requests (
     issued_secret TEXT                     -- 待 worker 领取的明文 secret；领走即置 NULL
 );
 CREATE INDEX IF NOT EXISTS idx_exec_cred_requests_state ON exec_cred_requests(state, requested_at DESC);
+
+-- 软件授权（license）台账：在线续期（`POST /api/license/refresh`）签发新令牌时的权威数据源，
+-- 也是控制台管理端点（`/api/web/license`）的存储。**不是签名核心**——验签/状态机/委托证书全在
+-- custom-utils 的 `util_license`（license-sign feature）；这里只是「一台客户机器授权了什么、
+-- 续期时该给多久」的记账。字段对应设计文档 §6.2：
+--   business_deadline  商务硬上限（root 签死的锚，续期不得越过，此处只是台账副本用于计算）；
+--   grant_window_days  每次续期把 expires_at 推到 now + 此值（封顶 business_deadline）；
+--   lease_days         在线租约天数，NULL = 纯离线模式（不给 lease_until）；
+--   machine_ids        JSON：MachineFingerprint 数组（decode_mreq1 落库前解出的结构）；
+--   features/max_version 随续期原样透传（不得在续期时扩权，客户端自己也会核对锚）；
+--   revoked_at          非空即吊销，refresh 立即拒绝（403）。
+-- 纯加表、IF NOT EXISTS 幂等：同 codeloop_io / llm_* / shadow_* / audio_blob / llm_sessions /
+-- exec_worker_creds，migrate() 启动即建出，故不需要、也不应 bump SCHEMA_VERSION。
+-- 见 docs/license-impl-design.md §6.2。
+CREATE TABLE IF NOT EXISTS licenses (
+    lic_id             TEXT PRIMARY KEY,
+    product            TEXT NOT NULL,
+    subject            TEXT NOT NULL,
+    contact_email      TEXT,
+    machine_ids        TEXT NOT NULL DEFAULT '[]',
+    not_before         TEXT NOT NULL,
+    business_deadline  TEXT NOT NULL,
+    grant_window_days  INTEGER NOT NULL,
+    lease_days         INTEGER,
+    grace_days         INTEGER NOT NULL DEFAULT 14,
+    features           TEXT NOT NULL DEFAULT '[]',
+    max_version        TEXT,
+    revoked_at         TEXT,
+    note               TEXT NOT NULL DEFAULT '',
+    created_at         TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_licenses_product ON licenses(product);
 "#;

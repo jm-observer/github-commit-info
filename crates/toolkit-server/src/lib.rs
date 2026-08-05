@@ -9,6 +9,7 @@ pub mod config;
 pub mod douyin_mod;
 pub mod egress_sessions;
 pub mod exec;
+pub mod license;
 pub mod llm;
 pub mod routes;
 pub mod shadow;
@@ -79,6 +80,27 @@ pub fn bootstrap(cfg: &Config) -> Result<AppState> {
         egress_sessions: Arc::new(egress_sessions::SessionStore::new()),
         exec: Arc::new(exec::Coordinator::default()),
         exec_audit: Arc::new(exec::audit::AuditLog::new(&cfg.workspace)),
+        license_signer: match license::Signer::from_env() {
+            Ok(Some(signer)) => {
+                log::info!("在线续期已启用（renewal kid={}）", signer.renewal_kid());
+                Some(Arc::new(signer))
+            }
+            Ok(None) => {
+                log::info!(
+                    "未设置 {}/{}/{}：在线续期未启用，/api/license/refresh 将返回 503",
+                    license::signer::ENV_RENEWAL_SEED,
+                    license::signer::ENV_RENEWAL_KID,
+                    license::signer::ENV_RENEWAL_CERT
+                );
+                None
+            }
+            Err(e) => {
+                // 三个 env 至少设了一个但配置本身非法（seed/cert 读取失败）：这是配置错误，
+                // 不能静默当作"未启用"（否则运维会以为续期在跑但实际没生效），直接冒泡失败。
+                return Err(e.context("装配在线续期 signer 失败"));
+            }
+        },
+        license_rate_limiter: Arc::new(license::RateLimiter::default_refresh()),
     })
 }
 
@@ -121,12 +143,17 @@ pub async fn serve_with_web(
         .await
         .with_context(|| format!("bind {bind}"))?;
     log::info!("toolkit-server listening on {bind}");
-    axum::serve(listener, app)
-        .with_graceful_shutdown(async {
-            let _ = tokio::signal::ctrl_c().await;
-        })
-        .await
-        .context("axum serve")
+    // `into_make_service_with_connect_info` 而非普通 `into_make_service`：license refresh 的
+    // 每 IP 限流（license::routes::refresh）要用 `ConnectInfo<SocketAddr>` 拿对端地址。
+    axum::serve(
+        listener,
+        app.into_make_service_with_connect_info::<SocketAddr>(),
+    )
+    .with_graceful_shutdown(async {
+        let _ = tokio::signal::ctrl_c().await;
+    })
+    .await
+    .context("axum serve")
 }
 
 /// 装配 Router。`web_dir` 存在 → 静态托管；否则内嵌最小 HTML。
@@ -146,6 +173,9 @@ pub fn build_router(state: AppState, web_dir: &std::path::Path) -> axum::Router 
         )
         .nest("/api/web/douyin", douyin_mod::routes::router())
         .nest("/api/web/llm", llm::routes::router())
+        // 软件授权 · 在线续期:公共面(免 Bearer,见 auth::is_exempt)+ 管理面(Bearer)。
+        .nest("/api/license", license::routes::public_router())
+        .nest("/api/web/license", license::routes::admin_router())
         // English 跟读判分（FunASR 转写 + 词级对齐 + 落 toolkit.db）。
         .nest("/api/web/shadow", shadow::routes::router())
         .nest("/api/agent", routes::agent::router())
@@ -215,7 +245,11 @@ pub async fn bind_ephemeral() -> Result<(tokio::net::TcpListener, SocketAddr)> {
 /// 用于测试：把现成 listener + state 跑起来（无静态 web 目录，走嵌入式 HTML）。
 pub async fn serve_with_listener(listener: tokio::net::TcpListener, state: AppState) -> Result<()> {
     let router = build_router(state, std::path::Path::new("/__nonexistent__"));
-    axum::serve(listener, router).await?;
+    axum::serve(
+        listener,
+        router.into_make_service_with_connect_info::<SocketAddr>(),
+    )
+    .await?;
     Ok(())
 }
 

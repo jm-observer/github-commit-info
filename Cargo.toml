@@ -56,3 +56,9 @@ strip = true
 #lto = true
 lto = "thin"
 codegen-units = 16   # 默认 release 是 1，配合并行加速
+
+# custom-utils 的 license feature（license-sign 等）尚未发布到 crates.io（0.16.0 已发布版本
+# 不含 license 模块），toolkit-server 需要它做在线续期签发。临时 patch 到本机同级路径；
+# 待 custom-utils 发新版本带上 license feature 后可删除本节，改回纯版本号依赖。
+[patch.crates-io]
+custom-utils = { path = "../custom-utils" }

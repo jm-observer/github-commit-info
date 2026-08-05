@@ -24,4 +24,11 @@ pub struct AppState {
     pub exec: Arc<crate::exec::Coordinator>,
     /// remote-exec 集中审计:JSONL 落 `<workspace>/remote-exec/audit/`。
     pub exec_audit: Arc<crate::exec::audit::AuditLog>,
+    /// 软件授权 · 在线续期私钥(设计 `docs/license-impl-design.md` §3.4/§6.2)。`None` = 未配置
+    /// `LICENSE_RENEWAL_SEED`/`LICENSE_RENEWAL_KID`/`LICENSE_RENEWAL_CERT` 三者之一,
+    /// `/api/license/refresh` 据此返回 503(与 TTS/LLM 未配置同风格)。
+    pub license_signer: Option<Arc<crate::license::Signer>>,
+    /// `/api/license/refresh` 的进程内限流器(每 IP + 每 lic_id 各查一次),与 signer 是否
+    /// 配置无关——即便 signer=None 也共用同一限流器实例,避免探测未配置状态本身被刷。
+    pub license_rate_limiter: Arc<crate::license::RateLimiter>,
 }

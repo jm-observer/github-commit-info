@@ -30,11 +30,14 @@ futures-util = "0.3"
 tower-http = { workspace = true }
 clap = { workspace = true, features = ["env"] }
 log = { workspace = true }
-custom-utils = { workspace = true, features = ["updater", "trace"] }
+custom-utils = { workspace = true, features = ["updater", "trace", "license-sign"] }
 rusqlite = { workspace = true }
 reqwest = { workspace = true }
 sm3 = { workspace = true }
 uuid = { workspace = true }
+# license 续期签名（signer.rs 直接持有 SigningKey 类型）；版本/feature 与 custom-utils 的
+# ed25519-dalek 依赖对齐（license-sign feature 里那份），避免类型不一致。
+ed25519-dalek = { version = "2", default-features = false, features = ["std"] }
 
 [dev-dependencies]
 reqwest = { workspace = true }

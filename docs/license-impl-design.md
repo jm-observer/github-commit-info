@@ -4,8 +4,9 @@
 > 本篇只讲**怎么实现**：crate 结构、密钥体系、令牌/指令格式、客户端与服务端集成、邮件、
 > 分阶段任务清单。字段/接口给到可直接开工的粒度。
 >
-> 状态：评审后实施版。按两期交付：**一期为共享离线核心 + zuche 首次接入**；二期为在线续期、
-> 措施广播、运营能力和 zero-desktop 接入。实际排期与验收以 §9 的两期清单为准。
+> 状态：评审后实施版。按**三期**交付：**一期 = 纯共享离线核心（custom-utils，不含任何消费方）**；
+> **二期 = zuche 首次接入（第一个真实交付，受限模式只放行只读页、不含导出）**；
+> **三期 = 在线续期 + 措施广播 + 运营能力 + zero-desktop**。实际排期与验收以 §9 的三期清单为准。
 
 ---
 
@@ -127,13 +128,12 @@ custom-utils 只需保证核心对两者都够用：
 | 手动同步 / 配置修改 / `POST /traffic/clear` 等写操作 | **禁** | [web.rs](../../zuche/crates/ui/src/web.rs) |
 | 定时采集任务 | **停** | 生产性 |
 | `GET /accounts`、`/traffic` 等只读页 | **放行** | 只读，符合红线 |
-| 导出已采数据 | **放行** | 红线：永远能导出 |
 | 授权页 / `license import` | **放行** | 否则死锁 |
 
-> ⚠️ **现状纠正**：zuche 的"MySQL 跨机直读 + 订单落库"是**目标态、尚未实现**（现状为本地
-> SQLite，订单仅在内存 `RunHistory`，进程重启即丢——见 [zuche DESIGN.md](../../zuche/DESIGN.md) §4/§13）。
-> 所以**不能**说"到期后公司侧直连读库不受影响"。zuche 一期的正确前置是：**要么先落地 MySQL/订单落库
-> 再谈'保留只读'，要么当前阶段的'只读'仅限 web 页面查看 + 导出**。把 MySQL 落库列为**外部前置条件**。
+> ⚠️ **受限模式只承诺"只读页放行"，不承诺"导出"（已定，降级）**：zuche 当前**没有导出路由**，
+> 订单还在内存 `RunHistory`（进程重启即丢，见 [zuche DESIGN.md](../../zuche/DESIGN.md) §4/§13）。为一句
+> "保留导出"去改 zuche 数据层不划算。所以 **二期受限模式 = 放行只读 web 页 + 授权页，禁全部生产/写，
+> 不含导出**。"数据导出 / MySQL 跨机直读"留给 zuche 自己的路线，作为**外部前置**，license 不承担。
 
 **对 custom-utils 的要求**：`util_license` 必须**不假设 GUI、不假设 Tauri、不假设某个 web 框架**——
 它只吐 `LicenseState` 和验签结果，"拿这个状态去拦 Tauri command 还是拦 axum 请求"由各项目自己接。
@@ -165,9 +165,14 @@ custom-utils 只需保证核心对两者都够用：
 
 | 角色 | 保管 |
 |---|---|
-| `root` / `directive` / `recovery` | **离线**：加密 U 盘 + 纸质抄写异地各一份；`age -p` 口令加密，`tklic` 用时解密到内存即弃。**不进 git / CI / G10 / 云盘明文** |
+| `root` / `directive` / `recovery` | **离线**：加密 U 盘 + 纸质抄写异地各一份。**加密交给外部 `age`/`gpg`，`tklic` 自己不做任何加密**（不自造 KDF/cipher，见下）——`tklic keygen` 只写明文 seed（`0600`），你随手 `age -p` 包一层再抹掉明文；签发时 `age -d k.age \| tklic … --sk -` 走 stdin，明文不落盘。**不进 git / CI / G10 / 云盘明文** |
 | `renewal` | **必须在 G10 在线**（否则续期没法零沟通）。防护降一档但仍要做：落盘 `age`/OS 密钥库加密、文件权限 `600`+专用用户、与业务进程隔离；**它是权限最小的角色**（只能在 `[已激活, business_deadline]` 内延期），泄露不至失守。定期用 recovery 轮换其 kid |
 | 轮换 | 每角色首发都多编 1 把冷备公钥（§2.1）；泄露即启用冷备私钥重签 + recovery 撤旧 kid |
+
+> **为什么 `tklic` 不自己加密私钥**：root 是全系统信任根，自造一段 KDF+cipher 只会比 `age`
+> 这类专用工具更弱、更少审计。故 `tklic` 读写**明文 seed（magic+32B，`0600`）**，加密在工具**外面**
+> 用 `age`/`gpg` 做，`--sk -` 支持从 stdin 读 `age -d` 的解密流，明文 seed 不必落盘。仓库里**零自造
+> crypto**。（已在 custom-utils 落地并 Windows/pwsh 管道验证通过。）
 
 ### 2.3 公钥进二进制（build.rs 注入）
 
@@ -200,14 +205,59 @@ pub fn verify_as(magic: &str, kid: &str, want: Role, payload_b64: &str, sig: &[u
                  revoked_kids: &RevokedSet) -> Result<()>;
 ```
 
-**发布构建必须带真公钥表**（`kid:role:hex` 列表，逗号分隔，**不是**裸 hex）：
+**公钥来源改为 committed 文件（不再用环境变量）**——决策已定：
 
-```bash
-LICENSE_PUBKEY="root-a:root:AB..,root-b:root:CD..,renewal-1:renewal:EF..,directive-1:directive:11..,recovery-1:recovery:22.." \
-  cargo build --release
+- **只 bake 信任锚 `root×2 + recovery×1`**；`renewal`/`directive` **不再 bake**，改由 root 委托子密钥
+  引入（见 §2.4）。所以 bake 进客户端的表很短、很少变。
+- **公钥不是秘密，进仓库完全没问题**。build.rs 从 committed 文件读，`prod`/`dev` feature 选文件：
+  - `license-pubkeys/prod.txt`（生产锚）、`license-pubkeys/dev.txt`（开发锚）。
+  - `prod` feature 且 `prod.txt` 缺失/为空 → **构建失败**（生产禁回退开发公钥）。
+  - 好处：不再依赖每次 prod 构建记得设 `LICENSE_PUBKEY` 环境变量；那串 hex 也不用手抄
+    （`tklic export-table` 从你的密钥集生成文件）。
+- **迁移说明**：二期 zuche 的 `build.rs` 当前实装用的是 `LICENSE_PUBKEY` 环境变量 + 内置 dev 常量
+  （见 `crates/zuche-app/build.rs`）；**三期把它改成读 committed 文件**（逻辑等价，只是来源从
+  env 换成文件，prod↔dev 互斥不变）。
+
+```rust
+// build.rs（三期目标形态）
+fn main() {
+    let is_prod = std::env::var_os("CARGO_FEATURE_PROD").is_some();
+    let file = if is_prod { "license-pubkeys/prod.txt" } else { "license-pubkeys/dev.txt" };
+    let table = std::fs::read_to_string(file)
+        .unwrap_or_else(|_| if is_prod { panic!("prod 构建必须提供 {file}（禁回退开发公钥）") } else { String::new() });
+    println!("cargo:rustc-env=LICENSE_PUBKEY={}", table.replace('\n', ",").trim_matches(','));
+    println!("cargo:rerun-if-changed={file}");
+}
 ```
 
-deploy-g10.ps1 / 桌面打包脚本里把它设成环境变量（生产公钥不是秘密，可以进脚本）。
+### 2.4 子密钥 / 委托证书（三期起，renewal/directive 走这条）
+
+**决策**：`root`/`recovery` 是信任锚，**直接 bake**（它们没有更上层能背书）；但**在线 `renewal` 与
+措施 `directive` 改为 root 委托的子密钥**——这俩一个常驻 G10（暴露面最大）、一个要频繁发措施，
+是"想随时轮换又不想重发客户端"的典型场景。类比 GPG subkey / X.509 中间 CA，做在应用层。
+
+**委托证书 `TKDC1`**（root 角色签）：
+
+```
+TKDC1.<root_kid>.<payload_b64url>.<sig>      # 由某把 baked root 私钥签
+payload = { ver, sub_kid:"renewal-1", role:"renewal"|"directive",
+            sub_pubkey_hex, not_before, expires_at, nonce }
+```
+
+**客户端验一份 renewal/directive 签的对象**（TKL1 续期 / TKR1 / TKD1）时改走**两跳链**：
+1. 取该子密钥 kid 的委托证书（**随对象一起送达**：TKR1 响应里带、directive feed 文件里带，客户端缓存最新有效证书）；
+2. 验证书：baked root 公钥签的 + 证书里 `role` 允许签这种对象 + `now ∈ [not_before, expires_at]` 未过期；
+3. 从证书取 `sub_pubkey` → 用它验对象签名。
+
+收益与语义：
+- **轮换零重发**：泄露/到期换 renewal/directive 钥，只要 root 现签一张新证书，**客户端一个字节都不改**。
+- **证书有效期 = 自动轮换 + 泄露封顶**：证书带 `expires_at`，到期强制重签；泄露的子钥最坏活到证书到期。
+- **recovery 仍是独立锚、不走委托**（设计 §1.4：泄露 root 不能危及 recovery）。泄露 root 时——它能签
+  授权和子密钥证书，但 **recovery 撤掉 root 的 kid** → root 签的一切（授权 + 委托证书 + 由此派生的子钥
+  对象）全失效，backstop 仍在。
+- 验签入口在 custom-utils 收口：`verify_as` 增加"经委托证书链验子密钥签名"的路径；证书类型/编解码进
+  `directive.rs` 或新 `delegation.rs`；`tklic` 增 `delegate` 子命令签证书。**一/二期不动**（只 bake
+  root×2+recovery），改动全部落三期。
 
 ---
 
@@ -383,14 +433,21 @@ pub fn evaluate(p: &Payload, machine: &MachineId, clock: &Clock, now: DateTime<U
 
 - **分量（带稳定标识名）**：
   - **Windows**：`machineguid`（`HKLM\...\MachineGuid`）+ 可选 `board` / `disk` 序列号 → 多分量。
-  - **Linux**（zuche 客户服务器 / G10）：`machine_id`（`/etc/machine-id`）→ **通常只有这一个分量**。
+  - **Linux**（zuche 客户服务器 / G10）：**争取取满 3 个分量**——`machine_id`（`/etc/machine-id`）+
+    `product_uuid`（`/sys/class/dmi/id/product_uuid`，固件级、重装不变，需 root 可读）+ 主网卡 MAC。
+    **为什么要 3 个而不是 2 个**：多数匹配在**恰好 2 分量时退化成"必须都中"**（1/2 不构成多数），
+    那么重装系统（`machine_id` 变）就仍然 brick——白加了第二分量。**3 分量才有真正的 2/3 容错**：
+    重装（machine_id 变）→ product_uuid+mac 仍中 → 2/3 过；换网卡（mac 变）→ 另两个中 → 2/3 过；
+    整机搬走 → 三个全不中 → 失配。`product_uuid` 读不到（无 root）时退化到 2 分量（machine_id+mac，
+    "必须都中"），可接受但没有容错。
 - 每个分量 `sha256("tklic-machine-v1" || product || name || raw)` 取前 16B hex，组成
   `{name: hash}` 映射；`machine.id`（给用户看/报给你的）= 对**排序后全部分量**再 SHA-256 取前 16B hex。
   这里的 domain separator 不是秘密，只用于隔离不同产品/用途；截断到 128 bit，避免原设计 64 bit
   分量摘要在客户量增长后留下不必要的碰撞空间。
 - **匹配规则（按分量数自适应，回应 codex #8）**：
-  - **多分量（Windows）**：令牌某条目与本机**多数分量一致**即通过（换个硬盘不失效）。
-  - **单分量（Linux）**：退化为**该分量精确相等**——没有"多数"可言，换机即失配（服务器场景本就该严）。
+  - **多分量（Windows/Linux 均 ≥2）**：令牌某条目与本机**多数分量一致**即通过（换硬盘 / 重装系统
+    致单个分量变化不失效）。
+  - 若某平台确实只拿得到 1 个分量：退化为精确相等——但 Linux 已按上面凑到 2 个，正常不走这条。
 - 令牌 `machine[]` 里**任一条目**匹配即整体通过（一份 license 授权多台）。
 - **签发要拿到分量、不只是 id（回应 codex #7）**：客户端授权页导出的是一段**机器请求串**
   `MREQ1.<base64(json{id, components:{name:hash}})>`——含 `id` + 已哈希的分量表。用户把这串
@@ -501,61 +558,87 @@ pub fn evaluate(p: &Payload, machine: &MachineId, clock: &Clock, now: DateTime<U
 
 ## 8. 签发 CLI（`tklic`，仅 `--features issuer`）
 
+> `--sk` 接**文件路径**或 `-`（从 stdin 读，配合 `age -d`）。`keygen` 写明文 seed，加密自己用 `age` 包（§2.2）。
+> 一期实装的子命令：`keygen/issue/clock-reset/inspect/verify`；`sign-directives/revoke-kid` 随三期措施 feed 才做。
+
 ```bash
-tklic keygen --role root|renewal|directive|recovery \
-             --kid root-a --out root-a.sk               # 每把带 kid+role（私钥可加口令）
-tklic issue  --sk root-a.sk --product zuche --subject "某某" \
+# 生成密钥：写明文 seed（0600）+ stdout 打印 kid:role:hex 公钥行；自己 age 包
+tklic keygen --role root --kid root-a --out root-a.seed
+age -p -o root-a.age root-a.seed && shred -u root-a.seed
+
+# 签授权：age 解密进 stdin，明文不落盘
+age -d root-a.age | tklic issue --sk - --kid root-a --product zuche --subject "某某" \
              --machine <MREQ1...> [--machine <MREQ1...>] \   # 客户端导出的机器请求串(含 id+components)
-             --months 6                                 # → business_deadline/expires（纯离线模式）
-             [--lease-days 14]                          # 给了 = 可及时吊销模式（带 lease_until）
+             --months 6 [--lease-days 14] \                  # 无 lease-days=纯离线；有=可及时吊销
              [--features speech,english] [--grace 14] [--emergency]   # 签 TKL1（root 角色）
-tklic clock-reset --sk recovery-1.sk --machine <MREQ1...> --to <时间> --rseq 12   # 离线校时(仅 recovery)
-tklic sign-directives --sk directive-1.sk --in d.json --seq 43        # 签 TKD1（directive 角色）
-tklic revoke-kid --sk recovery-1.sk --kid <泄露kid> --rseq 7 \
-             [--bump-directive-epoch]                     # 撤销公钥(仅 recovery，独立 rseq，可顺带升 epoch)
+
+age -d recovery-1.age | tklic clock-reset --sk - --kid recovery-1 \
+             --machine <MREQ1...> --to <时间> --rseq 12       # 离线校时(仅 recovery)
+
 tklic inspect <token>                                    # 解码查看（不验也能看结构）
-tklic verify  <token>                                    # 本地验签自检（查 kid+role+签名）
+tklic verify  <token> --pubkeys "<kid:role:hex,...>"     # 本地验签自检（查 kid+role+签名）
+# 三期新增：tklic sign-directives（directive）/ revoke-kid --rseq（recovery，可 --bump-directive-epoch）
 ```
 
-- `issue` 从 `--machine` / 期限算 payload，用私钥签。`--emergency` 只缩短期限和功能范围，仍必须绑定
-  MREQ1；不生成可复制到任意机器的万能码。
-- 私钥加载：优先 `--sk` 文件，加密则提示口令（`rpassword`），解密只在内存。
+- `issue` 从 `--machine`(MREQ1) + 期限算 payload，用私钥签。`--emergency` 只缩短期限/功能，**仍必须绑
+  MREQ1**，不生成可复制到任意机器的万能码。
+- 私钥加载：`--sk <文件>` 或 `--sk -`（stdin）；**`tklic` 不做解密**，明文/解密由外部 `age` 负责。
 
 ---
 
-## 9. 两期任务与完成判据
+## 9. 三期任务与完成判据
 
-### 一期：共享离线核心 + zuche 首次接入
+### 一期：纯共享离线核心（custom-utils，不含任何消费方）✅ 已完成
 
-| 工作包 | 内容 | 完成判据 |
-|---|---|---|
-| **共享核心** | `custom-utils` 增加 `license` / `license-issuer` feature；完成 root/recovery 密钥、TKL1、MREQ1、Linux machine-id、时钟水位、状态机和 `tklic keygen/issue/clock-reset/inspect/verify` | 坏签名、改字段、错 product、错机器、日期不变量、未生效、临期、宽限、过期、回拨和 clock-reset 重放测试全过；prod 未注入公钥时构建失败 |
-| **zuche 命令行** | `zuche-rs license machine`、`license import <token>`、`license status`；授权文件原子写入 `~/.config/zuche-rs/license.anchor.tkl` | 全离线完成“导出机器串→签发→导入→生效”；导入失败不破坏旧授权；新 root 授权可恢复过期状态 |
-| **zuche web** | 共享 `LicenseRuntime`；始终可访问的授权页；能力级 guard 接到合并后的总 Router 和后台生产任务 | `/api/login|verify|request`、同步、重放、配置修改、验证码 drive/auto/abandon 等生产/写能力受限；授权页、明确列入 allowlist 的只读页和导出可用；未知新增路由默认拒绝生产能力 |
-| **zuche 数据红线** | 不删、不改、不加密客户已有数据；补齐真实可用的导出入口，或明确把导出列为一期的独立前置工作包 | 过期前后数据文件一致；受限状态下能导出当前实际持久化的数据。内存 `RunHistory` 不得被文档冒充为已持久化数据 |
-| **回归与发布** | custom-utils、zuche 各自完整运行仓库规定的 clippy/fmt/test；aarch64 prod 构建注入真实公钥 | 两仓完整质量循环全绿；测试私钥不进入发布产物和仓库；在一台 Linux 测试机完成到期/恢复演练 |
+> 已落地并 review + 提交（custom-utils `main` @ `e3cd57e`，已 push）：`util_license` 模块
+> （token/keys/machine/clock/state/directive/issue）+ `tklic` bin + 30 单测全绿。
 
-一期路由策略不能简单写成“GET 放行、POST 禁止”：zuche 的 GET/SSE 中可能驱动后台状态，POST 也包含
-未来可能新增的导出操作。应定义 `LicenseCapability::{Activate, Read, Export, Produce, Mutate}`，handler 或
-子 Router 显式标注能力；`Restricted` 只允许前三类。最外层 guard 负责兜底，长驻后台循环在每次实际
-生产动作前再次读取共享状态，避免仅在启动时检查一次。
-
-`zuche-rs` 当前只手工解析 `--port`，没有命令框架。一期先用一个小型、可测试的参数解析模块在启动
-数据库和浏览器前分流 `license` 子命令，不为三个子命令额外引入 clap；后续 CLI 增长到确实需要命令
-框架时再单独评估依赖。
-
-### 二期：在线续期、措施运营与其它产品
+**只做验签核心 + 签发 CLI，不碰任何业务集成**。产物是一个能独立测试、独立签发/验签的库 + CLI。
 
 | 工作包 | 内容 | 完成判据 |
 |---|---|---|
-| **在线续期** | toolkit-server 台账、受限 renewal 私钥、POST refresh、TKR1 + nonce；客户端保留 root anchor，续期只写 lease | 旧 TKR1 重放被拒；renewal 修改机器/功能/商务截止被拒；续期钥泄露也不能越过 root 商务截止 |
-| **措施与恢复** | directive/recovery 双 feed、双序列、epoch、镜像发布脚本、撤 lic/kid、入口轮换 | 高 seq 普通指令压不住 recovery；撤销集合单调；任一镜像故障不影响其它镜像 |
-| **运营能力** | 管理页、审计、限流、邮件提醒；在线 renewal 密钥以专用账户和 `0600` 文件/系统凭据保护 | 提醒去重；所有签发/续期/吊销留痕；密钥轮换演练通过 |
-| **扩展接入** | zero-desktop 接入；仅对运行在我方服务器的价值能力增加 per-device token→lic_id 硬闸门 | 桌面离线能力遵循同一状态机；远端过期 token 返回 403；服务端不可用不破坏仍有效的离线授权 |
+| **验签核心** | `custom-utils` 加 `license` feature：`token.rs`(TKL1 信封+验签) / `keys.rs`(kid+role 表 + `verify_as`) / `machine.rs`(Windows 多分量 + Linux ≥2 分量 + MREQ1 编解码) / `clock.rs`(三点水位 + 误拨判定 + clock-reset nonce 一次性) / `state.rs`(`evaluate` 全判定顺序) / `directive.rs`(TKD1/recovery 解码+双序列，**结构与验签就位、feed 拉取留三期**) | 单测全过：坏签名 / 改字段 / 错 kid / **跨角色拒绝**（renewal 签 TKL1 之外、root 签撤销均拒）/ 错 product / 错机器 / **多数分量匹配 + 单分量精确** / 日期不变量 / 未生效 / 临期 / 宽限（Grant/Lease 两支）/ 过期 / 回拨 / **clock-reset 重放拒绝** |
+| **签发 CLI** | `license-issuer` feature + `tklic` bin：`keygen`(带 role/kid) / `issue`(读 MREQ1 签 TKL1) / `clock-reset` / `inspect` / `verify` | 离线两台机：A 导出 MREQ1 → B `tklic issue` → A `verify` 通过；改一字节即 fail |
+| **密钥产出** | `tklic keygen` 生成一期要 bake 的 **`root×2 + recovery×1`**（renewal/directive 留三期）；私钥 age 口令加密离线双备份 | 私钥不进 git/CI；公钥 hex 记档，供二期 `LICENSE_PUBKEY` 注入 |
+| **质量闸** | custom-utils 跑仓库既定 clippy/fmt/test 全绿 | 测试私钥不进产物；`prod` 与开发公钥回退互斥（`build.rs` 契约在二期消费方处生效，一期库内不 bake） |
 
-在线私钥无法靠“age 加密文件”单独解决无人值守解密：解密秘密若与文件同机，安全性只等同于该机器账户。
-因此二期以最小权限、专用用户、文件权限、进程隔离、审计和可撤销轮换为控制手段；若环境已有 KMS/系统
-密钥库再接入，不在设计里虚构一个不存在的安全边界。
+> 一期**没有消费方，不 bake 公钥**（`key_table` 由下游 build.rs 注入，一期只保证解析/验签逻辑）。
+> 一期也**没有吊销能力**（措施通道是三期）——库里 `revoked`/`revoked_kids` 判定就位但恒空。
+
+### 二期：zuche 首次接入（第一个真实交付）✅ 已完成
+
+> 已落地并 review + 提交（zuche `f809016`，与 gateway 恢复工作同一 commit）：`app_core::license`
+> LicenseRuntime、`build.rs` 公钥注入（prod 禁回退）、`zuche-rs license machine/import/status`、
+> web 能力 guard + 授权页；`cargo check -p zuche-app` 干净。安全 review 全通过。
+
+| 工作包 | 内容 | 完成判据 |
+|---|---|---|
+| **公钥 bake** | zuche `build.rs` 从 `LICENSE_PUBKEY` 注入一期产出的 `root×2 + recovery×1`；`prod`↔开发公钥回退互斥、缺失即构建失败（**当前用 env 变量；三期迁 committed 文件 §2.3**） | prod 构建未注入真公钥 → 编译失败；开发公钥只在 `dev` fallback 常量下可用 |
+| **zuche 命令行** | `zuche-rs license machine`（导出 MREQ1）/ `import <token>` / `status`；授权文件**原子写** `~/.config/zuche-rs/license.anchor.tkl` | 全离线走通"导出机器串→签发→导入→生效"；导入失败不破坏旧授权；新 root 授权能把过期状态救回 |
+| **zuche web guard** | 共享 `LicenseRuntime`；始终可达的授权页；`LicenseCapability::{Activate,Read,Produce,Mutate}` 逐 handler/子 Router 标注，接进合并后的总 Router + 后台生产循环 | `/api/login\|verify\|request`、同步、重放、配置修改、验证码 drive/auto/abandon 等生产/写受限；授权页 + allowlist 只读页放行；**未标注路由默认按 Produce 拒绝**（受限下） |
+| **数据红线** | 不删/不改/不加密客户已有数据；**受限模式只放行只读页 + 授权页，不含导出**（导出是 zuche 自己的路线，非本期） | 过期前后数据文件一致；受限下只读页可看、生产/写全禁 |
+| **首客约束** | 一期无吊销、二期也还没上措施通道，故**首个 zuche 客户 `business_deadline` 设短**（建议 ≤3 个月），把"错发了没法远程关"的窗口压小 | 台账/签发默认期限短；到期演练在一台 Linux 测试机完成 |
+
+> **能力标注取代"GET 放行/POST 禁止"**：zuche 的 GET/SSE 可能驱动后台状态、POST 里也可能有读操作，
+> 不能按方法分。用 `LicenseCapability` 显式标注，`Restricted` 只放 `Activate`/`Read`；最外层 guard 兜底，
+> **未标注 = Produce = 受限下拒绝**；长驻后台循环在每次真正生产动作前重读共享状态，别只在启动查一次。
+>
+> `zuche-rs` 当前只手工解析 `--port`、无命令框架。二期先用一个小型可测的参数模块在起库/浏览器前分流
+> `license` 子命令，不为三个子命令引入 clap；后续 CLI 长大再评估。
+
+### 三期：在线续期、措施运营与其它产品
+
+| 工作包 | 内容 | 完成判据 |
+|---|---|---|
+| **委托子密钥（地基，先做）** | custom-utils 加 `TKDC1` 委托证书（§2.4）：类型/编解码 + `verify_as` 增加"经证书链验子密钥"路径 + `tklic delegate` 签证书；build.rs 改读 committed 公钥文件（§2.3） | root 签的证书链验 renewal/directive 签名通过；过期证书被拒；改 root 只需换 committed 文件不动客户端 |
+| **在线续期** | toolkit-server `licenses` 台账、受限 renewal 私钥、`POST /api/license/refresh`、TKR1 + nonce + **随响应带 renewal 委托证书**；客户端保留 root anchor、续期只写 `license.lease.tkl` | 旧 TKR1 重放被拒；renewal 改机器/功能/商务截止被拒；续期钥泄露也越不过 root 商务截止且**受证书有效期封顶** |
+| **措施与恢复** | directive/recovery **双 feed** + 双序列 + directive epoch + 镜像发布脚本 + 撤 lic/kid + 入口轮换；**directive 走 root 委托子密钥（feed 里带证书），recovery 仍直接 bake** | 高 seq 普通指令压不住 recovery；撤销集合单调；任一镜像故障不拖垮其它；换 directive 钥零客户端改动 |
+| **运营能力** | 管理页、审计、限流、邮件提醒（`lettre`）；renewal 私钥专用账户 + `0600`/系统凭据；**定期用 root 现签新证书轮换 renewal/directive** | 提醒去重；签发/续期/吊销全留痕；密钥轮换演练（换证书不动客户端）通过 |
+| **扩展接入** | zero-desktop 接入（Windows 指纹 + Tauri guard）；仅对**跑在我方服务器**的价值能力加 per-device token→lic_id 硬闸门 | 桌面离线遵循同一状态机；远端过期 token 返回 403；服务端不可用不破坏仍有效的离线授权 |
+
+> 在线私钥无法靠"age 加密文件"独解无人值守解密：解密秘密与文件同机时，安全性只等同该机账户。故三期
+> 以最小权限 / 专用用户 / 文件权限 / 进程隔离 / 审计 / 可撤销轮换为控制手段；有 KMS/系统密钥库再接，
+> 不虚构不存在的安全边界。
 
 ---
 
@@ -563,14 +646,17 @@ tklic verify  <token>                                    # 本地验签自检（
 
 | 点 | 决策 | 分期说明 |
 |---|---|---|
-| 首次消费方 | **zuche** | 一期完成；zero-desktop 放二期 |
+| 首次消费方 | **zuche** | 二期完成（一期是不含消费方的纯核心）；zero-desktop 放三期 |
 | 签名算法 | **Ed25519** | 无 C 依赖、体积小；没有国密合规要求时不引入 SM2 复杂度 |
-| 一期公钥 | **root×2 + recovery×1** | 主 root、冷备 root、离线时钟恢复；生产构建禁止开发公钥回退 |
-| 二期新增公钥 | **renewal×1 + directive×1** | 开在线续期/措施通道时再加入，不让一期承担未使用角色 |
-| 离线私钥 | **age 口令加密 + 离线双备份** | root/recovery/directive 不进入服务端和 CI |
-| 在线私钥 | **专用 renewal 私钥 + OS 权限/隔离/审计** | 二期放 G10；客户端权限约束 + recovery 可撤销控制泄露半径 |
-| 措施镜像 | **Gitee + OSS + GitHub** | 二期实现，面向大陆时 Gitee/OSS 排前 |
-| 授权台账 | **一期无台账；二期集中到 toolkit-server** | zuche 不复制一套签发后台，只持本机授权文件；统一管理不同 product |
+| **只 bake 信任锚** | **root×2 + recovery×1**（renewal/directive 不 bake） | root/recovery 是锚，无更上层能背书 → 直接 bake；renewal/directive 走 root 委托子密钥（§2.4），可零客户端改动轮换 |
+| **子密钥 / 委托证书** | **三期起 renewal/directive 走 root 委托（`TKDC1`）** | 在线/常用钥想随时轮换又不想重发客户端；证书带有效期=自动轮换+泄露封顶；recovery 独立不委托（§2.4） |
+| **公钥来源** | **committed 文件（`license-pubkeys/{prod,dev}.txt`），非环境变量** | 公钥非秘密可进仓库；免每次 prod 构建记得设 env；`tklic export-table` 生成。二期用 env 临时，三期迁移（§2.3） |
+| 受限模式 | **只放行只读页 + 授权页，不含导出** | 已定降级；导出/MySQL 直读是 zuche 自己的路线，license 不承担 |
+| Linux 机器指纹 | **≥2 分量（machine_id + product_uuid/fs-uuid/mac）** | 避免单 machine_id 在重装/克隆下 brick 客户服务器 |
+| 离线私钥 | **age 口令加密 + 离线双备份**（可升级硬件令牌 / Shamir 分片） | root/recovery/directive 不进入服务端和 CI；硬件令牌（YubiKey，私钥不出设备）/ Shamir(2-of-3) 是推荐的保管升级，上不上由运维定 |
+| 在线私钥 | **专用 renewal 私钥 + OS 权限/隔离/审计** | 三期放 G10；权限最小（受证书有效期 + 客户端字段约束 + recovery 撤销三重封顶） |
+| 措施镜像 | **Gitee + OSS + GitHub** | 三期实现，面向大陆时 Gitee/OSS 排前 |
+| 授权台账 | **前两期无台账；三期集中到 toolkit-server** | zuche 不复制一套签发后台，只持本机授权文件；统一管理不同 product |
 | 服务端硬闸门 | **仅保护我方远端能力** | 不把客户服务器上的 zuche 本地中间件描述成不可绕过的硬保护 |
 
 ---
