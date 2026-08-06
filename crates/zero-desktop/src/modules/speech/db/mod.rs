@@ -125,6 +125,84 @@ impl SpeechDatabase {
         Ok(row)
     }
 
+    /// 记一次交付（日常全量收集，与手动采集的样本分开）。
+    pub async fn insert_scene(&self, new: repository::NewScene) -> Result<i64> {
+        let conn = Arc::clone(&self.conn);
+        let id = tokio::task::spawn_blocking(move || {
+            let guard = conn
+                .lock()
+                .map_err(|_| anyhow::anyhow!("db mutex poisoned"))?;
+            repository::insert_scene(&guard, &new)
+        })
+        .await
+        .map_err(|e| anyhow::anyhow!("spawn_blocking join error: {e}"))??;
+        Ok(id)
+    }
+
+    /// 用累计全文改写已有的那行场景记录（`auto_paste` 合并链），命中返回 `true`。
+    pub async fn update_scene_text(
+        &self,
+        id: i64,
+        text: String,
+        app: repository::SampleAppContext,
+        delivered_at: String,
+    ) -> Result<bool> {
+        let conn = Arc::clone(&self.conn);
+        let hit = tokio::task::spawn_blocking(move || {
+            let guard = conn
+                .lock()
+                .map_err(|_| anyhow::anyhow!("db mutex poisoned"))?;
+            repository::update_scene_text(&guard, id, &text, &app, &delivered_at)
+        })
+        .await
+        .map_err(|e| anyhow::anyhow!("spawn_blocking join error: {e}"))??;
+        Ok(hit)
+    }
+
+    /// 把纠错样本 `sample_id` 关联到它改动的那几条场景记录（按段号回标），返回受影响行数。
+    ///
+    /// `since` 是 `delivered_at` 的下界（本地时间字符串），`session_id` 是可选的会话过滤——
+    /// 两者共同防止「换服务端后段号重头再来」误标历史记录，见 `repository::mark_scenes_corrected`。
+    pub async fn mark_scenes_corrected(
+        &self,
+        segment_ids: Vec<i64>,
+        sample_id: i64,
+        since: String,
+        session_id: Option<String>,
+    ) -> Result<usize> {
+        let conn = Arc::clone(&self.conn);
+        let n = tokio::task::spawn_blocking(move || {
+            let guard = conn
+                .lock()
+                .map_err(|_| anyhow::anyhow!("db mutex poisoned"))?;
+            repository::mark_scenes_corrected(
+                &guard,
+                &segment_ids,
+                sample_id,
+                &since,
+                session_id.as_deref(),
+            )
+        })
+        .await
+        .map_err(|e| anyhow::anyhow!("spawn_blocking join error: {e}"))??;
+        Ok(n)
+    }
+
+    /// 场景记录总览（总数/今日/按应用排行）。
+    pub async fn scene_stats(&self) -> Result<repository::SceneStats> {
+        let today = Local::now().format("%Y-%m-%d").to_string();
+        let conn = Arc::clone(&self.conn);
+        let stats = tokio::task::spawn_blocking(move || {
+            let guard = conn
+                .lock()
+                .map_err(|_| anyhow::anyhow!("db mutex poisoned"))?;
+            repository::scene_stats(&guard, &today)
+        })
+        .await
+        .map_err(|e| anyhow::anyhow!("spawn_blocking join error: {e}"))??;
+        Ok(stats)
+    }
+
     /// 列出全部样本（marked_at 倒序）。
     pub async fn list_samples(&self) -> Result<Vec<repository::SampleRow>> {
         let conn = Arc::clone(&self.conn);

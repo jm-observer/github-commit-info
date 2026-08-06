@@ -1,6 +1,6 @@
 //! 语音纠错一键采集（in-place correction capture）。
 //!
-//! 用户改完中文优化文本后自己复制整段、按专用快捷键（`Ctrl+Alt+C`），程序读当前剪贴板拿到
+//! 用户改完中文优化文本后自己复制整段、按专用快捷键（`Ctrl+Alt+X`），程序读当前剪贴板拿到
 //! `Y'`，把「交付给用户的优化稿 `O` → 用户改好的 `Y'`」+ 原始 ASR `R` + segment_ids 落一条
 //! `speech_samples`。**本期只采集文本对，不分类、不碰音频、不写剪贴板**（音频后置 P2）。
 //!
@@ -31,6 +31,20 @@ const CAPTURE_TIME_WINDOW: Duration = Duration::from_secs(180);
 const SIMILARITY_THRESHOLD: f32 = 0.5;
 /// 已采集过的 `Y'` 文本去重 ring buffer 容量。
 const CAPTURED_RING_CAP: usize = 16;
+
+/// 采集结果反馈：每次按快捷键都必须有回应。
+///
+/// 采集是「按一下、没有任何可见界面」的手势，静默跳过等于让用户误以为采到了——实测就出现过
+/// 「以为采了 2 条、实际只落 1 条」，而原因（超时间窗/相似度不够/重复）只写在日志里，日常
+/// 使用（安装版、不开终端）根本看不到。故所有出口一律发通知，包括失败。
+fn notify_capture(app: &tauri::AppHandle, title: &str, body: impl Into<String>) {
+    use tauri_plugin_notification::NotificationExt;
+    let body = body.into();
+    info!(target: "speech", "[capture] notify: {title} — {body}");
+    if let Err(e) = app.notification().builder().title(title).body(&body).show() {
+        warn!(target: "speech", "[capture] notification failed: {e}");
+    }
+}
 
 /// 一次交付：某个 segment ref 最终交付给用户的优化稿 `o` 与拼接原文 `r`。
 ///
@@ -241,6 +255,7 @@ pub async fn run_capture_worker(
         let enabled = read_lock(&llm_settings).capture_enabled;
         if !enabled {
             info!(target: "speech", "[capture] capture_enabled=false, ignoring trigger");
+            notify_capture(&app, "未采集", "采集开关已关闭，可在语音页重新打开");
             continue;
         }
 
@@ -248,10 +263,12 @@ pub async fn run_capture_worker(
             Ok(t) if !t.trim().is_empty() => t,
             Ok(_) => {
                 info!(target: "speech", "[capture] clipboard text empty, ignoring");
+                notify_capture(&app, "未采集", "剪贴板是空的，请先复制改好的整段文本");
                 continue;
             }
             Err(e) => {
                 warn!(target: "speech", "[capture] clipboard read_text failed: {e}");
+                notify_capture(&app, "未采集", format!("读取剪贴板失败：{e}"));
                 continue;
             }
         };
@@ -268,6 +285,7 @@ pub async fn run_capture_worker(
         };
         if already_captured {
             info!(target: "speech", "[capture] Y' already captured before, ignoring");
+            notify_capture(&app, "未采集", "这段文本刚采集过，未重复入库");
             continue;
         }
 
@@ -286,11 +304,22 @@ pub async fn run_capture_worker(
 
         let Some((burst, sim)) = best else {
             info!(target: "speech", "[capture] no burst matched Y' within threshold, ignoring");
+            // 两种成因合并提示：超出时间窗（最近 3 分钟内没有交付）或改动幅度过大（相似度 < 0.5）。
+            // worker 侧无法区分「没有候选」与「候选都不够像」，索性都说清楚，用户自己知道是哪种。
+            notify_capture(
+                &app,
+                "未采集",
+                format!(
+                    "没找到能配对的交付：最近 {} 分钟内没有语音交付，或改动幅度过大",
+                    CAPTURE_TIME_WINDOW.as_secs() / 60
+                ),
+            );
             continue;
         };
 
         if y == burst.o {
             info!(target: "speech", "[capture] Y' identical to delivered O, nothing to learn from, ignoring");
+            notify_capture(&app, "未采集", "与交付原文完全一致，没有可学习的修改");
             continue;
         }
 
@@ -302,6 +331,11 @@ pub async fn run_capture_worker(
         let segment_ids_json = serde_json::to_string(&burst.segment_ids).unwrap_or_default();
         let first_seg = burst.segment_ids.first().copied().unwrap_or(0);
         let now_str = chrono::Local::now().format("%Y-%m-%d %H:%M:%S").to_string();
+        // 场景记录回标的时间下界：与配对时间窗同宽——能配上的交付本来就在这个窗内。
+        let scenes_since = (chrono::Local::now()
+            - chrono::Duration::seconds(CAPTURE_TIME_WINDOW.as_secs() as i64))
+        .format("%Y-%m-%d %H:%M:%S")
+        .to_string();
 
         // 交付时的应用上下文：值是**交付动作发生那一刻**抓拍的（打字前 / 按下 Ctrl+V 时），
         // 此处只是读出来，读取时刻用户已切窗口也不影响正确性。超出配对时间窗的抓拍视为
@@ -338,6 +372,7 @@ pub async fn run_capture_worker(
         let db_handle = mutex_lock(&db).clone();
         let Some(db_handle) = db_handle else {
             warn!(target: "speech", "[capture] speech db not initialized, dropping capture");
+            notify_capture(&app, "未采集", "语音数据库尚未就绪");
             continue;
         };
 
@@ -354,10 +389,44 @@ pub async fn run_capture_worker(
                         captured.pop_front();
                     }
                 }
+                // 回标场景记录：这次纠错对应的那几条交付「被改过」。用于日后统计真实表达
+                // 风格时排除含 ASR/LLM 错误的记录。命不中（对应交付没走自动交付链路、或
+                // 场景记录尚未落库）返回 0，不影响采集本身。
+                //
+                // 限定在「本次采集的配对时间窗 + 同一会话」内：段号是服务端的自增计数器，
+                // 换服务端 / 重建它的 app.db 后会从头再来，不设界的话重开的小段号会把几个月
+                // 前的历史记录无声误标成「被改过」。
+                match db_handle
+                    .mark_scenes_corrected(
+                        burst.segment_ids.clone(),
+                        id,
+                        scenes_since,
+                        burst.session_id.clone(),
+                    )
+                    .await
+                {
+                    Ok(n) => info!(
+                        target: "speech",
+                        "[capture] linked sample id={id} to {n} scene record(s)"
+                    ),
+                    Err(e) => {
+                        warn!(target: "speech", "[capture] mark_scenes_corrected failed: {e:#}")
+                    }
+                }
                 bounce_tray_twice(&app, false);
+                notify_capture(
+                    &app,
+                    "已采集纠错样本",
+                    format!(
+                        "#{id} · 相似度 {:.0}% · {} 段",
+                        sim * 100.0,
+                        burst.segment_ids.len()
+                    ),
+                );
             }
             Err(e) => {
                 warn!(target: "speech", "[capture] insert_sample failed: {e:#}");
+                notify_capture(&app, "采集失败", format!("写入数据库失败：{e}"));
             }
         }
     }

@@ -244,8 +244,9 @@ fn run_gui(workspace: PathBuf) -> Result<()> {
                 // 注册着，它的 overlay 仍是一层拦截整个桌面输入的隐身玻璃。这正是
                 // 「点哪都没反应」反复复发的根源。
                 tauri::WindowEvent::CloseRequested { .. } if window.label() == "main" => {
-                    modules::screenshot::overlay::close_overlay(&window.app_handle().clone());
-                    window.app_handle().exit(0);
+                    let app = window.app_handle();
+                    modules::screenshot::overlay::close_overlay(app);
+                    app.exit(0);
                 }
                 _ => {}
             }
@@ -275,9 +276,12 @@ fn run_gui(workspace: PathBuf) -> Result<()> {
             modules::speech::commands::clean::speech_clean_recording,
             modules::speech::commands::clean::speech_pick_audio_file,
             modules::speech::commands::clean::speech_open_in_folder,
+            modules::speech::commands::samples::speech_fetch_segment_audio,
             modules::speech::commands::samples::speech_mark_sample,
             modules::speech::commands::samples::speech_list_samples,
             modules::speech::commands::samples::speech_export_samples,
+            modules::speech::commands::samples::speech_export_homophone_candidates,
+            modules::speech::commands::samples::speech_scene_stats,
             modules::speech::commands::export::speech_copy_text_to_clipboard,
             modules::speech::commands::init::speech_get_init_status,
             modules::speech::commands::settings::speech_get_settings,

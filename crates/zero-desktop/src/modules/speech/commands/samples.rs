@@ -251,6 +251,41 @@ async fn sync_hotword_to_orchestrator(base: &str, correction: Option<&str>) -> S
     }
 }
 
+/// 试听：从编排器拉取该段音频，base64 返回给前端播放。**不落盘、不落库**——
+/// 与标注存档（`fetch_and_store_audio`）是两条线，这里只是「听一下再决定怎么标」。
+/// 编排器只保留 1 天内的音频 blob（每小时清理），过期 404 → 明确报「已过期」。
+#[tauri::command]
+pub async fn speech_fetch_segment_audio(
+    segment_id: i64,
+    state: State<'_, AppState>,
+) -> Result<String, String> {
+    let Some(base) = remote_http_base_from_state(&state.speech.remote_url) else {
+        return Err("远程识别地址未配置".to_string());
+    };
+    let url = format!("{base}/api/segments/{segment_id}/audio");
+    let client = reqwest::Client::builder()
+        .timeout(AUDIO_TIMEOUT)
+        .build()
+        .map_err(|e| format!("构建 HTTP 客户端失败: {e}"))?;
+    let resp = client
+        .get(&url)
+        .send()
+        .await
+        .map_err(|e| format!("拉取音频失败: {e}"))?;
+    match resp.status().as_u16() {
+        200 => {}
+        404 => return Err("音频已过期（服务端只保留 1 天）".to_string()),
+        other => return Err(format!("拉取音频失败: HTTP {other}")),
+    }
+    let bytes = resp
+        .bytes()
+        .await
+        .map_err(|e| format!("读取音频内容失败: {e}"))?;
+    info!(target: "speech", "[sample] audition seg={segment_id} ({} bytes)", bytes.len());
+    use base64::Engine;
+    Ok(base64::engine::general_purpose::STANDARD.encode(&bytes))
+}
+
 #[allow(clippy::too_many_arguments)]
 #[tauri::command]
 pub async fn speech_mark_sample(
@@ -357,6 +392,26 @@ pub async fn speech_list_samples(state: State<'_, AppState>) -> Result<Vec<Sampl
     Ok(rows.into_iter().map(Sample::from).collect())
 }
 
+/// 场景记录总览：桌面端据此显示「收了多少、今天多少、都来自哪些应用」。
+///
+/// 与样本采集是两条线：这里统计的是**每次交付都记**的全量日志，不是手动采集的纠错样本。
+#[tauri::command]
+pub async fn speech_scene_stats(
+    state: State<'_, AppState>,
+) -> Result<crate::modules::speech::db::repository::SceneStats, String> {
+    let db = {
+        let guard = state
+            .speech
+            .db
+            .lock()
+            .map_err(|_| "speech db mutex poisoned".to_string())?;
+        guard
+            .clone()
+            .ok_or_else(|| "speech db 未初始化".to_string())?
+    };
+    db.scene_stats().await.map_err(|e| e.to_string())
+}
+
 #[tauri::command]
 pub async fn speech_export_samples(state: State<'_, AppState>) -> Result<String, String> {
     let workspace = state.workspace.clone();
@@ -424,6 +479,131 @@ pub async fn speech_export_samples(state: State<'_, AppState>) -> Result<String,
         .await
         .map_err(|e| format!("写导出文件失败 {}: {e}", out_path.display()))?;
     info!(target: "speech", "[sample] exported {} samples -> {}", items.len(), out_path.display());
+    Ok(out_path.to_string_lossy().to_string())
+}
+
+/// 同音候选导出（P2a）：对全部纠错样本跑 `homophone::mine`，按 `(wrong, right, scope)`
+/// 聚合后写 JSON，返回文件路径。**只导出给人工审读，不建表、不改任何配置**（§6.3：
+/// 读音等价 ≠ 同音纠错，必须人工 approve；`homophone_pairs` 表按 v4 约定收集期不建）。
+///
+/// scope 取 `app_exe` 原值（分组维度按设计由 P1 数据决定，这里不预设归类）。
+/// `eligible_pending` = exact 且 hits ≥ 2（§6.2 入表门槛），仅是给人工看的排序信号。
+#[tauri::command]
+pub async fn speech_export_homophone_candidates(
+    state: State<'_, AppState>,
+) -> Result<String, String> {
+    use crate::modules::speech::homophone;
+    use std::collections::BTreeMap;
+
+    let workspace = state.workspace.clone();
+    let db = {
+        let guard = state
+            .speech
+            .db
+            .lock()
+            .map_err(|_| "speech db mutex poisoned".to_string())?;
+        guard
+            .clone()
+            .ok_or_else(|| "speech db 未初始化".to_string())?
+    };
+    let rows = db.list_samples().await.map_err(|e| e.to_string())?;
+
+    struct Agg {
+        reading: String,
+        match_kind: &'static str,
+        hits: usize,
+        sample_ids: Vec<i64>,
+        contexts: Vec<String>,
+    }
+    let mut agg: BTreeMap<(String, String, String), Agg> = BTreeMap::new();
+    let mut mined_samples = 0usize;
+    for r in &rows {
+        let Some(correction) = r.correction.as_deref().filter(|s| !s.trim().is_empty()) else {
+            continue;
+        };
+        // O = 实际交付的文本（优化文，缺则原文）。ok 标签本就无 correction，天然被上面滤掉。
+        let delivered = r
+            .text_optimized
+            .as_deref()
+            .filter(|s| !s.trim().is_empty())
+            .unwrap_or(&r.text_raw);
+        let found = homophone::mine(delivered, correction);
+        if found.is_empty() {
+            continue;
+        }
+        mined_samples += 1;
+        let scope = r.app_exe.clone().unwrap_or_else(|| "unknown".to_string());
+        for c in found {
+            let entry = agg
+                .entry((c.wrong.clone(), c.right.clone(), scope.clone()))
+                .or_insert_with(|| Agg {
+                    reading: c.reading.clone(),
+                    match_kind: c.match_kind.as_str(),
+                    hits: 0,
+                    sample_ids: Vec::new(),
+                    contexts: Vec::new(),
+                });
+            entry.hits += 1;
+            entry.sample_ids.push(r.id);
+            if entry.contexts.len() < 3 {
+                entry.contexts.push(c.context);
+            }
+        }
+    }
+
+    let mut candidates: Vec<serde_json::Value> = agg
+        .into_iter()
+        .map(|((wrong, right, scope), a)| {
+            serde_json::json!({
+                "wrong": wrong,
+                "right": right,
+                "scope": scope,
+                "reading": a.reading,
+                "match_kind": a.match_kind,
+                "hits": a.hits,
+                "eligible_pending": a.match_kind == "exact" && a.hits >= 2,
+                "sample_ids": a.sample_ids,
+                "contexts": a.contexts,
+            })
+        })
+        .collect();
+    // exact 优先、hits 降序，人工从最可信的看起。
+    candidates.sort_by(|x, y| {
+        let rank = |v: &serde_json::Value| match v["match_kind"].as_str() {
+            Some("exact") => 0,
+            Some("polyphone") => 1,
+            _ => 2,
+        };
+        rank(x)
+            .cmp(&rank(y))
+            .then(y["hits"].as_u64().cmp(&x["hits"].as_u64()))
+    });
+
+    let doc = serde_json::json!({
+        "generated_at": now_str(),
+        "samples_total": rows.len(),
+        "samples_with_candidates": mined_samples,
+        "note": "读音等价≠同音纠错(改专名/改习惯也读音等价)。exact 才可考虑入表, polyphone/fuzzy 仅供参考; 入表须人工确认(§6.3)。",
+        "candidates": candidates,
+    });
+
+    let dir = workspace.join("speech_samples");
+    tokio::fs::create_dir_all(&dir)
+        .await
+        .map_err(|e| format!("创建 speech_samples 目录失败: {e}"))?;
+    let ts = Local::now().format("%Y%m%d-%H%M%S").to_string();
+    let out_path = dir.join(format!("homophone-candidates-{ts}.json"));
+    let json = serde_json::to_string_pretty(&doc).map_err(|e| e.to_string())?;
+    tokio::fs::write(&out_path, json)
+        .await
+        .map_err(|e| format!("写导出文件失败 {}: {e}", out_path.display()))?;
+    info!(
+        target: "speech",
+        "[homophone] exported {} candidate group(s) from {} sample(s) -> {}",
+        doc["candidates"].as_array().map(Vec::len).unwrap_or(0),
+        mined_samples,
+        out_path.display()
+    );
     Ok(out_path.to_string_lossy().to_string())
 }
 

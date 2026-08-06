@@ -211,9 +211,9 @@ mod win {
     };
 
     const VK_V: u32 = 0x56;
-    /// 语音纠错一键采集的专用快捷键组合（`Ctrl+Alt+C`）中的 `C` 键。注意 `C` 同时也是普通
-    /// 复制快捷键的一部分，但只有同时按下 Ctrl **和** Alt 时才吞键/触发；纯 Ctrl+C 不受影响。
-    const VK_C: u32 = 0x43;
+    /// 语音纠错一键采集的专用快捷键组合（`Ctrl+Alt+X`）中的 `X` 键。注意 `X` 同时也是普通
+    /// 剪切快捷键的一部分，但只有同时按下 Ctrl **和** Alt 时才吞键/触发；纯 Ctrl+X 不受影响。
+    const VK_X: u32 = 0x58;
     const KEY_DOWN_MASK: u16 = 0x8000;
 
     unsafe extern "system" fn hook_proc(code: i32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
@@ -228,28 +228,37 @@ mod win {
                         (GetAsyncKeyState(VK_CONTROL as i32) as u16 & KEY_DOWN_MASK) != 0;
                     if ctrl_down {
                         PASTE_SIGNAL.store(true, Ordering::Relaxed);
-                        // auto_copy 链路的「实际交付时刻」就是这一下 Ctrl+V：此刻前台窗口
-                        // 即粘贴目标，抓拍最准。钩子回调有超时限制，抓拍只做几个本地
-                        // Win32 调用且全程失败即放弃，不会阻塞。
-                        super::record_delivery_app("auto_copy");
+                        // 门控：本钩子看得见**全局每一次** Ctrl+V，其中绝大多数是用户在粘
+                        // 自己的东西，与语音毫无关系。早期版本在此无条件抓拍，结果任意一次
+                        // 普通粘贴都会覆盖 LAST_DELIVERY、把 mode 改写成 auto_copy——采集
+                        // 样本因此记到一个跟语音交付无关的窗口上（实测污染过样本 id=8）。
+                        // 只有剪贴板里确实躺着待交付的语音内容时，这一下才算一次交付。
+                        if crate::modules::speech::scene_log::has_pending_clipboard() {
+                            // auto_copy 链路的「实际交付时刻」就是这一下 Ctrl+V：此刻前台窗口
+                            // 即粘贴目标，抓拍最准。钩子回调有超时限制，抓拍只做几个本地
+                            // Win32 调用且全程失败即放弃，不会阻塞。
+                            super::record_delivery_app("auto_copy");
+                            // 场景记录：只发信号，落库交给 worker（钩子里不碰数据库）。
+                            crate::modules::speech::scene_log::signal_paste_delivered();
+                        }
                     }
-                } else if vk_code == VK_C {
+                } else if vk_code == VK_X {
                     let ctrl_down =
                         (GetAsyncKeyState(VK_CONTROL as i32) as u16 & KEY_DOWN_MASK) != 0;
                     let alt_down = (GetAsyncKeyState(VK_MENU as i32) as u16 & KEY_DOWN_MASK) != 0;
                     if ctrl_down && alt_down {
                         crate::modules::speech::capture::signal_capture();
-                        // 吞掉 Ctrl+Alt+C：不放行给前台窗口，避免它当普通按键处理。
+                        // 吞掉 Ctrl+Alt+X：不放行给前台窗口，避免它当普通按键处理。
                         return 1;
                     }
                 }
             }
         }
-        // 其余按键（含普通 Ctrl+V / Ctrl+C）始终放行。
+        // 其余按键（含普通 Ctrl+V / Ctrl+X）始终放行。
         CallNextHookEx(ptr::null_mut(), code, wparam, lparam)
     }
 
-    use windows_sys::Win32::Foundation::{CloseHandle, HWND};
+    use windows_sys::Win32::Foundation::{CloseHandle, BOOL, HWND};
     use windows_sys::Win32::System::Threading::{
         GetCurrentProcessId, OpenProcess, QueryFullProcessImageNameW,
         PROCESS_QUERY_LIMITED_INFORMATION,
@@ -258,8 +267,12 @@ mod win {
         SendInput, INPUT, INPUT_0, INPUT_KEYBOARD, KEYBDINPUT, KEYEVENTF_KEYUP, KEYEVENTF_UNICODE,
     };
     use windows_sys::Win32::UI::WindowsAndMessaging::{
-        GetClassNameW, GetForegroundWindow, GetWindowTextW, GetWindowThreadProcessId,
+        EnumChildWindows, GetClassNameW, GetForegroundWindow, GetWindowTextW,
+        GetWindowThreadProcessId,
     };
+
+    /// UWP 应用的前台窗口归属的壳进程。真实 app 藏在它承载的 CoreWindow 子窗口里。
+    const UWP_SHELL_EXE: &str = "ApplicationFrameHost.exe";
 
     /// 窗口标题 / 类名的读取上限（UTF-16 码元）。标题超长直接截断——收集期够用，
     /// 也避免在键盘钩子里搬运过大的缓冲。
@@ -283,19 +296,81 @@ mod win {
             if pid == 0 || pid == GetCurrentProcessId() {
                 return None;
             }
-            let path = process_image_path(pid);
-            let exe = path
-                .as_deref()
-                .and_then(|p| p.rsplit(['\\', '/']).next())
-                .filter(|s| !s.is_empty())
-                .map(str::to_string);
+            let mut path = process_image_path(pid);
+            let mut exe = exe_from_path(path.as_deref());
+            // 目标窗口默认就是前台窗口；UWP 场景下改为承载的真实 app 子窗口（见下）。
+            let mut target = hwnd;
+
+            // L2：UWP 壳修正。传统应用的前台窗口即目标；但 UWP 的前台是壳进程
+            // ApplicationFrameHost.exe 的 ApplicationFrameWindow，真正的应用是它承载的
+            // CoreWindow 子窗口，属于**另一个**进程。命中壳进程时反查那个子窗口，让
+            // exe/path/title/class 全取真实 app 的。找不到跨进程子窗口（罕见）则保留壳
+            // 信息不猜——记成 ApplicationFrameHost 也好过编造。
+            if exe.as_deref() == Some(UWP_SHELL_EXE) {
+                if let Some((child_hwnd, child_pid)) = uwp_hosted_window(hwnd, pid) {
+                    target = child_hwnd;
+                    path = process_image_path(child_pid);
+                    exe = exe_from_path(path.as_deref());
+                }
+            }
+
             Some(super::DeliveryApp {
                 exe,
                 path,
-                title: window_text(hwnd, TextKind::Title),
-                class: window_text(hwnd, TextKind::Class),
+                title: window_text(target, TextKind::Title),
+                class: window_text(target, TextKind::Class),
                 mode: "",
             })
+        }
+    }
+
+    /// 从可执行文件全路径截出文件名（`C:\...\Code.exe` → `Code.exe`）。空/无路径返回 `None`。
+    fn exe_from_path(path: Option<&str>) -> Option<String> {
+        path.and_then(|p| p.rsplit(['\\', '/']).next())
+            .filter(|s| !s.is_empty())
+            .map(str::to_string)
+    }
+
+    /// EnumChildWindows 的收集器：找 `frame` 下第一个属于**其他进程**的后代窗口。
+    struct UwpProbe {
+        frame_pid: u32,
+        found_hwnd: HWND,
+        found_pid: u32,
+    }
+
+    /// EnumChildWindows 回调。属于另一进程的子窗口 = ApplicationFrameHost 承载的真实 UWP
+    /// app（CoreWindow），记下即停止枚举。全程只做 `GetWindowThreadProcessId` 一次本地调用。
+    unsafe extern "system" fn uwp_child_proc(child: HWND, lparam: LPARAM) -> BOOL {
+        let probe = &mut *(lparam as *mut UwpProbe);
+        let mut pid: u32 = 0;
+        GetWindowThreadProcessId(child, &mut pid);
+        if pid != 0 && pid != probe.frame_pid {
+            probe.found_hwnd = child;
+            probe.found_pid = pid;
+            return 0; // FALSE：停止枚举
+        }
+        1 // TRUE：继续
+    }
+
+    /// 反查 UWP 壳窗口 `frame` 承载的真实 app 窗口与进程。找不到返回 `None`。
+    ///
+    /// 只在前台确为 `ApplicationFrameHost.exe` 时调用，故枚举面很小；仍在键盘钩子里跑，
+    /// 但仅遍历壳的子窗口树、命中即停，开销可忽略。
+    unsafe fn uwp_hosted_window(frame: HWND, frame_pid: u32) -> Option<(HWND, u32)> {
+        let mut probe = UwpProbe {
+            frame_pid,
+            found_hwnd: ptr::null_mut(),
+            found_pid: 0,
+        };
+        EnumChildWindows(
+            frame,
+            Some(uwp_child_proc),
+            &mut probe as *mut UwpProbe as LPARAM,
+        );
+        if probe.found_hwnd.is_null() || probe.found_pid == 0 {
+            None
+        } else {
+            Some((probe.found_hwnd, probe.found_pid))
         }
     }
 
@@ -465,5 +540,31 @@ mod win {
                 error!(target: "speech", "[paste_watch] spawn watcher thread failed: {e}");
             })
             .ok();
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::exe_from_path;
+
+        #[test]
+        fn exe_from_path_basics() {
+            assert_eq!(
+                exe_from_path(Some(r"C:\Program Files\Code\Code.exe")).as_deref(),
+                Some("Code.exe")
+            );
+            // UWP 真实 app 路径（WindowsApps 深路径）也能截出末段。
+            assert_eq!(
+                exe_from_path(Some(
+                    r"C:\Program Files\WindowsApps\Microsoft.WindowsNotepad_x64__8we\Notepad\Notepad.exe"
+                ))
+                .as_deref(),
+                Some("Notepad.exe")
+            );
+            assert_eq!(exe_from_path(Some("/usr/bin/foo")).as_deref(), Some("foo"));
+            // 无路径 / 空 / 以分隔符结尾 → None，不返回空串。
+            assert_eq!(exe_from_path(None), None);
+            assert_eq!(exe_from_path(Some("")), None);
+            assert_eq!(exe_from_path(Some(r"C:\dir\")), None);
+        }
     }
 }

@@ -233,6 +233,13 @@ zero-desktop 主窗 webview 消息循环，所以 UI「卡」时 ASR 照常响�
 挂起）——ready-ack watchdog 只覆盖「show() 到就绪」这一小段窗口期，ack 一旦到达就
 彻底撤防。而残留代价是整个桌面失去输入，不对称到不值得省这一层。
 
+**watchdog 关窗一律带 session 判定**（2026-07-25 补）：两个 watchdog 都改走
+`close_overlay_if_current(app, session_id)`——定时器是「过去某一刻排下的队」，到期时屏上
+那扇窗可能已经不是当初那扇。ready 超时分支原先无条件 `close_overlay`，会误关后继截图的
+overlay，还会把 `CURRENT_SESSION` 清零、连带废掉它的 ⑧ 号兜底（新窗从此没有 120s 保护）。
+用户主动触发的路径（commit / cancel / 关主窗）仍走无条件 `close_overlay`——那些就是要关掉
+屏上任何一扇。
+
 ### 7.3 验收记录（2026-07-21 实测）
 
 1. **单实例**：起一个实例后再次启动 → 新进程立即自退（退出码 0），实例数保持 1；

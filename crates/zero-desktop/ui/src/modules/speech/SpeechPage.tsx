@@ -81,6 +81,7 @@ export default function SpeechPage() {
   const [autoPasteRewriteRetype, setAutoPasteRewriteRetype] = useState(false);
   const [autoStart, setAutoStart] = useState(false);
   const [captureEnabled, setCaptureEnabled] = useState(true);
+  const [sceneLogEnabled, setSceneLogEnabled] = useState(true);
   const [settingsLoaded, setSettingsLoaded] = useState(false);
   const autoStartFiredRef = useRef(false);
 
@@ -99,6 +100,7 @@ export default function SpeechPage() {
         setAutoPasteRewriteRetype(!!s.auto_paste_rewrite_retype);
         setAutoStart(!!s.auto_start);
         setCaptureEnabled(s.capture_enabled !== false);
+        setSceneLogEnabled(s.scene_log_enabled !== false);
       })
       .catch((err) => console.warn('Load settings failed', err))
       .finally(() => setSettingsLoaded(true));
@@ -372,6 +374,7 @@ export default function SpeechPage() {
       auto_paste_rewrite_retype: autoPasteRewriteRetype,
       auto_start: autoStart,
       capture_enabled: captureEnabled,
+      scene_log_enabled: sceneLogEnabled,
     };
     persistAndMaybeReconnect(next, true);
   };
@@ -397,6 +400,7 @@ export default function SpeechPage() {
       auto_paste_rewrite_retype: autoPasteRewriteRetype,
       auto_start: autoStart,
       capture_enabled: captureEnabled,
+      scene_log_enabled: sceneLogEnabled,
     };
     persistAndMaybeReconnect(next, urlChanged);
   };
@@ -416,6 +420,7 @@ export default function SpeechPage() {
       auto_paste_rewrite_retype: autoPasteRewriteRetype,
       auto_start: autoStart,
       capture_enabled: captureEnabled,
+      scene_log_enabled: sceneLogEnabled,
     };
     SpeechAPI.applySettings(next).catch((err) =>
       console.error('apply notify_sound failed', err)
@@ -437,6 +442,7 @@ export default function SpeechPage() {
       auto_paste_rewrite_retype: autoPasteRewriteRetype,
       auto_start: autoStart,
       capture_enabled: captureEnabled,
+      scene_log_enabled: sceneLogEnabled,
     };
     SpeechAPI.applySettings(next).catch((err) =>
       console.error('apply auto_paste failed', err)
@@ -458,6 +464,7 @@ export default function SpeechPage() {
       auto_paste_rewrite_retype: val,
       auto_start: autoStart,
       capture_enabled: captureEnabled,
+      scene_log_enabled: sceneLogEnabled,
     };
     SpeechAPI.applySettings(next).catch((err) =>
       console.error('apply auto_paste_rewrite_retype failed', err)
@@ -479,6 +486,7 @@ export default function SpeechPage() {
       auto_paste_rewrite_retype: autoPasteRewriteRetype,
       auto_start: val,
       capture_enabled: captureEnabled,
+      scene_log_enabled: sceneLogEnabled,
     };
     SpeechAPI.applySettings(next).catch((err) =>
       console.error('apply auto_start failed', err)
@@ -500,9 +508,32 @@ export default function SpeechPage() {
       auto_paste_rewrite_retype: autoPasteRewriteRetype,
       auto_start: autoStart,
       capture_enabled: val,
+      scene_log_enabled: sceneLogEnabled,
     };
     SpeechAPI.applySettings(next).catch((err) =>
       console.error('apply capture_enabled failed', err)
+    );
+  };
+
+  const handleSceneLogEnabledChange = (val: boolean) => {
+    if (val === sceneLogEnabled) return;
+    setSceneLogEnabled(val);
+    const next: AppSettings = {
+      asr_language: asrLanguage,
+      auto_copy_mode: autoCopyMode,
+      merge_window_ms: mergeWindowMs,
+      remote_url: remoteUrl,
+      remote_url_presets: remoteUrlPresets,
+      want_secondary: wantSecondary,
+      notify_sound: notifySound,
+      auto_paste: autoPaste,
+      auto_paste_rewrite_retype: autoPasteRewriteRetype,
+      auto_start: autoStart,
+      capture_enabled: captureEnabled,
+      scene_log_enabled: val,
+    };
+    SpeechAPI.applySettings(next).catch((err) =>
+      console.error('apply scene_log_enabled failed', err)
     );
   };
 
@@ -521,6 +552,7 @@ export default function SpeechPage() {
       auto_paste_rewrite_retype: autoPasteRewriteRetype,
       auto_start: autoStart,
       capture_enabled: captureEnabled,
+      scene_log_enabled: sceneLogEnabled,
     };
     persistAndMaybeReconnect(next, true);
   };
@@ -543,6 +575,7 @@ export default function SpeechPage() {
       auto_paste_rewrite_retype: autoPasteRewriteRetype,
       auto_start: autoStart,
       capture_enabled: captureEnabled,
+      scene_log_enabled: sceneLogEnabled,
     };
     persistAndMaybeReconnect(next, urlChanged);
   };
@@ -571,6 +604,7 @@ export default function SpeechPage() {
   };
 
   const [exporting, setExporting] = useState(false);
+  const [exportingHomophone, setExportingHomophone] = useState(false);
 
   const handleExportSamples = async () => {
     setExporting(true);
@@ -582,6 +616,20 @@ export default function SpeechPage() {
       store.setErrorMessage(typeof err === 'string' ? err : (err as Error)?.message || String(err));
     } finally {
       setExporting(false);
+    }
+  };
+
+  // P2a：对纠错样本跑同音候选挖掘，导出 JSON 供人工审读（不建表、不改配置）。
+  const handleExportHomophone = async () => {
+    setExportingHomophone(true);
+    try {
+      const path = await SpeechAPI.exportHomophoneCandidates();
+      await SpeechAPI.openInFolder(path);
+    } catch (err) {
+      console.error('export homophone candidates failed', err);
+      store.setErrorMessage(typeof err === 'string' ? err : (err as Error)?.message || String(err));
+    } finally {
+      setExportingHomophone(false);
     }
   };
 
@@ -617,6 +665,7 @@ export default function SpeechPage() {
               auto_paste_rewrite_retype: autoPasteRewriteRetype,
               auto_start: autoStart,
               capture_enabled: captureEnabled,
+              scene_log_enabled: sceneLogEnabled,
             };
             SpeechAPI.applySettings(next).catch((err) => console.error('apply asr_language failed', err));
           }}
@@ -635,6 +684,7 @@ export default function SpeechPage() {
               auto_paste_rewrite_retype: autoPasteRewriteRetype,
               auto_start: autoStart,
               capture_enabled: captureEnabled,
+              scene_log_enabled: sceneLogEnabled,
             };
             SpeechAPI.applySettings(next).catch((err) => console.error('apply auto_copy_mode failed', err));
           }}
@@ -659,6 +709,7 @@ export default function SpeechPage() {
               auto_paste_rewrite_retype: autoPasteRewriteRetype,
               auto_start: autoStart,
               capture_enabled: captureEnabled,
+              scene_log_enabled: sceneLogEnabled,
             };
             SpeechAPI.applySettings(next).catch((err) => console.error('apply merge_window_ms failed', err));
           }}
@@ -673,6 +724,8 @@ export default function SpeechPage() {
           onNotifySoundChange={handleNotifySoundChange}
           captureEnabled={captureEnabled}
           onCaptureEnabledChange={handleCaptureEnabledChange}
+          sceneLogEnabled={sceneLogEnabled}
+          onSceneLogEnabledChange={handleSceneLogEnabledChange}
           disabled={isBusy}
         />
       </div>
@@ -687,7 +740,16 @@ export default function SpeechPage() {
               onUpdateConfig={updateVoiceConfig}
             />
 
-            <div className="flex justify-end">
+            <div className="flex justify-end gap-1">
+              <button
+                onClick={handleExportHomophone}
+                disabled={exportingHomophone}
+                className="inline-flex items-center gap-1.5 h-7 px-2.5 text-[11px] rounded-md text-[var(--ink-4)] hover:text-[var(--ink-2)] hover:bg-[var(--bg-soft)] transition-colors disabled:opacity-50"
+                title="对纠错样本挖掘同音替换候选，导出 JSON 供人工审读（exact 级才可考虑入表）"
+              >
+                <Icon name={exportingHomophone ? 'refresh' : 'wand'} size={12} className={exportingHomophone ? 'animate-spin' : undefined} />
+                {exportingHomophone ? '挖掘中...' : '导出同音候选'}
+              </button>
               <button
                 onClick={handleExportSamples}
                 disabled={exporting}

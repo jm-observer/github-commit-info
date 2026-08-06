@@ -61,6 +61,7 @@ rubato = "0.16"
 rtrb = "0.3"
 lofty = "0.24"
 crossbeam-channel = "0.5"
+pinyin = "0.11.0"
 
 [dev-dependencies]
 # screenshot 元数据 sidecar 的单测：临时 workspace 目录
