@@ -49,7 +49,9 @@ rand = "0.8"
 base64 = "0.21"
 # Speech 模块依赖
 cpal = "0.16"
-tokio-tungstenite = "0.24"
+# 外网档 ASR 是 wss://（经 caddy TLS 终止）；默认特性不含 TLS，连 wss 会报
+# "TLS support not compiled in"。与 workspace reqwest 一致走 rustls，不引 native-tls。
+tokio-tungstenite = { version = "0.24", features = ["rustls-tls-webpki-roots"] }
 futures-util = "0.3"
 # Music 模块依赖（原生音频引擎：解码 / 输出 / 重采样 / 元数据 / 无锁环形缓冲）
 symphonia = { version = "0.6", features = [
