@@ -38,6 +38,9 @@ uuid = { workspace = true }
 # license 续期签名（signer.rs 直接持有 SigningKey 类型）；版本/feature 与 custom-utils 的
 # ed25519-dalek 依赖对齐（license-sign feature 里那份），避免类型不一致。
 ed25519-dalek = { version = "2", default-features = false, features = ["std"] }
+# 软件授权 · 临期邮件提醒（alerts.rs，设计 §4.3/§7）：异步 SMTP，禁默认 feature 避免拉 openssl，
+# 走 rustls + tokio1 运行时。
+lettre = { version = "0.11", default-features = false, features = ["tokio1-rustls-tls", "smtp-transport", "builder"] }
 
 [dev-dependencies]
 reqwest = { workspace = true }

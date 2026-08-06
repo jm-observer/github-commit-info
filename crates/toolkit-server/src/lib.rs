@@ -127,6 +127,26 @@ pub async fn serve_with_web(
     // 只在真正 serve 时 spawn —— bootstrap() 是同步装配、测试也复用它，不应带副作用。
     tokio::spawn(egress_sessions::run_reaper(state.egress_sessions.clone()));
 
+    // 软件授权 · 临期邮件提醒（设计 docs/license-impl-design.md §4.3/§7）：只在真正 serve 时
+    // spawn，同上面的 reaper。未配置 SMTP_HOST/SMTP_FROM/LICENSE_ALERT_TO 任一则不启用。
+    match license::AlertConfig::from_env() {
+        Ok(Some(cfg)) => {
+            log::info!("license 临期邮件提醒已启用（每 24h 扫描一次 licenses 台账）");
+            license::alerts::spawn_daily_scan(state.pool.clone(), cfg);
+        }
+        Ok(None) => {
+            log::info!(
+                "未设置 {}/{}/{}：license 临期邮件提醒未启用",
+                license::alerts::ENV_SMTP_HOST,
+                license::alerts::ENV_SMTP_FROM,
+                license::alerts::ENV_LICENSE_ALERT_TO
+            );
+        }
+        Err(e) => {
+            return Err(e.context("装配 license 临期邮件提醒配置失败"));
+        }
+    }
+
     // 鉴权挂在最外层（含 nest 进来的 /api/asr）：未设 TOOLKIT_API_TOKEN 则整层放行。
     if std::env::var(auth::TOKEN_ENV).is_ok_and(|v| !v.trim().is_empty()) {
         log::info!("API 鉴权已启用（{}）", auth::TOKEN_ENV);
@@ -244,6 +264,14 @@ pub async fn bind_ephemeral() -> Result<(tokio::net::TcpListener, SocketAddr)> {
 
 /// 用于测试：把现成 listener + state 跑起来（无静态 web 目录，走嵌入式 HTML）。
 pub async fn serve_with_listener(listener: tokio::net::TcpListener, state: AppState) -> Result<()> {
+    // 同 serve_with_web：只在真正监听时 spawn 临期邮件提醒后台任务，未配置则不启用。
+    // 测试环境通常不设 SMTP_* env，这里静默跳过（Err 仍冒泡——配置了但非法时测试也该炸）。
+    match license::AlertConfig::from_env() {
+        Ok(Some(cfg)) => license::alerts::spawn_daily_scan(state.pool.clone(), cfg),
+        Ok(None) => {}
+        Err(e) => return Err(e.context("装配 license 临期邮件提醒配置失败")),
+    }
+
     let router = build_router(state, std::path::Path::new("/__nonexistent__"));
     axum::serve(
         listener,

@@ -10,10 +10,12 @@
 //! （见 [`Signer::from_env`]）时 `AppState.license_signer = None`，`/api/license/refresh`
 //! 返回 503（与 TTS/LLM 未配置时的既有约定一致），不 panic。
 
+pub mod alerts;
 pub mod ratelimit;
 pub mod routes;
 pub mod signer;
 pub mod store;
 
+pub use alerts::AlertConfig;
 pub use ratelimit::RateLimiter;
 pub use signer::Signer;

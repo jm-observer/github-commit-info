@@ -276,4 +276,15 @@ CREATE TABLE IF NOT EXISTS licenses (
     created_at         TEXT NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_licenses_product ON licenses(product);
+
+-- license_alerts：临期邮件提醒去重表（设计 docs/license-impl-design.md §4.3/§7）。
+-- 每 (lic_id, threshold_days) 只发一次提醒；命中即插一行，之后同一阈值不再重复发信。
+-- 邮件是带外提醒，不参与授权判定——这张表纯粹为了不刷屏，与 licenses 台账本身无关。
+-- 纯加表、IF NOT EXISTS 幂等：同上面一批，不 bump SCHEMA_VERSION。
+CREATE TABLE IF NOT EXISTS license_alerts (
+    lic_id          TEXT NOT NULL,
+    threshold_days  INTEGER NOT NULL,
+    sent_at         TEXT NOT NULL,
+    PRIMARY KEY (lic_id, threshold_days)
+);
 "#;
