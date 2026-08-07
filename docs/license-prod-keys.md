@@ -64,14 +64,23 @@ $b = [IO.File]::ReadAllBytes("root-a.seed"); [Convert]::ToHexString($b[5..36])
 抄下这 64 个 hex 字符 + 「root-a / role=root」。从纸恢复：把 hex 转回 32 字节、加 `TKSK1` 头写文件
 （需要时找 Claude 给还原脚本，或用下方 §5 的待加命令）。
 
-## 5. ⚠️ 待补工具（当前缺口）
+## 5. 公钥行丢了怎么找回（`tklic seed-pubkey`）
 
-现在 tklic **没有** "从已有 seed 反推公钥行" 或 "seed↔hex 互转" 的命令。所以：
-- §1 的公钥行**必须当场存**，否则光有 `.age` 恢复不出 `LICENSE_PUBKEY`。
-- 纸质 hex 的导出/恢复现在靠上面的 PowerShell 手搓。
+§1 的 `kid:role:hex` 公钥行如果没存下来，**不用重新生成密钥**——从 `.age` 反推即可
+（公钥可由私钥推出；`kid`/`role` 是标签，seed 里不含，需你重新给出）：
 
-**计划补**：`tklic seed-pubkey --sk <seed|-> --kid <k> --role <r>`（打印公钥行）+ `tklic seed-export/import`
-（seed↔hex）。补完这两步就干净了。见 [license-todo.md](license-todo.md)。
+```powershell
+$TK = "D:\git\custom-utils\target\debug\tklic.exe"
+age -d root-a.age     | & $TK seed-pubkey --sk - --kid root-a     --role root
+age -d root-b.age     | & $TK seed-pubkey --sk - --kid root-b     --role root
+age -d recovery-1.age | & $TK seed-pubkey --sk - --kid recovery-1 --role recovery
+```
+三行用 `,` 拼起来即 `LICENSE_PUBKEY`（§7）。也支持 `--sk <seed文件>` 直接读文件。
+
+> `kid`/`role` 给错不会有安全风险（只会让下游按错角色验签而拒绝），但要与当初 keygen 时一致，
+> 否则签出的令牌客户端认不了。**仍建议 keygen 时当场把公钥行存档**，这条只是补救。
+
+**尚缺（低优先）**：`seed↔hex` 互转命令（纸质备份/恢复现靠 §4 的 PowerShell 手搓）。见 [license-todo.md](license-todo.md)。
 
 ## 6. 签发生产 license
 
