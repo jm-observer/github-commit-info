@@ -45,6 +45,38 @@
 
 ---
 
+## TODO-2 开了 TLS feature 之后仍崩:rustls 进程级 CryptoProvider 未安装
+
+- [x] **现象**(2026-08-09,桌面端外网档一按录音就崩):
+
+  ```text
+  [speech] remote mode -> wss://spark.for-memory.site:38788/api/asr/stream (picked=Wan)
+  thread 'tokio-rt-worker' panicked at rustls-0.23.40/src/crypto/mod.rs:249:14:
+  Could not automatically determine the process-level CryptoProvider from Rustls crate features.
+  ```
+
+- **判断**:TODO-1 只解决了「有没有 TLS 连接器」,这条是「TLS 连接器用哪个加密后端」。
+  rustls 0.23 要求进程级 `CryptoProvider`;当依赖树里 **aws-lc-rs 与 ring 两个 provider 同时
+  被启用**时它拒绝自动选择,首次握手即 panic。`cargo tree -e features -i rustls` 可见两条链:
+  - `reqwest 0.12`(经 tauri-plugin-http)→ `hyper-rustls` feature `aws-lc-rs`
+  - `tokio-rustls` / `tokio-tungstenite` 一路 → feature `ring`
+
+  注意**这不是 zero-desktop 自己的 feature 写错**——两个 provider 分别由不同上游拉进来,
+  单靠调 feature 很难消掉,显式安装才是正解。
+
+- **改法**:[`main.rs`](../crates/zero-desktop/src/main.rs) 最开头(任何 TLS 使用之前)装 ring:
+
+  ```rust
+  let _ = rustls::crypto::ring::default_provider().install_default();
+  ```
+
+  并把 `rustls = { version = "0.23", default-features = false, features = ["ring"] }`
+  加为直接依赖。重复安装返回 `Err`,忽略即可。
+
+- [ ] **回归**:与 TODO-1 第 3 条合并——外网档跑一次实时语音识别 + 一次跟读流式评测。
+
+---
+
 ## 备忘:外网档的既有约定(别改错了)
 
 - **38788 → caddy(TLS 终止) → G10:8788 = toolkit-server**;**28080 是 english 自己的入口**

@@ -114,6 +114,13 @@ fn init_trace() {
 }
 
 fn main() -> Result<()> {
+    // rustls 0.23 要求进程级 CryptoProvider。依赖树里 aws-lc-rs 与 ring 两个 provider 同时
+    // 被启用（reqwest 0.12 经 hyper-rustls 拉 aws-lc-rs，tokio-rustls 一路拉 ring），rustls
+    // 无法自动选择 → 首次 TLS 握手时 panic。表现为外网档 wss 语音识别一连就崩：
+    // `Could not automatically determine the process-level CryptoProvider`。
+    // 必须在任何 TLS 使用之前装好；重复安装返回 Err，忽略即可。
+    let _ = rustls::crypto::ring::default_provider().install_default();
+
     let cli = Cli::parse();
 
     // `codeloop-smoke --json` 模式下 stdout 是 JSONL 契约，不能让 logger 串字符进来。

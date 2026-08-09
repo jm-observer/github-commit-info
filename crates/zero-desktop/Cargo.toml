@@ -52,6 +52,8 @@ cpal = "0.16"
 # 外网档 ASR 是 wss://（经 caddy TLS 终止）；默认特性不含 TLS，连 wss 会报
 # "TLS support not compiled in"。与 workspace reqwest 一致走 rustls，不引 native-tls。
 tokio-tungstenite = { version = "0.24", features = ["rustls-tls-webpki-roots"] }
+# rustls 0.23 的进程级 CryptoProvider 需在 main 里显式安装（见 main.rs 开头注释）。
+rustls = { version = "0.23", default-features = false, features = ["ring"] }
 futures-util = "0.3"
 # Music 模块依赖（原生音频引擎：解码 / 输出 / 重采样 / 元数据 / 无锁环形缓冲）
 symphonia = { version = "0.6", features = [
