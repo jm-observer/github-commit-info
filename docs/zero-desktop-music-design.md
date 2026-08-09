@@ -1,7 +1,7 @@
 # zero-desktop 音乐播放模块 设计文档
 
 > 状态：设计稿（待评审）· 作者：fengqi · 日期：2026-06-16
-> 关联：[zero-desktop 模块化架构](../crates/zero-desktop/)（english / speech / cookie / codeloop 同款套路）
+> 关联：[zero-desktop 模块化架构](../crates/zero-desktop/)（english / speech / cookie 同款套路）
 
 ## 1. 目标与范围
 

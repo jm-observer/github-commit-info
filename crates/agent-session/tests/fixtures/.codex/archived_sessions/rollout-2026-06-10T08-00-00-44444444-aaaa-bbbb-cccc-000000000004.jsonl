@@ -1,2 +1,0 @@
-{"timestamp": "2026-06-10T08:00:00Z", "type": "session_meta", "payload": {"id": "44444444-aaaa-bbbb-cccc-000000000004", "cwd": "D:/git/old"}}
-{"timestamp": "2026-06-10T08:00:01Z", "type": "event_msg", "payload": {"type": "user_message", "message": "归档前的最后一句"}}

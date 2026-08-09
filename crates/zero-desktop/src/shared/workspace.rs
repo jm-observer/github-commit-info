@@ -13,7 +13,6 @@ pub fn ensure_workspace(path: &Path) -> Result<()> {
         "cookie/login_profile/ths",
         "music",
         "music/covers",
-        "codeloop",
     ];
     for sub in &subdirs {
         let dir = path.join(sub);
@@ -37,11 +36,6 @@ pub fn speech_dir(workspace: &Path) -> PathBuf {
 /// cookie 模块的 SQLite 数据库路径。
 pub fn cookie_db_path(workspace: &Path) -> PathBuf {
     workspace.join("cookie").join("state.db")
-}
-
-/// codeloop 模块的 SQLite 数据库路径（复核循环记录 + 逐轮消息）。
-pub fn codeloop_db_path(workspace: &Path) -> PathBuf {
-    workspace.join("codeloop").join("state.db")
 }
 
 /// cookie 模块的设置文件路径（保留，仅存 cookie 自己的本地偏好，G10 配置在 app.json）。

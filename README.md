@@ -17,7 +17,7 @@ engine, HTTP API, desktop cookie harvester) plus a few standalone CLI tools, dep
 | `toolkit-core` | Domain types, SQLite schema + migrations, URL classification. |
 | `toolkit-tasks` | Generic long-task engine: `TaskKind` registry, submit→spawn→state machine, SQLite persistence. |
 | `toolkit-server` | axum daemon assembling core/tasks + business modules; HTTP API + web console; systemd install/self-update. |
-| `zero-desktop` | Unified Tauri desktop shell: cookie capture (Douyin/THS), speech, English, codeloop, G10 deploy. |
+| `zero-desktop` | Unified Tauri desktop shell: cookie capture (Douyin/THS), speech, English, music, G10 deploy. |
 | `douyin` | Douyin web tools: a-bogus signing, creator/works/tags API, download + ASR pipeline, knowledge md. |
 | `rag` | Semantic search over Douyin knowledge md → sqlite-vec (CLI `ingest`/`search`, HTTP `serve`). |
 | `github-commit-info` | Standalone CLI tool: fetch GitHub repo commits within a time range (see below). |

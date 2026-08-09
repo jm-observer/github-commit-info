@@ -6,7 +6,6 @@ import EnglishPackages from "./modules/english/EnglishPackages";
 import SpeechPage from "./modules/speech/SpeechPage";
 import AudioCleanPage from "./modules/audio-clean/AudioCleanPage";
 import CookiePage from "./modules/cookie/CookiePage";
-import CodeloopPage from "./modules/codeloop/CodeloopPage";
 import ChatSummaryPage from "./modules/chat-summary/ChatSummaryPage";
 import LlmChatPage from "./modules/llmchat/LlmChatPage";
 import G10DeployPage from "./modules/g10-deploy/G10DeployPage";
@@ -30,7 +29,6 @@ export default function App() {
             <Route path="speech" element={<SpeechPage />} />
             <Route path="audio-clean" element={<AudioCleanPage />} />
             <Route path="cookie" element={<CookiePage />} />
-            <Route path="codeloop" element={<CodeloopPage />} />
             <Route path="chat-summary" element={<ChatSummaryPage />} />
             <Route path="llmchat" element={<LlmChatPage />} />
             <Route path="music" element={<MusicPage />} />

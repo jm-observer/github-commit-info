@@ -19,7 +19,7 @@
 |---|---|---|
 | 配置存储 | `toolkit.db` 的 `llm_config` 表（base_url / model / api_key） | `app.db` 的 `config` 表 `vllm.base` / `vllm.model` |
 | 环境变量兜底 | `LLM_BASE_URL` / `LLM_MODEL` / `LLM_API_KEY` | `VLLM_BASE` / `VLLM_MODEL` |
-| 提示词 | `builtins()`（`douyin_refine` / `chat_summary` / 2× codeloop） | `app.db` 的 `llm.optimize_prompt` / `llm.translate_prompt`（**不在 builtins**） |
+| 提示词 | `builtins()`（`douyin_refine` / `chat_summary`） | `app.db` 的 `llm.optimize_prompt` / `llm.translate_prompt`（**不在 builtins**） |
 | 客户端 | `toolkit-llm::LlmClient`（统一重试 / 超时） | orchestrator 自行拼 HTTP |
 | 热词注入 | 无 | `optimize_prompt_with_hotwords` 拼到 prompt 末尾 |
 

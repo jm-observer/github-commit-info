@@ -1,4 +1,0 @@
-{"timestamp": "2026-06-15T09:00:00Z", "type": "turn_context", "payload": {"cwd": "D:/git/github-commit-info-codeloop/crates/agent-session"}}
-{"timestamp": "2026-06-15T09:00:01Z", "type": "event_msg", "payload": {"type": "user_message", "message": "实现 store.rs"}}
-{"timestamp": "2026-06-15T09:00:02Z", "type": "event_msg", "payload": {"type": "task_started"}}
-{"timestamp": "2026-06-15T09:00:10Z", "type": "event_msg", "payload": {"type": "agent_message", "message": "正在编写解析逻辑……"}}

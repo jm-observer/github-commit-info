@@ -87,7 +87,7 @@ english 不再持有 wav 文件。
 ### 4.3 新表（`toolkit.db`）
 
 按仓库约定加进整块 `DDL_V1`（[schema.rs](../crates/toolkit-core/src/schema.rs)），**纯加表、`IF NOT EXISTS` 幂等，
-不 bump `SCHEMA_VERSION`**——与 `codeloop_io` / `llm_config` / `shadow_attempt` 等已有加表一致：`migrate()`
+不 bump `SCHEMA_VERSION`**——与 `llm_config` / `shadow_attempt` 等已有加表一致：`migrate()`
 每次启动 `execute_batch(DDL_V1)` 都会把缺的表建出；bump 反而不会更新已有 DB 的 `meta.schema_version`，故对纯加表
 既无必要也不应做（见 schema.rs 第 88-90 行注释）：
 

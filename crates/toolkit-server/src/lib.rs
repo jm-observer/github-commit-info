@@ -3,7 +3,6 @@
 pub mod audioforge;
 mod audiostore;
 pub mod auth;
-pub mod codeloop;
 pub mod config;
 #[path = "douyin/mod.rs"]
 pub mod douyin_mod;
@@ -58,24 +57,17 @@ pub fn bootstrap(cfg: &Config) -> Result<AppState> {
     registry.register::<toolkit_tasks::EchoTask>();
     douyin_mod::kinds::register_all(&mut registry);
     audioforge::register_all(&mut registry);
-    codeloop::register_all(&mut registry);
 
     let recovered = toolkit_tasks::recover_interrupted(&pool)?;
     if recovered > 0 {
         log::info!("recovered {recovered} interrupted task(s) from prior run");
     }
 
-    // codeloop 会话存储在用户 home（~/.codex、~/.claude），不在 workspace。
-    // 定位不到 home 时回退到 workspace 根（locate 自然查无，不致命）。
-    let session_store = agent_session::store::Store::from_env()
-        .unwrap_or_else(|_| agent_session::store::Store::with_home(cfg.workspace.clone()));
-
     Ok(AppState {
         pool,
         registry: Arc::new(registry),
         db_path,
         workspace: cfg.workspace.clone(),
-        session_store: Arc::new(session_store),
         egress: Arc::new(egress_pool::Registry::new()),
         egress_sessions: Arc::new(egress_sessions::SessionStore::new()),
         exec: Arc::new(exec::Coordinator::default()),
@@ -236,21 +228,11 @@ pub fn build_router(state: AppState, web_dir: &std::path::Path) -> axum::Router 
             .route("/app.js", axum::routing::get(static_assets::app_js))
             .route("/style.css", axum::routing::get(static_assets::style_css))
             .route("/hub.js", axum::routing::get(static_assets::hub_js))
-            .route("/hub.css", axum::routing::get(static_assets::hub_css))
-            .route(
-                "/codeloop.js",
-                axum::routing::get(static_assets::codeloop_js),
-            )
-            .route(
-                "/codeloop.css",
-                axum::routing::get(static_assets::codeloop_css),
-            );
+            .route("/hub.css", axum::routing::get(static_assets::hub_css));
     }
 
-    // /hub、/codeloop（无扩展名）在两种模式下都需要显式路由（ServeDir 不自动映射目录省略名）
-    router = router
-        .route("/hub", axum::routing::get(static_assets::hub))
-        .route("/codeloop", axum::routing::get(static_assets::codeloop));
+    // /hub（无扩展名）在两种模式下都需要显式路由（ServeDir 不自动映射目录省略名）
+    router = router.route("/hub", axum::routing::get(static_assets::hub));
 
     router.layer(cors).with_state(state)
 }

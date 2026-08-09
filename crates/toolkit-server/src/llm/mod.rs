@@ -6,7 +6,7 @@
 //!   解析（[`resolve_prompt`]）DB 行优先，缺失用内置默认；控制台改了就写 DB 覆盖、删 DB 行即
 //!   「恢复内置默认」。
 //!
-//! 各功能（douyin 整理、对话总结、codeloop 文案…）都经此层取配置/提示词，不再各自读 env /
+//! 各功能（douyin 整理、对话总结、ASR 润色…）都经此层取配置/提示词，不再各自读 env /
 //! `include_str!`。
 
 pub mod record;
@@ -20,8 +20,6 @@ use toolkit_llm::{prompt_hash, LlmClient, LlmConfig};
 // ---- 内置提示词名字（其他模块引用，避免裸字符串散落）----
 pub const NAME_DOUYIN_REFINE: &str = "douyin_refine";
 pub const NAME_CHAT_SUMMARY: &str = "chat_summary";
-pub const NAME_CODELOOP_CODEX_REVIEW: &str = codeloop_core::prompt::PROMPT_NAME_CODEX_REVIEW;
-pub const NAME_CODELOOP_CLAUDE_REVISION: &str = codeloop_core::prompt::PROMPT_NAME_CLAUDE_REVISION;
 /// ASR 中文优化系统提示词（orchestrator 的 vLLM 润色调用）。orchestrator 经裸字符串
 /// `"asr_optimize_zh"` 读取（不依赖 toolkit-server crate）；两边名称必须一致。
 pub const NAME_ASR_OPTIMIZE_ZH: &str = "asr_optimize_zh";
@@ -76,20 +74,6 @@ pub fn builtins() -> Vec<BuiltinPrompt> {
             version: "v1",
             placeholders: &["{CONVERSATION}"],
             default_text: CHAT_SUMMARY_PROMPT,
-        },
-        BuiltinPrompt {
-            name: NAME_CODELOOP_CODEX_REVIEW,
-            description: "codeloop 复核方（Codex）指令模板（走 CLI 会话，非 HTTP LLM）",
-            version: codeloop_core::prompt::TEMPLATE_VERSION,
-            placeholders: codeloop_core::prompt::CODEX_PLACEHOLDERS,
-            default_text: codeloop_core::prompt::DEFAULT_CODEX_TEMPLATE,
-        },
-        BuiltinPrompt {
-            name: NAME_CODELOOP_CLAUDE_REVISION,
-            description: "codeloop 修订方（Claude）指令模板（走 CLI 会话，非 HTTP LLM）",
-            version: codeloop_core::prompt::TEMPLATE_VERSION,
-            placeholders: codeloop_core::prompt::CLAUDE_PLACEHOLDERS,
-            default_text: codeloop_core::prompt::DEFAULT_CLAUDE_TEMPLATE,
         },
         BuiltinPrompt {
             name: NAME_ASR_OPTIMIZE_ZH,

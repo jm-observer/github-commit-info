@@ -85,22 +85,10 @@ CREATE TABLE IF NOT EXISTS browser_sessions (
 );
 CREATE INDEX IF NOT EXISTS idx_browser_sessions_last_seen ON browser_sessions(last_seen DESC);
 
--- codeloop 跨会话复核循环的 ASK_USER 握手表（见 RFC §10.3）。
--- 纯加表、IF NOT EXISTS 幂等：migrate() 每次启动 execute_batch(DDL_V1) 都会建出，
--- 故不需要、也不应 bump SCHEMA_VERSION（bump 不更新已有 DB 的 meta）。
-CREATE TABLE IF NOT EXISTS codeloop_io (
-    task_id     TEXT,
-    seq         INTEGER,
-    asked_by    TEXT,
-    question_json TEXT,
-    answer_text TEXT,
-    created_at  TEXT,
-    answered_at TEXT,
-    PRIMARY KEY(task_id, seq)
-);
-
 -- 公共大模型连接配置（单行）。DB 行存在则优先于环境变量，便于运行时在控制台改地址/模型/key
--- 而无需重启或改 systemd 环境。纯加表、IF NOT EXISTS 幂等：同 codeloop_io，不 bump SCHEMA_VERSION。
+-- 而无需重启或改 systemd 环境。纯加表、IF NOT EXISTS 幂等：migrate() 每次启动
+-- execute_batch(DDL_V1) 都会建出，故不需要、也不应 bump SCHEMA_VERSION（bump 不更新已有
+-- DB 的 meta）。
 CREATE TABLE IF NOT EXISTS llm_config (
     id         INTEGER PRIMARY KEY CHECK (id = 1),
     base_url   TEXT,
@@ -109,7 +97,7 @@ CREATE TABLE IF NOT EXISTS llm_config (
     updated_at TEXT NOT NULL
 );
 
--- 可配提示词注册表：按名字存（如 douyin_refine / chat_summary / codeloop_*）。DB 行存在则
+-- 可配提示词注册表：按名字存（如 douyin_refine / chat_summary）。DB 行存在则
 -- 覆盖各功能编译期内置默认；version/hash 保留溯源，builtin_hash 记录覆盖时的内置基线哈希，
 -- 供控制台提示「已修改/可重置」。纯加表幂等，不 bump SCHEMA_VERSION。
 CREATE TABLE IF NOT EXISTS llm_prompts (
@@ -123,7 +111,7 @@ CREATE TABLE IF NOT EXISTS llm_prompts (
 
 -- English 跟读判分明细：每次跟读尝试一行（可回看 / 调阈值后重算）。kind=sentence|word；
 -- word 模式 word_index 为句内词序号，sentence 模式为 NULL。纯加表、IF NOT EXISTS 幂等，
--- 同 codeloop_io / llm_*，不 bump SCHEMA_VERSION。见 docs/english-shadow-design.md §7。
+-- 同 llm_*，不 bump SCHEMA_VERSION。见 docs/english-shadow-design.md §7。
 -- detail_json：GOP 发音级评测的音素/词级明细（v1-ASR 内核为 NULL）。新库由下方 DDL 直接建出；
 -- 存量库由 migrations.rs 的幂等 ALTER 补列（CREATE TABLE IF NOT EXISTS 不会给已存在的表加列）。
 -- 见 docs/english-shadow-gop-design.md §5。
@@ -161,7 +149,7 @@ CREATE TABLE IF NOT EXISTS shadow_stat (
 -- 音频统一仓库（audio-store）：内容寻址 blob 仓库，按 id 收拢音频字节，供 english 等消费方
 -- 持引用消复制。**只存音频字节本身的元信息、不持任何产品语义**（句子/课程/包等都在消费方）。
 -- id = sm3(bytes) 前 8 字节短哈希（`aud_` 前缀），同内容自然去重（内容寻址幂等）。字节落
--- `<workspace>/audio-store/<id>.wav`，本表记元信息。纯加表、IF NOT EXISTS 幂等：同 codeloop_io /
+-- `<workspace>/audio-store/<id>.wav`，本表记元信息。纯加表、IF NOT EXISTS 幂等：同 llm_config /
 -- llm_* / shadow_*，migrate() 启动即建出，故不需要、也不应 bump SCHEMA_VERSION。
 -- 见 docs/audio-store-design.md。
 CREATE TABLE IF NOT EXISTS audio_blob (
@@ -177,7 +165,7 @@ CREATE TABLE IF NOT EXISTS audio_blob (
 -- 统一以 session 形式落库，供桌面端「大模型会话」模块只读回看（对话测试面板可续聊）。
 -- kind 标记来源（chat_test | douyin_refine | chat_summary），为后续接入 zero agent 预留
 -- kind="agent"；metadata / 每条消息 meta 均为 JSON blob，可承载 aweme_id / prompt 版本哈希 /
--- 将来的工具调用信息，无需改表。纯加表、IF NOT EXISTS 幂等：同 codeloop_io / llm_* / shadow_* /
+-- 将来的工具调用信息，无需改表。纯加表、IF NOT EXISTS 幂等：同 llm_* / shadow_* /
 -- audio_blob，migrate() 启动即建出，故不需要、也不应 bump SCHEMA_VERSION。
 CREATE TABLE IF NOT EXISTS llm_sessions (
     id          TEXT PRIMARY KEY,
@@ -209,7 +197,7 @@ CREATE INDEX IF NOT EXISTS idx_llm_messages_session ON llm_messages(session_id, 
 -- 远程执行（remote-exec）第一期：per-worker exec 专用凭据。secret 明文只在 `exec-cred add`
 -- 时展示一次，落库只存 `sm3(salt||secret)` 的 hex（salt 随机 16 字节）。revoked_at 非空即吊绝：
 -- 拒绝该 worker 后续领取任务/回传结果（不是正在执行命令的 emergency stop，见设计 §4.2）。
--- 纯加表、IF NOT EXISTS 幂等：同 codeloop_io / llm_* / shadow_* / audio_blob / llm_sessions，
+-- 纯加表、IF NOT EXISTS 幂等：同 llm_* / shadow_* / audio_blob / llm_sessions，
 -- migrate() 启动即建出，故不需要、也不应 bump SCHEMA_VERSION。
 -- 见 docs/remote-exec-design.md 第一期 §4.2。
 -- expires_at：临时授权的到期时间（unix 秒）。NULL = 永不过期（`exec-cred add` 手工签发的老形态）。
@@ -255,7 +243,7 @@ CREATE INDEX IF NOT EXISTS idx_exec_cred_requests_state ON exec_cred_requests(st
 --   machine_ids        JSON：MachineFingerprint 数组（decode_mreq1 落库前解出的结构）；
 --   features/max_version 随续期原样透传（不得在续期时扩权，客户端自己也会核对锚）；
 --   revoked_at          非空即吊销，refresh 立即拒绝（403）。
--- 纯加表、IF NOT EXISTS 幂等：同 codeloop_io / llm_* / shadow_* / audio_blob / llm_sessions /
+-- 纯加表、IF NOT EXISTS 幂等：同 llm_* / shadow_* / audio_blob / llm_sessions /
 -- exec_worker_creds，migrate() 启动即建出，故不需要、也不应 bump SCHEMA_VERSION。
 -- 见 docs/license-impl-design.md §6.2。
 CREATE TABLE IF NOT EXISTS licenses (

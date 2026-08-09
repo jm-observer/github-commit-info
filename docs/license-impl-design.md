@@ -292,7 +292,7 @@ payload = { ver, sub_kid:"renewal-1", role:"renewal"|"directive",
   "expires_at": "2027-02-03T00:00:00Z",
   "lease_until": null,
   "grace_days": 14,
-  "features": ["speech", "english", "codeloop"],
+  "features": ["speech", "english", "music"],
   "max_version": "0.9.*",
   "nonce": "7c1f…"
 }

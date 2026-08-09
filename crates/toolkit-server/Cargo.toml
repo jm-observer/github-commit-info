@@ -15,8 +15,6 @@ douyin = { path = "../douyin" }
 orchestrator = { path = "../orchestrator" }
 audio-clean-client = { path = "../audio-clean-client" }
 asr-client = { path = "../asr-client" }
-agent-session = { workspace = true }
-codeloop-core = { workspace = true }
 anyhow = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }

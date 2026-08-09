@@ -17,7 +17,7 @@
 | `toolkit-core` | 领域类型、SQLite schema + 迁移、URL 模式识别。 |
 | `toolkit-tasks` | 通用长任务引擎：`TaskKind` 注册、submit→spawn→状态机、SQLite 持久化。 |
 | `toolkit-server` | axum daemon，装配 core/tasks + 业务模块；HTTP API + web 控制台；systemd 安装/自更新。 |
-| `zero-desktop` | 统一 Tauri 桌面壳：cookie 采集（抖音/同花顺）、语音、英语、codeloop、G10 部署。 |
+| `zero-desktop` | 统一 Tauri 桌面壳：cookie 采集（抖音/同花顺）、语音、英语、音乐、G10 部署。 |
 | `douyin` | 抖音 web 工具：a-bogus 签名、作者 / 作品 / 标签 API、下载 + ASR 管线、knowledge md。 |
 | `rag` | 抖音 knowledge md 的语义检索 → sqlite-vec（CLI `ingest`/`search`，HTTP `serve`）。 |
 | `github-commit-info` | 独立 CLI 工具：获取 GitHub 仓库指定时间范围的 commit 信息（见下）。 |

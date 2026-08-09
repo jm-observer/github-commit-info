@@ -9,7 +9,7 @@ mod shared;
 
 use anyhow::{Context, Result};
 use app_state::AppState;
-use clap::{Args, Parser, Subcommand};
+use clap::{Parser, Subcommand};
 use log::LevelFilter::Info;
 use std::path::PathBuf;
 
@@ -35,70 +35,6 @@ enum Command {
         #[arg(short, long)]
         force: bool,
     },
-    /// Headless 跑 codeloop 三段（design → implementation → review），不开 Tauri 窗口。
-    /// 设计见 `docs/codeloop-headless-smoke-runner-plan.md`。
-    CodeloopSmoke {
-        #[command(flatten)]
-        args: Box<CodeloopSmokeArgs>,
-    },
-}
-
-#[derive(Args, Debug, Clone)]
-struct CodeloopSmokeArgs {
-    /// 仓库根（必须是 git 工作树根）。
-    #[arg(long)]
-    repo: PathBuf,
-    /// 设计文档 / 目标的仓内相对路径。
-    #[arg(long)]
-    target: String,
-    /// 必填：Claude 会话 id；传 `auto` 表示按 cwd + 最近活跃自动选（仍受劫持保护）。
-    /// 不传直接拒绝，避免误选用户当前正在用的活会话。
-    #[arg(long)]
-    claude_session: Option<String>,
-    /// Codex 会话 id；传 `auto` 自动选；与 `--new-codex-agent` 配合时可省。
-    #[arg(long)]
-    codex_session: Option<String>,
-    /// 每段最大轮数。
-    #[arg(long, default_value_t = 2)]
-    max_rounds: u32,
-    /// 全自动放行逐步确认门（无人值守必开）。
-    #[arg(long)]
-    auto_confirm: bool,
-    /// 启动前新建 Codex 会话。
-    #[arg(long)]
-    new_codex_agent: bool,
-    /// 解除"目标会话 transcript 近 5 分钟内仍在写入"的劫持保护。
-    /// 不要在日常开发机上加这个；日常用 `--repo` 指向独立 clone。
-    #[arg(long)]
-    allow_hijack_current_session: bool,
-    /// ASK_USER 子串→答案 的 JSON 映射文件；未提供且模型问就 abort。
-    #[arg(long)]
-    ask_user_answers: Option<PathBuf>,
-    /// 恢复变体（v1 未实现，占位）。
-    #[arg(long)]
-    recover_after_stop: bool,
-    /// 实现 worktree 内跑 `cargo test -p codeloop-core` + `cargo check -p zero-desktop`。
-    #[arg(long)]
-    verify: bool,
-    /// 输出 JSONL 进度 + 终态对象到 stdout（人类摘要进 stderr）。
-    #[arg(long)]
-    json: bool,
-    /// 全局 wall-clock 上限（如 `15m` / `1h`）。
-    #[arg(long, default_value = "15m")]
-    timeout: humantime::Duration,
-    /// 多入口标记（codeloop-multi-entry-design.md §6.4 第 3 点）：
-    /// `doc_review`（默认，兼容旧脚本） | `implement` | `review_seed`。
-    #[arg(long, default_value = "doc_review")]
-    entry_kind: String,
-    /// 仅 `--entry-kind=review_seed` 且 `mode=implementation` 时可选：规格依据文档路径。
-    #[arg(long)]
-    design_doc: Option<String>,
-    /// `--entry-kind=review_seed`：seed 文件路径。
-    #[arg(long)]
-    seed_review: Option<String>,
-    /// `--entry-kind=review_seed`：从文件读 inline seed 文本（避免 shell 引号陷阱）。
-    #[arg(long)]
-    seed_review_inline_file: Option<PathBuf>,
 }
 
 /// 启用 trace-hub 全链路追踪——仅当设置了环境变量 `TRACE_HUB_ENDPOINT` 时生效；
@@ -123,82 +59,16 @@ fn main() -> Result<()> {
 
     let cli = Cli::parse();
 
-    // `codeloop-smoke --json` 模式下 stdout 是 JSONL 契约，不能让 logger 串字符进来。
-    // 此模式下完全跳过 logger 注册（log crate 变 no-op，driver / codeloop 的 log::info!
-    // 都被吃掉）；其它命令保持原行为。
-    let suppress_logger = matches!(
-        cli.command,
-        Some(Command::CodeloopSmoke {
-            args: ref smoke_args
-        }) if smoke_args.json
-    );
-    if !suppress_logger {
-        let _ = custom_utils::logger::logger_feature(APP, "info,reqwest=warn", Info, false).build();
-    }
+    let _ = custom_utils::logger::logger_feature(APP, "info,reqwest=warn", Info, false).build();
 
     init_trace();
 
     let workspace = resolve_workspace(&cli.workspace)?;
-    if !suppress_logger {
-        log::info!("workspace = {}", workspace.display());
-    }
+    log::info!("workspace = {}", workspace.display());
 
     match cli.command.unwrap_or(Command::Run) {
         Command::Run => run_gui(workspace),
         Command::Update { force } => shared::update::run_update(REPO_OWNER, REPO_NAME, APP, force),
-        Command::CodeloopSmoke { args } => {
-            let CodeloopSmokeArgs {
-                repo,
-                target,
-                claude_session,
-                codex_session,
-                max_rounds,
-                auto_confirm,
-                new_codex_agent,
-                allow_hijack_current_session,
-                ask_user_answers,
-                recover_after_stop,
-                verify,
-                json,
-                timeout,
-                entry_kind,
-                design_doc,
-                seed_review,
-                seed_review_inline_file,
-            } = *args;
-            let parsed_entry_kind = match entry_kind.as_str() {
-                "doc_review" => codeloop_core::prompt::EntryKind::DocReview,
-                "implement" => codeloop_core::prompt::EntryKind::Implement,
-                "review_seed" => codeloop_core::prompt::EntryKind::ReviewSeed,
-                other => {
-                    eprintln!(
-                        "[fatal] --entry-kind 取值非法：{other}（仅支持 doc_review / implement / review_seed）"
-                    );
-                    std::process::exit(modules::codeloop::smoke::EXIT_PREFLIGHT);
-                }
-            };
-            let args = modules::codeloop::smoke::SmokeArgs {
-                repo,
-                target,
-                workspace,
-                claude_session,
-                codex_session,
-                max_rounds,
-                auto_confirm,
-                new_codex_agent,
-                allow_hijack_current_session,
-                ask_user_answers,
-                recover_after_stop,
-                verify,
-                json,
-                timeout: timeout.into(),
-                entry_kind: parsed_entry_kind,
-                design_doc,
-                seed_review,
-                seed_review_inline_file,
-            };
-            std::process::exit(modules::codeloop::smoke::run(args));
-        }
     }
 }
 
@@ -335,23 +205,6 @@ fn run_gui(workspace: PathBuf) -> Result<()> {
             modules::exec::exec_list_creds,
             modules::exec::exec_approve_request,
             modules::exec::exec_reject_request,
-            // codeloop 模块（Codex⇄Claude 复核循环）
-            modules::codeloop::codeloop_list_sessions,
-            modules::codeloop::codeloop_new_codex_session,
-            modules::codeloop::codeloop_session_messages,
-            modules::codeloop::codeloop_send_one,
-            modules::codeloop::codeloop_start,
-            modules::codeloop::codeloop_status,
-            modules::codeloop::codeloop_preflight,
-            modules::codeloop::codeloop_answer,
-            modules::codeloop::codeloop_confirm,
-            modules::codeloop::codeloop_set_auto_confirm,
-            modules::codeloop::codeloop_stop,
-            modules::codeloop::codeloop_continue,
-            modules::codeloop::codeloop_list_loops,
-            modules::codeloop::codeloop_loop_messages,
-            modules::codeloop::codeloop_delete_loop,
-            modules::codeloop::codeloop_merge_worktree,
             // g10-deploy 模块（G10 服务部署面板：列表/连通性/版本对比/一键部署）
             modules::g10_deploy::g10_list_services,
             modules::g10_deploy::g10_save_services,

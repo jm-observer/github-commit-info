@@ -54,19 +54,6 @@ async fn request_json(
     timeout: Duration,
     prefix: &str,
 ) -> Result<serde_json::Value, String> {
-    request_json_inner(state, method, path, body, timeout, prefix).await
-}
-
-/// 同 [`request_json`]，但接裸 `&AppState`——供非 Tauri command 上下文（如 codeloop
-/// 启动时拉模板）复用。
-pub(crate) async fn request_json_inner(
-    state: &AppState,
-    method: reqwest::Method,
-    path: &str,
-    body: Option<serde_json::Value>,
-    timeout: Duration,
-    prefix: &str,
-) -> Result<serde_json::Value, String> {
     let resolved = state.net.resolve(&state.workspace).await;
     let endpoint = resolved
         .llm_endpoint(path)
@@ -96,30 +83,6 @@ pub(crate) async fn request_json_inner(
         return Ok(serde_json::Value::Null);
     }
     serde_json::from_str(&text).map_err(|e| format!("{prefix}：解析响应 JSON 失败 {e}"))
-}
-
-/// codeloop 启动时拉可配模板：失败要快速回退内置，不能拖慢循环启动，故用比
-/// [`QUICK_TIMEOUT`] 更紧的超时。
-const PROMPT_FETCH_TIMEOUT: Duration = Duration::from_secs(10);
-
-/// 读单条可配提示词的**生效文本**（DB 覆盖 > 内置默认，合并逻辑在 server 侧）。
-/// 任何失败（G10 未配置 / 不可达 / 老版本缺路由 / 响应缺字段）返回 Err，
-/// 由调用方回退内置默认——绝不因此阻塞业务。
-pub(crate) async fn fetch_prompt_text(state: &AppState, name: &str) -> Result<String, String> {
-    let v = request_json_inner(
-        state,
-        reqwest::Method::GET,
-        &format!("/prompts/{name}"),
-        None,
-        PROMPT_FETCH_TIMEOUT,
-        "读提示词失败",
-    )
-    .await?;
-    v.get("text")
-        .and_then(|t| t.as_str())
-        .filter(|s| !s.trim().is_empty())
-        .map(|s| s.to_string())
-        .ok_or_else(|| format!("提示词 {name} 响应缺少非空 text 字段"))
 }
 
 // ---------------- 连接配置 ----------------

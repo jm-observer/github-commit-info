@@ -24,16 +24,10 @@ tauri-plugin-single-instance = "2"
 png = "0.17"
 serde = { workspace = true }
 serde_json = { workspace = true }
-# codeloop 模块：采集层 agent-session + 协议层 codeloop-core（与 toolkit-server 共享）
-agent-session = { workspace = true }
-codeloop-core = { workspace = true }
 tokio = { workspace = true, features = ["rt-multi-thread", "macros", "time", "sync", "fs", "process", "io-util"] }
 anyhow = { workspace = true }
 log = { workspace = true }
 clap = { workspace = true, features = ["env"] }
-async-trait = "0.1"
-humantime = "2"
-dirs = "5"
 custom-utils = { workspace = true, features = ["updater", "trace"] }
 # Cookie 模块依赖
 reqwest = { workspace = true }

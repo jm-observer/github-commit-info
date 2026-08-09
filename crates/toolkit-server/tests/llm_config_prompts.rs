@@ -86,7 +86,6 @@ async fn prompt_override_and_reset() {
     assert_eq!(refine["source"], "builtin");
     assert_eq!(refine["modified"], false);
     assert!(prompts.iter().any(|p| p["name"] == "chat_summary"));
-    assert!(prompts.iter().any(|p| p["name"] == "codeloop_codex_review"));
 
     // 覆盖 douyin_refine。
     let resp = client
