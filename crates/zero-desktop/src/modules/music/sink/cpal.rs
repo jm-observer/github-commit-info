@@ -14,7 +14,7 @@ use cpal::{SampleFormat, SampleRate, SupportedStreamConfig};
 use tracing::{info, warn};
 
 use super::super::types::{ActualFormat, AudioFormat, AudioKind};
-use super::{AudioSink, FramesPlayed, SinkHandle, VolumeQ16};
+use super::{AudioSink, FramesPlayed, SinkAlive, SinkHandle, VolumeQ16};
 
 /// cpal 共享模式 sink，持有 `Stream`（drop 即停流）。
 pub struct CpalSink {
@@ -33,6 +33,7 @@ impl CpalSink {
         frames_played: FramesPlayed,
         volume: VolumeQ16,
         capacity: usize,
+        alive: SinkAlive,
     ) -> Result<SinkHandle> {
         let host = cpal::default_host();
         let device = host
@@ -63,6 +64,7 @@ impl CpalSink {
             volume.clone(),
             capacity,
             channels_for_cb,
+            alive.clone(),
         );
         let (stream, producer, actual_rate) = match source_attempt {
             Ok((stream, producer)) => (stream, producer, fmt.sample_rate),
@@ -81,6 +83,7 @@ impl CpalSink {
                     volume,
                     capacity,
                     channels_for_cb,
+                    alive.clone(),
                 )
                 .context("建立 cpal 输出流失败")?;
                 (stream, producer, default_config.sample_rate.0)
@@ -110,6 +113,8 @@ impl CpalSink {
             }),
             producer,
             format: actual,
+            device_id: None, // 由 build_sink 统一填（与设备监听同源）
+            alive,
         })
     }
 }
@@ -161,6 +166,7 @@ fn find_f32_config(device: &cpal::Device, sample_rate: u32) -> Option<SupportedS
         .max_by_key(|config| config.channels())
 }
 
+#[allow(clippy::too_many_arguments)]
 fn build_stream_with_ring(
     device: &cpal::Device,
     config: &cpal::StreamConfig,
@@ -169,6 +175,7 @@ fn build_stream_with_ring(
     volume: VolumeQ16,
     capacity: usize,
     channels: usize,
+    alive: SinkAlive,
 ) -> Result<(cpal::Stream, rtrb::Producer<f32>)> {
     let (producer, consumer) = rtrb::RingBuffer::<f32>::new(capacity.max(channels * 1024));
     let stream = build_stream(
@@ -179,10 +186,12 @@ fn build_stream_with_ring(
         volume,
         frames_played,
         channels,
+        alive,
     )?;
     Ok((stream, producer))
 }
 
+#[allow(clippy::too_many_arguments)]
 fn build_stream(
     device: &cpal::Device,
     config: &cpal::StreamConfig,
@@ -191,9 +200,12 @@ fn build_stream(
     volume: VolumeQ16,
     frames_played: FramesPlayed,
     channels: usize,
+    alive: SinkAlive,
 ) -> Result<cpal::Stream> {
     macro_rules! build_typed {
         ($t:ty, $convert:expr) => {{
+            // 错误回调：设备丢失/驱动异常 → 置 alive=false，引擎下一轮据此重建 sink。
+            let alive_cb = alive.clone();
             device.build_output_stream(
                 config,
                 move |out: &mut [$t], _: &cpal::OutputCallbackInfo| {
@@ -206,7 +218,7 @@ fn build_stream(
                         $convert,
                     );
                 },
-                log_stream_error,
+                move |err| on_stream_error(err, &alive_cb),
                 None,
             )?
         }};
@@ -224,8 +236,9 @@ fn build_stream(
     }
 }
 
-fn log_stream_error(err: cpal::StreamError) {
+fn on_stream_error(err: cpal::StreamError, alive: &SinkAlive) {
     tracing::error!(target: "music", "cpal 输出流错误: {err}");
+    alive.store(false, Ordering::Relaxed);
 }
 
 impl AudioSink for CpalSink {

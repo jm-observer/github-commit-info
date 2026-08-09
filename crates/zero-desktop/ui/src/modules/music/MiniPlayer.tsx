@@ -41,8 +41,9 @@ export default function MiniPlayer() {
     volume,
     repeat,
     shuffle,
+    format,
     pendingResume,
-    play,
+    resumeLast,
     toggle,
     next,
     prev,
@@ -59,6 +60,15 @@ export default function MiniPlayer() {
   useEffect(() => {
     if (!dragging) setDragValue(positionSecs)
   }, [positionSecs, dragging])
+
+  // 松手/失焦即提交当前拖动值。用 pointer 事件而非 mouseup：触屏/笔一样走这条路，
+  // 且指针在拖动中被系统取消（如切窗口）时有 pointercancel 兜底 —— 否则 dragging
+  // 会一直为 true，进度条卡在拖动值上不再跟随播放。
+  const commitDrag = (el: HTMLInputElement) => {
+    if (!dragging) return
+    setDragging(false)
+    void seek(Number(el.value))
+  }
 
   const playing = status === 'playing'
   const hasTrack = track !== null
@@ -118,11 +128,7 @@ export default function MiniPlayer() {
 
           <button
             type="button"
-            onClick={() =>
-              pendingResume
-                ? void play(pendingResume.queue, pendingResume.index)
-                : void toggle()
-            }
+            onClick={() => (pendingResume ? void resumeLast() : void toggle())}
             disabled={!hasTrack}
             title={playing ? '暂停' : '播放'}
             className="flex h-9 w-9 items-center justify-center rounded-full bg-blue-500 text-white transition-colors hover:bg-blue-600 disabled:opacity-40"
@@ -172,25 +178,26 @@ export default function MiniPlayer() {
               setDragging(true)
               setDragValue(Number(e.target.value))
             }}
-            onMouseUp={e => {
-              const v = Number((e.target as HTMLInputElement).value)
-              setDragging(false)
-              void seek(v)
-            }}
-            onKeyUp={e => {
-              const v = Number((e.target as HTMLInputElement).value)
-              setDragging(false)
-              void seek(v)
-            }}
+            onPointerUp={e => commitDrag(e.currentTarget)}
+            onPointerCancel={e => commitDrag(e.currentTarget)}
+            onBlur={e => commitDrag(e.currentTarget)}
+            onKeyUp={e => commitDrag(e.currentTarget)}
             className="h-1 flex-1 cursor-pointer accent-blue-500 disabled:cursor-default disabled:opacity-50"
           />
           <span className="w-9 text-[11px] tabular-nums text-gray-400">{fmtTime(dur)}</span>
         </div>
       </div>
 
-      {/* 音量 */}
+      {/* 音量。独占 bit-perfect 下引擎旁路软件音量（不污染原始 PCM），滑块此刻不起作用，
+          只记住设置值——必须明确告诉用户，否则表现就是「音量条坏了」。 */}
       <div className="flex w-32 flex-shrink-0 items-center gap-2">
-        <Volume2 size={16} className="flex-shrink-0 text-gray-400" />
+        <Volume2
+          size={16}
+          className={[
+            'flex-shrink-0',
+            format?.exclusive ? 'text-amber-500' : 'text-gray-400',
+          ].join(' ')}
+        />
         <input
           type="range"
           min={0}
@@ -198,8 +205,15 @@ export default function MiniPlayer() {
           step={0.01}
           value={volume}
           onChange={e => void setVolume(Number(e.target.value))}
-          title={`音量 ${Math.round(volume * 100)}%`}
-          className="h-1 flex-1 cursor-pointer accent-blue-500"
+          title={
+            format?.exclusive
+              ? `音量 ${Math.round(volume * 100)}%（独占 bit-perfect 模式下软件音量旁路，此处不生效；请用系统音量，或在音乐页切「共享(兼容)」）`
+              : `音量 ${Math.round(volume * 100)}%`
+          }
+          className={[
+            'h-1 flex-1 cursor-pointer accent-blue-500',
+            format?.exclusive ? 'opacity-50' : '',
+          ].join(' ')}
         />
       </div>
     </div>

@@ -112,6 +112,9 @@ pub fn setup(app: &tauri::AppHandle, state: Arc<MusicState>) -> Result<()> {
             });
         })?;
     info!(target: "music", "音乐引擎线程已派生");
+
+    // 默认输出设备变更监听（换蓝牙耳机等）→ 引擎原位重建 sink 跟过去。
+    sink::device_watch::spawn(state.tx.clone());
     Ok(())
 }
 

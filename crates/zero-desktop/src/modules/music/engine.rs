@@ -44,6 +44,9 @@ pub enum AudioCommand {
     SetRepeat(RepeatMode),
     SetShuffle(bool),
     SetOutputMode(OutputMode),
+    /// 系统默认输出设备已变（由 [`super::sink::device_watch`] 轮询发现），携带新默认设备 id。
+    /// 引擎比对当前 sink 所在设备，不同则原位重建，把声音跟到新设备（如刚连上的蓝牙耳机）。
+    OutputDeviceChanged(Option<String>),
     Stop,
     /// 请求完整状态快照（`music_get_state` 用）：引擎填好经回传 channel 送回。
     Snapshot(crossbeam_channel::Sender<super::types::PlaybackState>),
@@ -57,6 +60,8 @@ const PREFILL_FRAMES: usize = 12_000;
 const PROGRESS_INTERVAL: Duration = Duration::from_millis(250);
 /// 控制循环每轮无事可做时的让出睡眠。
 const IDLE_SLEEP: Duration = Duration::from_millis(5);
+/// 两次 sink 重建之间的最小间隔（设备持续不可用时的重试节流）。
+const REBUILD_MIN_INTERVAL: Duration = Duration::from_millis(1500);
 
 /// 当前正在播放的一首的运行时状态。
 struct Current {
@@ -180,12 +185,14 @@ pub fn run(ctx: EngineContext) {
         status: PlayStatus::Stopped,
         repeat: RepeatMode::Off,
         shuffle: false,
+        shuffle_order: Vec::new(),
         volume: 1.0,
         output_mode: OutputMode::Auto,
         current: None,
         frames_played: Arc::new(AtomicU32::new(0)),
         volume_q16: Arc::new(AtomicU32::new(65536)),
         last_progress: Instant::now(),
+        last_rebuild: Instant::now(),
         tracks_meta: Vec::new(),
         pending_switch: VecDeque::new(),
     };
@@ -211,7 +218,12 @@ pub fn run(ctx: EngineContext) {
             engine.handle_command(cmd);
         }
 
-        // 2. 推进播放。
+        // 2. 输出链路健康检查（暂停中也查：设备此刻丢了，恢复播放不该是静音）。
+        if engine.status != PlayStatus::Stopped {
+            engine.check_sink_alive();
+        }
+
+        // 3. 推进播放。
         if engine.status == PlayStatus::Playing {
             engine.pump();
             engine.maybe_gapless(); // 当前曲解码 EOF → 同格式则原地换下一首解码器，不重建 sink
@@ -231,6 +243,12 @@ struct Engine {
     status: PlayStatus,
     repeat: RepeatMode,
     shuffle: bool,
+    /// 随机播放序列：队列下标的一个随机排列，`shuffle=false` 时为空。
+    ///
+    /// **不是每次现掷随机数**——那样只能避开「紧邻重复」，一轮里同一首照样反复出现，
+    /// 听感就是「随机 = 老听到那几首」。改成走一遍排列：一轮内每首恰好一次，走完
+    /// （`repeat=all`）再重洗新一轮，且保证新一轮首曲不等于刚播完的那首。
+    shuffle_order: Vec<i64>,
     volume: f32,
     /// 输出模式（独占优先 / 强制共享）。
     output_mode: OutputMode,
@@ -240,6 +258,8 @@ struct Engine {
     /// 与 sink 共享的定点音量。
     volume_q16: VolumeQ16,
     last_progress: Instant,
+    /// 上次重建 sink 的时刻（设备丢失重试节流用）。
+    last_rebuild: Instant,
     /// queue 中各路径对应的元数据（扫描时不带；这里懒填，emit 给前端）。
     tracks_meta: Vec<Option<Track>>,
     /// gapless 预切但尚未播到的曲目切换边界（FIFO；通常至多 1 个）。
@@ -266,9 +286,17 @@ impl Engine {
             }
             AudioCommand::SetShuffle(on) => {
                 self.shuffle = on;
+                if on {
+                    // 当前曲置于新序列首位：开随机不该把正在听的这首挤掉，
+                    // 下一首从序列第 2 个开始。
+                    self.rebuild_shuffle_order(Some(self.index));
+                } else {
+                    self.shuffle_order.clear();
+                }
                 self.publish_state();
             }
             AudioCommand::SetOutputMode(m) => self.set_output_mode(m),
+            AudioCommand::OutputDeviceChanged(id) => self.on_default_device_changed(id),
             AudioCommand::Stop => self.stop(),
             AudioCommand::Snapshot(reply) => {
                 let snap = self.snapshot();
@@ -287,6 +315,10 @@ impl Engine {
         self.queue = tracks;
         let start = start.min(self.queue.len() - 1);
         self.index = start as i64;
+        if self.shuffle {
+            // 队列换了 → 旧序列的下标失效，按新队列重洗（起播那首置首）。
+            self.rebuild_shuffle_order(Some(self.index));
+        }
         self.start_current();
     }
 
@@ -598,6 +630,20 @@ impl Engine {
             self.stop();
             return;
         }
+        // 随机序列走完一轮 + 列表循环 → 重洗开新一轮（首曲避开刚播完的那首，
+        // 否则一轮之交会紧接着重复同一首）。
+        if self.shuffle && self.repeat == RepeatMode::All && self.next_index().is_none() {
+            let just_played = self.index;
+            self.rebuild_shuffle_order(None);
+            if self.shuffle_order.len() > 1 && self.shuffle_order[0] == just_played {
+                self.shuffle_order.swap(0, 1);
+            }
+            if let Some(&first) = self.shuffle_order.first() {
+                self.index = first;
+                self.start_current();
+                return;
+            }
+        }
         let next = self.next_index();
         match next {
             Some(i) => {
@@ -626,25 +672,20 @@ impl Engine {
     }
 
     /// 计算下一首下标（考虑 shuffle / repeat-all）。
+    ///
+    /// **纯查询**（`&self`）：随机序列走完时返回 `None`，续轮重洗由 [`advance`] 负责。
+    /// 这样 gapless 的「预看下一首」不会因为一次预看就把序列洗掉。
     fn next_index(&self) -> Option<i64> {
         let len = self.queue.len() as i64;
         if len == 0 {
             return None;
         }
         if self.shuffle {
-            if len == 1 {
-                return if self.repeat == RepeatMode::All {
-                    Some(self.index)
-                } else {
-                    None
-                };
-            }
-            // 简单随机：避开当前曲。
-            let mut n = pseudo_rand() % (len as u64);
-            if n as i64 == self.index {
-                n = (n + 1) % len as u64;
-            }
-            return Some(n as i64);
+            return match self.shuffle_pos() {
+                Some(p) if p + 1 < self.shuffle_order.len() => Some(self.shuffle_order[p + 1]),
+                // 序列走完（或当前曲不在序列里）：交给 advance 决定重洗还是停。
+                _ => None,
+            };
         }
         let nxt = self.index + 1;
         if nxt < len {
@@ -656,6 +697,27 @@ impl Engine {
         }
     }
 
+    /// 当前曲在随机序列中的位置。序列为空 / 当前曲不在其中（队列刚变）→ `None`。
+    fn shuffle_pos(&self) -> Option<usize> {
+        self.shuffle_order.iter().position(|&i| i == self.index)
+    }
+
+    /// 洗出一个新的随机序列（Fisher-Yates）。`pin_first` 若给定且在队列内，
+    /// 洗完把它换到首位——用于「开随机 / 换队列」时不打断正在听的这首。
+    fn rebuild_shuffle_order(&mut self, pin_first: Option<i64>) {
+        let len = self.queue.len();
+        self.shuffle_order = (0..len as i64).collect();
+        for i in (1..len).rev() {
+            let j = (pseudo_rand() % (i as u64 + 1)) as usize;
+            self.shuffle_order.swap(i, j);
+        }
+        if let Some(f) = pin_first {
+            if let Some(p) = self.shuffle_order.iter().position(|&x| x == f) {
+                self.shuffle_order.swap(0, p);
+            }
+        }
+    }
+
     fn prev(&mut self) {
         if self.queue.is_empty() {
             return;
@@ -664,6 +726,24 @@ impl Engine {
         if self.position_secs() > 3.0 {
             self.start_current();
             return;
+        }
+        // 随机播放：上一首 = 序列里的前一个（即刚才真正听过的那首），
+        // 而不是队列下标 -1（那是「列表上一首」，随机模式下从没播过）。
+        if self.shuffle {
+            if let Some(p) = self.shuffle_pos() {
+                let target = if p > 0 {
+                    Some(self.shuffle_order[p - 1])
+                } else if self.repeat == RepeatMode::All {
+                    self.shuffle_order.last().copied()
+                } else {
+                    None
+                };
+                if let Some(i) = target {
+                    self.index = i;
+                }
+                self.start_current();
+                return;
+            }
         }
         let len = self.queue.len() as i64;
         let prev = if self.index > 0 {
@@ -740,24 +820,64 @@ impl Engine {
             return;
         }
         self.output_mode = mode;
-        if self.current.is_some() {
-            let pos = self.position_secs();
-            let was_paused = self.status == PlayStatus::Paused;
-            self.start_current(); // 用新模式重建解码器 + sink（从曲首）
-            if pos > 0.0 {
-                self.seek(pos); // 回到原位置
-            }
-            if was_paused {
-                self.set_paused(true);
-            }
+        self.rebuild_sink_in_place("输出模式切换");
+    }
+
+    /// 原位重建 sink：保留当前曲、播放位置与暂停态，只把输出链路换成按当前状态重新协商的新流。
+    ///
+    /// 实现即「从曲首 `start_current` + `seek` 回原位」——sink 与解码器在 [`Current`] 里同生共死，
+    /// 单独换 sink 要重做重采样器/声道适配/进度基准，不如整条重建来得可靠（seek 成本远小于
+    /// 一次设备协商）。重建失败（设备真没了）由 `start_current` 走 emit error + stopped。
+    fn rebuild_sink_in_place(&mut self, reason: &str) {
+        if self.current.is_none() {
+            return;
         }
+        let pos = self.position_secs();
+        let was_paused = self.status == PlayStatus::Paused;
+        info!(target: "music", "重建输出链路（{reason}），回到 {pos:.1}s");
+        self.last_rebuild = Instant::now();
+        self.start_current();
+        if self.current.is_none() {
+            return; // 重建失败：start_current 已 emit 错误并置 stopped
+        }
+        if pos > 0.0 {
+            self.seek(pos);
+        }
+        if was_paused {
+            self.set_paused(true);
+        }
+    }
+
+    /// 系统默认输出设备变了：当前 sink 不在该设备上就重建跟过去。
+    ///
+    /// 比对而非无脑重建，是因为变更通知与当前流未必相关（例如刚重建过、已经在新设备上，
+    /// 或者变的是采集端引发的连带通知）——无谓重建会造成一次可闻的断音。
+    fn on_default_device_changed(&mut self, new_id: Option<String>) {
+        let Some(cur) = self.current.as_ref() else {
+            return; // 没在播：下次 start_current 自然用新默认设备
+        };
+        if cur.sink.device_id == new_id {
+            return;
+        }
+        self.rebuild_sink_in_place("系统默认输出设备变更");
+    }
+
+    /// 输出链路已死（拔设备 / 驱动重启 / 独占被抢）→ 重建。带最小间隔节流，避免设备持续
+    /// 不可用时死循环重建刷 CPU；被节流时下一轮循环仍会再判，不会漏。
+    fn check_sink_alive(&mut self) {
+        let dead = matches!(&self.current, Some(cur) if !cur.sink.alive.load(Ordering::Relaxed));
+        if !dead || self.last_rebuild.elapsed() < REBUILD_MIN_INTERVAL {
+            return;
+        }
+        warn!(target: "music", "输出链路已断开，尝试重建");
+        self.rebuild_sink_in_place("输出设备丢失");
     }
 
     /// 写定点音量给 sink。独占 bit-perfect 时旁路（置 1.0），不污染原始 PCM。
     fn apply_volume_atomic(&self) {
         let effective = match &self.current {
             Some(cur) if cur.actual.exclusive => 1.0,
-            _ => self.volume,
+            _ => perceptual_gain(self.volume),
         };
         self.volume_q16
             .store((effective * 65536.0) as u32, Ordering::Relaxed);
@@ -974,6 +1094,18 @@ fn status_code(s: PlayStatus) -> u8 {
         PlayStatus::Playing => 1,
         PlayStatus::Paused => 2,
     }
+}
+
+/// 滑块位置（0..=1）→ 实际线性增益。
+///
+/// 人耳对响度的感知接近对数：线性映射下滑块上半程几乎听不出变化，全部动态都挤在末尾一小段。
+/// 三次方是音频软件常用的近似（v=0.5 → 约 −18dB，听感恰好「一半」），且两端精确：
+/// v=0 是真静音、v=1 是原始电平（满音量时乘 1.0，不引入任何量化误差）。
+///
+/// 只作用于共享模式；独占 bit-perfect 下软件音量整体旁路，不走这里。
+fn perceptual_gain(v: f32) -> f32 {
+    let v = v.clamp(0.0, 1.0);
+    v * v * v
 }
 
 /// 轻量伪随机（shuffle 用，无需密码学强度）。基于时间种子的 xorshift。

@@ -10,12 +10,13 @@
 //! 构造时交给 sink。
 
 use anyhow::Result;
-use std::sync::atomic::AtomicU32;
+use std::sync::atomic::{AtomicBool, AtomicU32};
 use std::sync::Arc;
 
 use super::types::{ActualFormat, AudioFormat, AudioKind, OutputMode};
 
 pub mod cpal;
+pub mod device_watch;
 #[cfg(windows)]
 pub mod wasapi;
 
@@ -25,6 +26,11 @@ pub type FramesPlayed = Arc<AtomicU32>;
 
 /// 软件音量（0..=1，定点放大 1<<16）。独占 bit-perfect 时引擎置 1.0 旁路（输出回调仍乘，但 ×1 无损）。
 pub type VolumeQ16 = Arc<AtomicU32>;
+
+/// 输出链路存活标志。sink 内部输出线程/错误回调在设备丢失（拔耳机、驱动重启、被独占抢占）时
+/// 置 `false`；引擎每轮检查，发现已死则原位重建 sink。**没有它的话设备一丢，表现是「进度条
+/// 还在走但没声音」，引擎察觉不到。**
+pub type SinkAlive = Arc<AtomicBool>;
 
 /// 音频输出后端：拿到源格式后协商设备，起输出线程/回调消费 rtrb 中的交织 f32。
 ///
@@ -50,6 +56,11 @@ pub struct SinkHandle {
     pub producer: rtrb::Producer<f32>,
     /// sink 实际生效格式。
     pub format: ActualFormat,
+    /// 本流建立时的系统默认输出设备标识（见 [`device_watch::current_default_output_id`]）。
+    /// 引擎收到设备变更通知时与新默认 id 比对，不同才重建。
+    pub device_id: Option<String>,
+    /// 输出链路是否仍存活（设备丢失即为 `false`）。
+    pub alive: SinkAlive,
 }
 
 /// 按平台与源格式建立输出链路。`buffer_frames` 是 rtrb 容量（帧），取较大值吸收解码抖动。
@@ -64,23 +75,33 @@ pub fn build_sink(
     mode: OutputMode,
 ) -> Result<SinkHandle> {
     let capacity = buffer_frames * fmt.channels.max(1) as usize;
+    // 建流用的就是「当前系统默认输出设备」，故此处取一次 id 即代表本流所在设备。
+    let device_id = device_watch::current_default_output_id();
 
     #[cfg(windows)]
     if mode == OutputMode::Auto && !prefers_shared_float(fmt) {
+        let alive: SinkAlive = Arc::new(AtomicBool::new(true));
         match wasapi::WasapiExclusiveSink::try_build(
             fmt,
             frames_played.clone(),
             volume.clone(),
             capacity,
+            alive.clone(),
         ) {
-            Ok(handle) => return Ok(handle),
+            Ok(mut handle) => {
+                handle.device_id = device_id;
+                return Ok(handle);
+            }
             Err(e) => {
                 tracing::warn!(target: "music", "WASAPI 独占协商失败，回退共享模式: {e:#}");
             }
         }
     }
 
-    cpal::CpalSink::build(fmt, frames_played, volume, capacity)
+    let alive: SinkAlive = Arc::new(AtomicBool::new(true));
+    let mut handle = cpal::CpalSink::build(fmt, frames_played, volume, capacity, alive)?;
+    handle.device_id = device_id;
+    Ok(handle)
 }
 
 fn prefers_shared_float(fmt: AudioFormat) -> bool {

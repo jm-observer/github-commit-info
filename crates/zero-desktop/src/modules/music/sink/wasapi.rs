@@ -19,7 +19,7 @@ use tracing::{info, warn};
 use wasapi::{initialize_mta, Direction, SampleType, ShareMode, StreamMode, WaveFormat};
 
 use super::super::types::{ActualFormat, AudioFormat};
-use super::{AudioSink, FramesPlayed, SinkHandle, VolumeQ16};
+use super::{AudioSink, FramesPlayed, SinkAlive, SinkHandle, VolumeQ16};
 
 /// WASAPI 独占 sink。持有输出线程句柄与控制原子；drop 时通知线程退出并 join。
 pub struct WasapiExclusiveSink {
@@ -43,6 +43,7 @@ impl WasapiExclusiveSink {
         frames_played: FramesPlayed,
         volume: VolumeQ16,
         capacity: usize,
+        alive: SinkAlive,
     ) -> Result<SinkHandle> {
         let (producer, consumer) = rtrb::RingBuffer::<f32>::new(capacity.max(4096));
 
@@ -54,6 +55,7 @@ impl WasapiExclusiveSink {
 
         let stop_c = stop.clone();
         let paused_c = paused.clone();
+        let alive_c = alive.clone();
         let thread = std::thread::Builder::new()
             .name("music-wasapi-out".into())
             .spawn(move || {
@@ -64,6 +66,7 @@ impl WasapiExclusiveSink {
                     volume,
                     stop_c,
                     paused_c,
+                    alive_c,
                     init_tx,
                 );
             })
@@ -93,6 +96,8 @@ impl WasapiExclusiveSink {
             }),
             producer,
             format: actual,
+            device_id: None, // 由 build_sink 统一填（与设备监听同源）
+            alive,
         })
     }
 }
@@ -131,6 +136,16 @@ fn choose_store_bits(src_bits: u32) -> usize {
     }
 }
 
+/// 线程退出即宣告输出链路已死（无论是正常 stop、设备丢失还是初始化失败）。引擎每轮读
+/// `alive`，为 false 且仍在播放 → 原位重建 sink。放成 guard 是因为本函数有多个早 return。
+struct AliveGuard(SinkAlive);
+
+impl Drop for AliveGuard {
+    fn drop(&mut self) {
+        self.0.store(false, Ordering::Relaxed);
+    }
+}
+
 /// 输出线程主体：初始化独占设备（失败回传 Err），然后事件驱动拉循环写 PCM。
 #[allow(clippy::too_many_arguments)]
 fn output_thread(
@@ -140,8 +155,11 @@ fn output_thread(
     volume: VolumeQ16,
     stop: Arc<AtomicBool>,
     paused: Arc<AtomicBool>,
+    alive: SinkAlive,
     init_tx: std::sync::mpsc::Sender<Result<ActualFormat, String>>,
 ) {
+    let _alive_guard = AliveGuard(alive);
+
     // 在本线程初始化 COM（MTA）。
     if initialize_mta().is_err() {
         let _ = init_tx.send(Err("WASAPI: 初始化 COM(MTA) 失败".into()));
