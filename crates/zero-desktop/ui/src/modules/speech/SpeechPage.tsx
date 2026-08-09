@@ -75,6 +75,8 @@ export default function SpeechPage() {
   const [mergeWindowMs, setMergeWindowMs] = useState(3000);
   const [remoteUrl, setRemoteUrl] = useState<string>(DEFAULT_REMOTE_URL);
   const [remoteUrlPresets, setRemoteUrlPresets] = useState<string[]>([]);
+  /** 「内置」项的地址：按 G10 局域网/外网设置派生，与录音实际连的地址同源。 */
+  const [builtinRemoteUrl, setBuiltinRemoteUrl] = useState<string>(DEFAULT_REMOTE_URL);
   const [wantSecondary, setWantSecondary] = useState(false);
   const [notifySound, setNotifySound] = useState(true);
   const [autoPaste, setAutoPaste] = useState(false);
@@ -104,6 +106,10 @@ export default function SpeechPage() {
       })
       .catch((err) => console.warn('Load settings failed', err))
       .finally(() => setSettingsLoaded(true));
+    // 内置项跟随 G10 网络设置（局域网 ws://…:8788 / 外网 wss://…:38788），失败则留常量。
+    SpeechAPI.defaultRemoteUrl()
+      .then((u) => u && setBuiltinRemoteUrl(u))
+      .catch((err) => console.warn('Load default remote url failed', err));
   }, []);
 
   const showTranslationNotification = useCallback(async (segment: Segment) => {
@@ -559,7 +565,8 @@ export default function SpeechPage() {
 
   const handleRemoteUrlRemove = (url: string) => {
     const presetsNext = remoteUrlPresets.filter((p) => p !== url);
-    const fallback = remoteUrl === url ? DEFAULT_REMOTE_URL : remoteUrl;
+    // 删掉的正是当前选中项 → 回落到「内置」（跟随 G10 设置的派生地址）。
+    const fallback = remoteUrl === url ? builtinRemoteUrl : remoteUrl;
     const urlChanged = fallback !== remoteUrl;
     setRemoteUrlPresets(presetsNext);
     setRemoteUrl(fallback);
@@ -715,6 +722,7 @@ export default function SpeechPage() {
           }}
           remoteUrl={remoteUrl}
           remoteUrlPresets={remoteUrlPresets}
+          builtinRemoteUrl={builtinRemoteUrl}
           onRemoteUrlSelect={handleRemoteUrlSelect}
           onRemoteUrlAdd={handleRemoteUrlAdd}
           onRemoteUrlRemove={handleRemoteUrlRemove}

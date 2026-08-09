@@ -24,6 +24,7 @@ impl Default for VadSettings {
 
 /// Built-in default orchestrator URL.
 /// orchestrator 已并入 toolkit-server :8788/api/asr 同进程,默认指向新地址。
+/// 最终回退：G10 host 未配置时用它（正常路径走 `speech_default_remote_url` 的派生值）。
 pub(crate) const DEFAULT_REMOTE_URL: &str = "ws://192.168.0.68:8788/api/asr/stream";
 
 /// 旧默认 URL（orchestrator 独立 :8090 时期）。`load_remote_settings_from_db` 会把 DB 里

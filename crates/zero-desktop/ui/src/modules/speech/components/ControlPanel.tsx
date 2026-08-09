@@ -36,6 +36,8 @@ interface ControlPanelProps {
   onMergeWindowMsChange: (val: number) => void;
   remoteUrl: string;
   remoteUrlPresets: string[];
+  /** 「内置」项地址（按 G10 局域网/外网设置派生）。 */
+  builtinRemoteUrl: string;
   onRemoteUrlSelect: (url: string) => void;
   onRemoteUrlAdd: (url: string) => void;
   onRemoteUrlRemove: (url: string) => void;
@@ -95,6 +97,7 @@ export const ControlPanel: React.FC<ControlPanelProps> = ({
   onMergeWindowMsChange,
   remoteUrl,
   remoteUrlPresets,
+  builtinRemoteUrl,
   onRemoteUrlSelect,
   onRemoteUrlAdd,
   onRemoteUrlRemove,
@@ -128,6 +131,7 @@ export const ControlPanel: React.FC<ControlPanelProps> = ({
       <RemoteUrlPicker
         value={remoteUrl}
         presets={remoteUrlPresets}
+        builtinUrl={builtinRemoteUrl}
         onSelect={onRemoteUrlSelect}
         onAdd={onRemoteUrlAdd}
         onRemove={onRemoteUrlRemove}

@@ -1,13 +1,14 @@
 import React, { useState } from 'react';
 import { Icon } from './ui/Icon';
 import { cn } from '../utils';
-import { DEFAULT_REMOTE_URL } from '../api/tauri-client';
 
 interface RemoteUrlPickerProps {
   /** Currently selected URL (one of `presets` or the built-in default). */
   value: string;
   /** User-added presets — built-in default is shown separately and is never in this list. */
   presets: string[];
+  /** 「内置」项地址：由 G10 局域网/外网设置派生，不再是编译期常量。 */
+  builtinUrl: string;
   /** Disable interactions (e.g. while busy applying). Selecting a different URL
    * is still allowed during recording — App handles the stop+restart. */
   disabled?: boolean;
@@ -35,6 +36,7 @@ function isValidWsUrl(s: string): boolean {
 export const RemoteUrlPicker: React.FC<RemoteUrlPickerProps> = ({
   value,
   presets,
+  builtinUrl,
   disabled,
   onSelect,
   onAdd,
@@ -47,9 +49,9 @@ export const RemoteUrlPicker: React.FC<RemoteUrlPickerProps> = ({
 
   // Built-in always shown first; then user presets (de-duped + minus default).
   const items: { url: string; builtin: boolean }[] = [
-    { url: DEFAULT_REMOTE_URL, builtin: true },
+    { url: builtinUrl, builtin: true },
     ...presets
-      .filter((p) => p && p !== DEFAULT_REMOTE_URL)
+      .filter((p) => p && p !== builtinUrl)
       .map((p) => ({ url: p, builtin: false })),
   ];
 
@@ -139,7 +141,7 @@ export const RemoteUrlPicker: React.FC<RemoteUrlPickerProps> = ({
                         onClick={(e) => {
                           e.stopPropagation();
                           onRemove(it.url);
-                          if (selected) onSelect(DEFAULT_REMOTE_URL);
+                          if (selected) onSelect(builtinUrl);
                         }}
                         className="shrink-0 w-7 h-7 rounded-md flex items-center justify-center text-[var(--ink-4)] hover:text-[var(--danger)] hover:bg-[var(--danger-soft)] opacity-0 group-hover:opacity-100 transition-opacity"
                         title="删除此预设"

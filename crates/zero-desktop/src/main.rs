@@ -285,6 +285,7 @@ fn run_gui(workspace: PathBuf) -> Result<()> {
             modules::speech::commands::export::speech_copy_text_to_clipboard,
             modules::speech::commands::init::speech_get_init_status,
             modules::speech::commands::settings::speech_get_settings,
+            modules::speech::commands::settings::speech_default_remote_url,
             modules::speech::commands::settings::speech_apply_settings,
             // Cookie 模块
             modules::cookie::cookie_workspace_path,

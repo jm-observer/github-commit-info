@@ -51,6 +51,11 @@ export interface AppSettings {
   scene_log_enabled: boolean;
 }
 
+/**
+ * 最终回退地址。正常路径走 `SpeechAPI.defaultRemoteUrl()`——它按 G10 的局域网/外网设置
+ * 派生，与录音时实际连接的地址（`speech_start_recording` 用 `resolved.asr_url`）同源。
+ * 只有后端还没返回时才短暂用到这个常量。
+ */
 export const DEFAULT_REMOTE_URL = 'ws://192.168.0.68:8788/api/asr/stream';
 
 export interface SegmentDiscardedEvent {
@@ -178,6 +183,8 @@ export const SpeechAPI = {
   copyToClipboard: (text: string) =>
     invoke('speech_copy_text_to_clipboard', { text }),
   getSettings: () => invoke<AppSettings>('speech_get_settings'),
+  /** 当前生效的内置 ASR 地址（按 G10 局域网/外网设置派生，含 token query）。 */
+  defaultRemoteUrl: () => invoke<string>('speech_default_remote_url'),
   applySettings: (newSettings: AppSettings) =>
     invoke('speech_apply_settings', { newSettings }),
   /** 试听某段识别的原始音频（base64 WAV）。服务端只保留 1 天，过期报错。 */
