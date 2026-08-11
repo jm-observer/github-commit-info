@@ -18,8 +18,8 @@ workspace，作为 zero/Agent 生态的统一工具底座。架构目标：
 | `toolkit-core` | 领域类型 + SQLite schema/迁移（`schema.rs` 的 `DDL_V1`）+ URL 模式识别。`open_pool` / `migrate` / `new_task_id` / `now_iso8601`。 |
 | `toolkit-tasks` | **通用长任务引擎**：`TaskKind` trait + `Registry` 注册、`submit` 即 spawn、`run_task` 状态机、`store` 持久化到 `tasks` 表。 |
 | `toolkit-llm` | **统一 OpenAI 兼容 LLM 客户端**：`LlmConfig`（含 `from_env`）+ `LlmClient`（`complete`/`chat` + 指数退避重试 + 响应解析）+ `prompt_hash`。任何需调大模型的内部 crate 都走它，不要自行拼 HTTP。**不持有提示词**（提示词由功能层/可配目录决定后传入）。 |
-| `toolkit-server` | axum daemon。`bootstrap` 装配 pool/migrate/registry/recovery；`/api/web`、`/api/web/audio`（TTS 代理）、`/api/web/douyin`、`/api/web/llm`（**公共大模型：连接配置/可配提示词/连通性自测/对话总结**）、`/api/agent`、`/api/browser`、`/api/internal`（**出口代理 worker 通道**：register/heartbeat/长轮询 egress/result,共享 token）、`/api/web/egress`（出口观测 + probe 自测）路由 + web 控制台。systemd 安装 / 自更新（`custom-utils` updater）。 |
-| `zero-desktop` | 统一 Tauri 桌面壳：cookie 采集（抖音/同花顺 headless_chrome/CDP + msToken + 上传 G10）、speech / english / g10-deploy / 音乐 / 截图 / 远程节点 等模块。**需 Tauri 工具链**，CI 式环境通常排除。 |
+| `toolkit-server` | axum daemon。`bootstrap` 装配 pool/migrate/registry/recovery；`/api/web`、`/api/web/probe`（**loopback 探针代理**：以 G10 本机视角 GET 一个 `127.0.0.1:<port>` 健康端点并回传，让桌面端 g10-deploy 面板在外网也能逐服务探活——外网只需 toolkit-server 一个入口，无需为每个服务做端口映射；目标 host 限死 loopback）、`/api/web/audio`（TTS 代理）、`/api/web/douyin`、`/api/web/llm`（**公共大模型：连接配置/可配提示词/连通性自测/对话总结**）、`/api/agent`、`/api/browser`、`/api/internal`（**出口代理 worker 通道**：register/heartbeat/长轮询 egress/result,共享 token）、`/api/web/egress`（出口观测 + probe 自测）路由 + web 控制台。systemd 安装 / 自更新（`custom-utils` updater）。 |
+| `zero-desktop` | 统一 Tauri 桌面壳：cookie 采集（抖音/同花顺 headless_chrome/CDP + msToken + 上传 G10）、speech / english / g10-deploy / 音乐 / 截图 / 录屏 / 远程节点 等模块。**需 Tauri 工具链**，CI 式环境通常排除。 |
 | `asr-client` | 通用 FunASR `/transcribe` HTTP 客户端（multipart 上传 + 强类型响应 + 错误归类）。**任何需要离线 ASR 的内部 crate 都走它**，不要自行拼 multipart。端点契约权威源在 streaming-speech `docs/asr-transcribe-api.md`。 |
 | `douyin` | 抖音 web 工具：a-bogus 签名、creator/works/tags API、下载 + ASR 管线（**通过 `asr-client` 调 FunASR**）、LLM 整理（`refine`）、knowledge md 生成。既是库（被 server 调）也有独立 daemon/CLI。 |
 | `rag` | 抖音 knowledge md 的语义检索 → sqlite-vec。CLI `ingest`/`search`，HTTP `serve`。 |
@@ -253,8 +253,10 @@ pwsh ./deploy-g10.ps1 -SkipBuild # 仅复制已有产物
   后仍 `wait()` 回收，`timed_out` 的 exit_code 为 null。
 - **审计**：controller（`<workspace>/remote-exec/audit/`）与 worker（`<workspace>/remote-exec/audit/`）
   双写 JSONL，保留 30 天，**只记元信息 + 脚本 SM3 短哈希，绝不记正文**。
-- **CLI 只剩**：`run`（零参数）/ `status` / `update` / `install`(Linux) / `proxy`；`list` 仅 Linux。
-  **`scan` 已删**。出口选择参数是历史包袱且**实测只有 Linux 有效**：`--interface`
+- **CLI 只剩**：`run`（零参数）/ `status` / `update` / `install`(Linux) / `proxy`。
+  **`scan` / `list` 已删**（`list` 的实现随 net-policy 拆仓一并移除，空壳变体因 cfg 门控在
+  Windows 上编译不到，2026-08 交叉编译时才暴露，已连同调用删净）。
+  出口选择参数是历史包袱且**实测只有 Linux 有效**：`--interface`
   （`SO_BINDTODEVICE`）只在 Linux 编译进 CLI；`--local-address` 在 Windows 上绑非默认路由网卡
   会直接发不出包（实测每张非默认网卡探测全失败）——换出口走 net-policy（已拆独立仓）。
 - **已知取舍**：Windows 上临时目录/脚本只靠继承 ACL（凭据文件用 `icacls` 收紧了）；Unix 杀树只
@@ -263,6 +265,7 @@ pwsh ./deploy-g10.ps1 -SkipBuild # 仅复制已有产物
 ## 文档目录（动手前按主题查）
 
 - [docs/toolkit-design.md](docs/toolkit-design.md) — 中台整体设计。
+- [docs/zero-desktop-recording-design.md](docs/zero-desktop-recording-design.md) — 桌面端录屏设计（框选复用截图叠加窗；BGRA 裸帧管道喂外部 ffmpeg 出 H.264 mp4；补帧保时间轴；热键与截图共用一张全局表，注册收拢在 `modules/hotkeys.rs`）。
 - [docs/douyin-design.md](docs/douyin-design.md) / [docs/douyin-cli.md](docs/douyin-cli.md) — 抖音工具设计与 CLI/HTTP API 参考。
 - [docs/rag-service-design.md](docs/rag-service-design.md) — RAG 检索服务设计。
 - [docs/runbook-pipeline-e2e.md](docs/runbook-pipeline-e2e.md) — 抖音知识管线端到端验收 runbook（Phase 2）。
@@ -278,6 +281,7 @@ pwsh ./deploy-g10.ps1 -SkipBuild # 仅复制已有产物
 - [docs/wan-access-todo.md](docs/wan-access-todo.md) — 外网入口待办（桌面端 tokio-tungstenite 没开 TLS feature，外网档 wss 语音识别连不上）。
 - [docs/remote-exec-todo.md](docs/remote-exec-todo.md) — remote-exec 待办（部署版本落后导致面板看不到申请、worker 轮询未判状态码把 404 误报成解析失败）。
 - [docs/remote-exec-design.md](docs/remote-exec-design.md) — 远程命令执行 / 远程排查底座设计（第一期：同步 `/run` 闭环，已落地；第二期：异步任务 · 排队 · 远程取消 · 本地控制面，未做）。
+- [docs/worker-fabric-design.md](docs/worker-fabric-design.md) — worker 通用通道底座设计（remote-exec 第二期的上位规划）：一条传输 + 多 channel（exec/file/forward/egress），「合并管道不合并闸门」，并把 zero-desktop 的部署/健康探测接成可选 runner 维度；分 P1~P5 落地。
 - [docs/distributed-worker-design.md](docs/distributed-worker-design.md) — 分布式爬虫底座设计（公共库 · Worker · 出口 IP 池）：统一模型（一支 fleet 两个面 / 库的两档接入：请求级 egress 代理 + 任务级 worker 分发 / cookie·匿名 IP 策略分裂 / proxy_pool 提级）+ pull 调度 + 两段式自更新。
 - **网络出口策略（net-policy）已于 2026-07 拆为独立仓** → [jm-observer/net-policy](https://github.com/jm-observer/net-policy)（本地 `D:\git\net-policy`）。六个 `net-policy-*` crate、`docs/net-policy/` 文档集、`package-net-policy.ps1` 全部迁出，本仓不再持有；历史经 `git filter-repo` 完整保留在新仓。
 - [docs/toolkit-rfc/2026-06-04-initial-skeleton/data-model.md](docs/toolkit-rfc/2026-06-04-initial-skeleton/data-model.md) — SQLite 数据模型。
