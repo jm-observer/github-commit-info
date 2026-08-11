@@ -102,11 +102,11 @@ export default function EnglishMiniPlayer() {
   const onNext = () => { try { AudioPlayerService.getInstance().nextSentence() } catch { /* ignore */ } }
 
   // 「内嵌 body」形态: 不带外层 h-16/border-t/bg/padding,由 BottomPlayerBar 统一包裹。
-  // 列宽与音乐 MiniPlayerBody 一致(w-56 / flex-1 / w-32)。主色用 amber 与音乐 blue 做区分。
+  // 列宽与音乐 MiniPlayerBody 一致(w-40 / flex-1 / w-44)。主色用 amber 与音乐 blue 做区分。
   return (
     <div className="flex h-full w-full items-center gap-3 px-4">
       {/* 图标 + 标题 + 索引（对齐音乐封面块） */}
-      <div className="flex w-56 min-w-0 flex-shrink-0 items-center gap-3">
+      <div className="flex w-40 min-w-0 flex-shrink-0 items-center gap-3">
         <div className="flex h-11 w-11 flex-shrink-0 items-center justify-center rounded bg-amber-50 text-amber-600 dark:bg-amber-900/30 dark:text-amber-400">
           <Languages size={20} />
         </div>
@@ -164,7 +164,7 @@ export default function EnglishMiniPlayer() {
       </div>
 
       {/* 右侧占位：与音乐 MiniPlayer 的 volume 列对齐，避免两条按钮列错位。 */}
-      <div className="w-32 flex-shrink-0" aria-hidden />
+      <div className="w-44 flex-shrink-0" aria-hidden />
     </div>
   )
 }

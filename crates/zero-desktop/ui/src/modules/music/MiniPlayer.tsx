@@ -81,7 +81,7 @@ export default function MiniPlayer() {
   return (
     <div className="flex h-full w-full items-center gap-3 px-4">
       {/* 封面 + 标题/歌手 */}
-      <div className="flex w-56 min-w-0 flex-shrink-0 items-center gap-3">
+      <div className="flex w-40 min-w-0 flex-shrink-0 items-center gap-3">
         <div className="flex h-11 w-11 flex-shrink-0 items-center justify-center overflow-hidden rounded bg-gray-100 dark:bg-gray-800">
           {coverSrc ? (
             <img src={coverSrc} alt="" className="h-full w-full object-cover" />
@@ -190,7 +190,7 @@ export default function MiniPlayer() {
 
       {/* 音量。独占 bit-perfect 下引擎旁路软件音量（不污染原始 PCM），滑块此刻不起作用，
           只记住设置值——必须明确告诉用户，否则表现就是「音量条坏了」。 */}
-      <div className="flex w-32 flex-shrink-0 items-center gap-2">
+      <div className="flex w-44 flex-shrink-0 items-center gap-2 pr-1">
         <Volume2
           size={16}
           className={[
@@ -211,10 +211,13 @@ export default function MiniPlayer() {
               : `音量 ${Math.round(volume * 100)}%`
           }
           className={[
-            'h-1 flex-1 cursor-pointer accent-blue-500',
+            'h-1 min-w-0 flex-1 cursor-pointer accent-blue-500',
             format?.exclusive ? 'opacity-50' : '',
           ].join(' ')}
         />
+        <span className="w-8 flex-shrink-0 text-right text-[11px] tabular-nums text-gray-400">
+          {Math.round(volume * 100)}%
+        </span>
       </div>
     </div>
   )
