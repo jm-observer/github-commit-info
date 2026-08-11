@@ -15,6 +15,15 @@
 //! 不再单列「端口」，而是把它作为 env 清单里的一条（带备注）。部署时整份 env 拼成
 //! `-Env KEY=VAL,...` 传给脚本，脚本逐条转发为 `install -e KEY=VAL`（custom-utils 0.16 写进
 //! unit 的 `Environment=`）。连通性以 HTTP 健康端点为准（`health_url`，面板可编辑）。
+//!
+//! **健康端点写 loopback**：探测经 toolkit-server 的 `/api/web/probe` 由 G10 本机代发，
+//! 所以清单里不写「从哪访问」——那由设置页的网络模式（局域网 IP / 外网域名）唯一决定。
+//!
+//! **后台地址分局域网 / 外网两条**（`web_url` / `web_url_wan`）：后台是浏览器直连，不像健康探测
+//! 那样能经 toolkit-server 代发，所以必须按当前网络路径给出各自可达的地址。2026-08-11 起 G10 的
+//! caddy 按子域名分流（`<svc>.for-memory.site:38788` → 本机各端口，见 caddy 那条 memory），
+//! 外网档因此有了真实入口；`web_url_wan` 为空的服务（如 english 自持 28080 入口未收编）外网档
+//! 仍置灰。**局域网档恒用 `web_url` 直连**，不绕公网发夹。
 
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
@@ -32,15 +41,25 @@ pub struct ServiceDef {
     /// 本地仓库根目录（取本地 git 版本 / 跑部署脚本的工作目录）。
     pub repo_dir: String,
     /// HTTP 健康端点（GET，期望返回 `{status, version, commit}`）。空串表示「未配置健康端点」。
+    ///
+    /// **以 G10 本机视角填写**（`http://127.0.0.1:<port>/...`）：探测经 toolkit-server 的
+    /// `/api/web/probe` 由 G10 本机代发，故清单里不含「从哪台机器访问」这一位置信息，
+    /// 局域网 / 外网两档共用同一份清单。填成私网 IP（旧覆盖文件里的 `192.168.0.68`）也能
+    /// 工作——探测时会自动改写成 loopback，见 `mod.rs::probe_target`。
     /// 面板可编辑：服务跑 https（自签）就填 `https://`，探测已放宽证书校验。
     #[serde(default)]
     pub health_url: String,
     /// 远端 systemd `--user` 服务名（仅展示用）。
     #[serde(default)]
     pub remote_service: Option<String>,
-    /// 服务 web 后台地址（前端「打开后台」按钮跳转）。空串 = 无后台，不显示按钮。
+    /// 服务 web 后台地址——**局域网直连**（前端「打开后台」按钮跳转）。空串 = 无后台，不显示按钮。
     #[serde(default)]
     pub web_url: String,
+    /// 同一后台的**外网地址**（caddy 子域名入口，形如 `https://<svc>.for-memory.site:38788`）。
+    /// 空串 = 该服务没有外网入口 → 外网档「打开后台」置灰。与 `web_url` 指向同一个后台，
+    /// 只是路径不同：局域网档用 `web_url` 直连，外网档用本字段。
+    #[serde(default)]
+    pub web_url_wan: String,
     /// 安装时动态注入 systemd unit 的环境变量（`KEY=VAL` + 可选备注）。部署时拼成
     /// `-Env KEY=VAL,...` 传给部署脚本，由脚本转发为 `install -e KEY=VAL`（custom-utils 0.16
     /// 注入 `Environment=`）。**端口即其中的 `<SERVICE>_BIND` 一条**。空 = 不注入额外变量。
@@ -82,6 +101,15 @@ fn bind_note() -> String {
     "监听地址 host:port（端口经此环境变量注入）".into()
 }
 
+/// 后台的外网地址：G10 caddy 按子域名分流（公网 38788 → caddy:8443 → 本机各服务端口）。
+///
+/// 各子域名在 DNSPod 均为 CNAME → `spark.for-memory.site`，动态 IP 只需 dns-update 刷 `spark`
+/// 一条 A 记录，其余自动跟随。**端口固定 38788**——公网只开了这一个映射，新增服务不必再开端口，
+/// 加一条 CNAME + 一个 caddy handle 块即可。
+fn wan_url(sub: &str, path: &str) -> String {
+    format!("https://{sub}.for-memory.site:38788{path}")
+}
+
 /// 内置默认清单。每个服务的端口以 `<SERVICE>_BIND` 环境变量呈现（值含端口）；非 toolkit-server
 /// 的健康端点为基于各仓已知端口的最佳猜测，不可达时前端显示红灯（不影响功能）。
 pub fn builtin() -> Vec<ServiceDef> {
@@ -91,9 +119,10 @@ pub fn builtin() -> Vec<ServiceDef> {
             label: "toolkit-server（工具中台）".into(),
             note: "本仓 axum 守护进程 + 抖音/RAG/LLM 工具底座".into(),
             repo_dir: r"D:\git\toolkit".into(),
-            health_url: "http://192.168.0.68:8788/api/web/health".into(),
+            health_url: "http://127.0.0.1:8788/api/web/health".into(),
             remote_service: Some("toolkit-server".into()),
             web_url: "http://192.168.0.68:8788".into(),
+            web_url_wan: wan_url("toolkit", ""),
             env: vec![
                 EnvVar {
                     key: "TOOLKIT_BIND".into(),
@@ -151,10 +180,12 @@ pub fn builtin() -> Vec<ServiceDef> {
             note: "Actix-web 学习平台；deploy-g10.ps1 交叉编译，端口经 ENGLISH_BIND 注入".into(),
             repo_dir: r"D:\git\english".into(),
             // prod feature 跑 HTTPS（自签）→ 健康端点走 https；面板探测已开 danger_accept_invalid_certs。
-            health_url: "https://192.168.0.68:28080/health".into(),
+            health_url: "https://127.0.0.1:28080/health".into(),
             remote_service: Some("english.service".into()),
             // prod feature = https（自签证书）；前端 SPA 挂根路径。
             web_url: "https://192.168.0.68:28080".into(),
+            // english 自持 28080 外网入口、未收编进 caddy，故无子域名 → 外网档「打开后台」置灰。
+            web_url_wan: String::new(),
             env: vec![EnvVar {
                 key: "ENGLISH_BIND".into(),
                 value: "0.0.0.0:28080".into(),
@@ -171,11 +202,12 @@ pub fn builtin() -> Vec<ServiceDef> {
             label: "trace-hub（全链路追踪）".into(),
             note: "axum 追踪后端；deploy-g10.ps1 交叉编译，端口经 TRACE_HUB_BIND 注入".into(),
             repo_dir: r"D:\git\trace-hub".into(),
-            health_url: "http://192.168.0.68:9120/health".into(),
+            health_url: "http://127.0.0.1:9120/health".into(),
             remote_service: Some("trace-hub.service".into()),
             // 追踪 Web UI 挂主端口根路径（随 TRACE_HUB_BIND）。
             // 端口 9100 已让给 FunASR(streaming-speech),trace-hub 挪到 9120。
             web_url: "http://192.168.0.68:9120".into(),
+            web_url_wan: wan_url("trace", ""),
             env: vec![EnvVar {
                 key: "TRACE_HUB_BIND".into(),
                 value: "0.0.0.0:9120".into(),
@@ -194,10 +226,13 @@ pub fn builtin() -> Vec<ServiceDef> {
             repo_dir: r"D:\git\system-prompt-show".into(),
             // /health 挂在路由 server（主端口 9300），与 SPS_BIND 同口。
             // G10 上 9000 被 clickhouse 占用，改用 9300。
-            health_url: "http://192.168.0.68:9300/health".into(),
+            health_url: "http://127.0.0.1:9300/health".into(),
             remote_service: Some("system-prompt-show.service".into()),
-            // Web 控制台在 8081，默认绑 127.0.0.1 → 需把 config.toml 的 web host 改 0.0.0.0 才能外部访问。
-            web_url: "http://192.168.0.68:8081".into(),
+            // Web 控制台端口由 config.toml `[web] port` 定，**不随 SPS_BIND**。G10 上实配 9201
+            // （host 也已改 0.0.0.0）；代码里的 8081 只是 default_web_port() 的默认值，早被覆盖，
+            // 这里一度写成 8081 → 该端口无人监听，「打开后台」局域网下也打不开。2026-08-11 修正。
+            web_url: "http://192.168.0.68:9201".into(),
+            web_url_wan: wan_url("llm", ""),
             // 主端口（路由 9300）经 SPS_BIND 注入；代理口 8080 / Web UI 8081 仍由 config 控制。
             env: vec![EnvVar {
                 key: "SPS_BIND".into(),
@@ -215,10 +250,11 @@ pub fn builtin() -> Vec<ServiceDef> {
             label: "alarm-server（定时器）".into(),
             note: "timer-util 守护进程（Actix-web）；deploy-g10.ps1 交叉编译，端口经 ALARM_SERVER_BIND 注入".into(),
             repo_dir: r"D:\git\timer-util".into(),
-            health_url: "http://192.168.0.68:8080/api/health".into(),
+            health_url: "http://127.0.0.1:8080/api/health".into(),
             remote_service: Some("alarm-server.service".into()),
             // dashboard 挂主端口根路径（随 ALARM_SERVER_BIND）。
             web_url: "http://192.168.0.68:8080".into(),
+            web_url_wan: wan_url("alarm", ""),
             env: vec![EnvVar {
                 key: "ALARM_SERVER_BIND".into(),
                 value: "0.0.0.0:8080".into(),
@@ -235,10 +271,11 @@ pub fn builtin() -> Vec<ServiceDef> {
             label: "zero（消息网关）".into(),
             note: "多渠道消息网关 + Nova 编排；deploy-g10.ps1 交叉编译部署，端口经 ZERO_BIND 注入".into(),
             repo_dir: r"D:\git\zero".into(),
-            health_url: "http://192.168.0.68:9001/health".into(),
+            health_url: "http://127.0.0.1:9001/health".into(),
             remote_service: Some("zero.service".into()),
             // 控制台挂在 gateway server（随 ZERO_BIND 绑 0.0.0.0:9001）的 /console 前缀。
             web_url: "http://192.168.0.68:9001/console".into(),
+            web_url_wan: wan_url("zero", "/console"),
             env: vec![
                 EnvVar {
                     key: "ZERO_BIND".into(),

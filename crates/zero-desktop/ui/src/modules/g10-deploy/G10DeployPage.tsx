@@ -7,6 +7,7 @@ import {
   onDeployLog,
   type DeployLog,
   type LocalVersion,
+  type NetStatus,
   type ProbeResult,
   type ServiceDef,
 } from './api/tauri-client'
@@ -63,6 +64,15 @@ export default function G10DeployPage() {
   const [rows, setRows] = useState<Row[]>([])
   const [warning, setWarning] = useState<string | null>(null)
   const [loadError, setLoadError] = useState<string | null>(null)
+  // 当前生效的网络路径：页头展示 + 决定「打开后台」用局域网还是外网地址。
+  const [net, setNet] = useState<NetStatus | null>(null)
+  const wanOnly = net != null && net.picked !== 'lan'
+
+  /**
+   * 当前路径下该服务后台的实际地址。局域网档恒用 `web_url` 直连（不绕公网发夹）；
+   * 外网档用 caddy 子域名入口 `web_url_wan`，没有则返回空串 → 按钮置灰。
+   */
+  const backendUrl = (def: ServiceDef) => (wanOnly ? def.web_url_wan : def.web_url)
 
   // 本地仓库目录编辑
   const [editingDirName, setEditingDirName] = useState<string | null>(null)
@@ -73,6 +83,12 @@ export default function G10DeployPage() {
   const [editingHealthName, setEditingHealthName] = useState<string | null>(null)
   const [draftHealth, setDraftHealth] = useState('')
   const [savingHealth, setSavingHealth] = useState(false)
+
+  // 后台地址编辑（局域网直连 / 外网 caddy 子域名两条；后者留空 = 该服务无外网入口）
+  const [editingWebName, setEditingWebName] = useState<string | null>(null)
+  const [draftWeb, setDraftWeb] = useState('')
+  const [draftWebWan, setDraftWebWan] = useState('')
+  const [savingWeb, setSavingWeb] = useState(false)
 
   // 环境变量编辑：draftEnv = 草稿 KEY=VAL(+备注) 列表（端口即其中的 <SVC>_BIND 一条）
   const [editingEnvName, setEditingEnvName] = useState<string | null>(null)
@@ -104,6 +120,9 @@ export default function G10DeployPage() {
   const loadAll = useCallback(async () => {
     setLoadError(null)
     try {
+      G10DeployAPI.netStatus()
+        .then(setNet)
+        .catch(() => setNet(null))
       const list = await G10DeployAPI.listServices()
       setWarning(list.warning)
       setRows(list.services.map(def => ({ def, probing: true })))
@@ -274,6 +293,43 @@ export default function G10DeployPage() {
     }
   }
 
+  // ── 后台地址编辑 ──────────────────────────────────────────────────────────
+  // 后台是浏览器直连，不经 toolkit-server 代发，所以两条路径各存一个地址。改端口 / 换子域名
+  // 后在此改，不必编辑 g10-services.json。
+  const startEditWeb = (def: ServiceDef) => {
+    setEditingWebName(def.name)
+    setDraftWeb(def.web_url)
+    setDraftWebWan(def.web_url_wan)
+  }
+  const cancelEditWeb = () => {
+    setEditingWebName(null)
+    setDraftWeb('')
+    setDraftWebWan('')
+  }
+  const saveWeb = async (name: string) => {
+    const lan = draftWeb.trim()
+    const wan = draftWebWan.trim()
+    // 两条都允许留空（局域网空 = 无后台不显示按钮；外网空 = 外网档置灰）；非空时校验是 http(s)。
+    for (const [label, url] of [
+      ['局域网后台地址', lan],
+      ['外网后台地址', wan],
+    ] as const) {
+      if (url !== '' && !/^https?:\/\//i.test(url)) {
+        window.alert(`${label}需以 http:// 或 https:// 开头（或留空）`)
+        return
+      }
+    }
+    setSavingWeb(true)
+    try {
+      await saveServicePatch(name, { web_url: lan, web_url_wan: wan })
+      cancelEditWeb()
+    } catch (e) {
+      window.alert(`保存后台地址失败：${String(e)}`)
+    } finally {
+      setSavingWeb(false)
+    }
+  }
+
   // ── 环境变量编辑（端口即其中的 <SVC>_BIND 一条） ──────────────────────────
   const startEditEnv = (def: ServiceDef) => {
     setEditingEnvName(def.name)
@@ -331,6 +387,12 @@ export default function G10DeployPage() {
           <p className="text-sm text-gray-500 dark:text-gray-400">
             D:\git 下部署到 G10 的服务：连通性 · 本地编译版 vs 远端运行版 · 一键交叉编译部署
           </p>
+          {net && (
+            <p className="mt-0.5 text-xs text-gray-400 dark:text-gray-500">
+              连通性经 <b>{net.picked === 'lan' ? '局域网' : '外网'}</b> 的{' '}
+              {net.g10_base || '（未配置）'} 代探（toolkit-server 在 G10 本机逐个探健康端点）
+            </p>
+          )}
         </div>
         <button
           type="button"
@@ -352,7 +414,7 @@ export default function G10DeployPage() {
         </div>
       )}
 
-      {/* 服务卡片列表 */}
+      {/* 服务卡片列表。wanOnly：当前生效路径是外网 → 「打开后台」不可用（见按钮注释）。 */}
       <div className="space-y-3">
         {rows.map(({ def, probe, local, probing }) => {
           const configured = def.health_url.length > 0
@@ -515,6 +577,87 @@ export default function G10DeployPage() {
                     )}
                   </div>
 
+                  {/* 后台地址：局域网直连 / 外网 caddy 子域名。当前路径那条加粗，即「打开后台」会跳的。 */}
+                  <div className="mt-2 flex items-start gap-2">
+                    <span className="w-16 flex-shrink-0 pt-0.5 text-xs text-gray-400">后台地址</span>
+                    {editingWebName === def.name ? (
+                      <div className="flex flex-col gap-1.5">
+                        <div className="flex items-center gap-1.5">
+                          <span className="w-12 flex-shrink-0 text-xs text-gray-400">局域网</span>
+                          <input
+                            type="text"
+                            value={draftWeb}
+                            onChange={e => setDraftWeb(e.target.value)}
+                            placeholder="http(s)://192.168.0.68:port/path（留空=无后台）"
+                            className="w-80 rounded border border-gray-300 px-1.5 py-0.5 font-mono text-xs dark:border-gray-600 dark:bg-gray-800"
+                          />
+                        </div>
+                        <div className="flex items-center gap-1.5">
+                          <span className="w-12 flex-shrink-0 text-xs text-gray-400">外网</span>
+                          <input
+                            type="text"
+                            value={draftWebWan}
+                            onChange={e => setDraftWebWan(e.target.value)}
+                            placeholder="https://<svc>.for-memory.site:38788（留空=无外网入口）"
+                            className="w-80 rounded border border-gray-300 px-1.5 py-0.5 font-mono text-xs dark:border-gray-600 dark:bg-gray-800"
+                          />
+                        </div>
+                        <div className="flex items-center gap-1.5">
+                          <button
+                            type="button"
+                            disabled={savingWeb}
+                            onClick={() => void saveWeb(def.name)}
+                            className="flex items-center gap-1 rounded bg-blue-500 px-2 py-0.5 text-xs font-medium text-white hover:bg-blue-600 disabled:opacity-50"
+                          >
+                            <Save size={12} /> {savingWeb ? '保存中…' : '保存'}
+                          </button>
+                          <button
+                            type="button"
+                            onClick={cancelEditWeb}
+                            className="rounded px-2 py-0.5 text-xs text-gray-500 hover:bg-gray-100 dark:hover:bg-gray-800"
+                          >
+                            取消
+                          </button>
+                        </div>
+                      </div>
+                    ) : (
+                      <div className="flex flex-wrap items-center gap-x-2 gap-y-1">
+                        <span
+                          title={def.web_url || '未配置（无后台）'}
+                          className={[
+                            'max-w-[22rem] truncate font-mono text-xs',
+                            wanOnly
+                              ? 'text-gray-400'
+                              : 'font-medium text-gray-700 dark:text-gray-200',
+                          ].join(' ')}
+                        >
+                          <span className="mr-1 text-gray-400">局域网</span>
+                          {def.web_url || <span className="text-gray-400">未配置</span>}
+                        </span>
+                        <span
+                          title={def.web_url_wan || '未配置（外网档「打开后台」置灰）'}
+                          className={[
+                            'max-w-[22rem] truncate font-mono text-xs',
+                            wanOnly
+                              ? 'font-medium text-gray-700 dark:text-gray-200'
+                              : 'text-gray-400',
+                          ].join(' ')}
+                        >
+                          <span className="mr-1 text-gray-400">外网</span>
+                          {def.web_url_wan || <span className="text-gray-400">未配置</span>}
+                        </span>
+                        <button
+                          type="button"
+                          onClick={() => startEditWeb(def)}
+                          title="编辑后台地址（局域网 / 外网）"
+                          className="rounded p-1 text-gray-400 hover:bg-gray-100 hover:text-gray-600 dark:hover:bg-gray-800"
+                        >
+                          <Pencil size={12} />
+                        </button>
+                      </div>
+                    )}
+                  </div>
+
                   {/* 环境变量（安装时注入 systemd unit 的 Environment=；端口即 <SVC>_BIND 一条） */}
                   <div className="mt-2 flex items-start gap-2">
                     <span className="w-16 flex-shrink-0 pt-0.5 text-xs text-gray-400">环境变量</span>
@@ -617,12 +760,21 @@ export default function G10DeployPage() {
 
                 {/* 操作 */}
                 <div className="flex flex-shrink-0 items-center gap-2">
-                  {def.web_url && (
+                  {/* 两条地址都空才算「无后台」不显示按钮；只配了其中一条时按钮在，另一档置灰。 */}
+                  {(def.web_url || def.web_url_wan) && (
                     <button
                       type="button"
-                      onClick={() => void openUrl(def.web_url)}
-                      title={`打开后台 ${def.web_url}`}
-                      className="flex items-center gap-1.5 rounded-md px-2.5 py-1.5 text-sm text-gray-600 hover:bg-gray-100 dark:text-gray-300 dark:hover:bg-gray-800"
+                      // 后台是浏览器直连，不像健康探测那样能经 toolkit-server 代发，所以按当前路径
+                      // 选地址：局域网走 web_url，外网走 caddy 子域名 web_url_wan。后者为空的服务
+                      // （如 english 自持 28080 入口未收编进 caddy）外网档仍无处可去 → 置灰。
+                      disabled={!backendUrl(def)}
+                      onClick={() => void openUrl(backendUrl(def))}
+                      title={
+                        backendUrl(def)
+                          ? `打开后台 ${backendUrl(def)}`
+                          : '当前走外网：该服务没有外网入口（未接入 caddy 子域名分流）'
+                      }
+                      className="flex items-center gap-1.5 rounded-md px-2.5 py-1.5 text-sm text-gray-600 hover:bg-gray-100 disabled:cursor-not-allowed disabled:opacity-40 disabled:hover:bg-transparent dark:text-gray-300 dark:hover:bg-gray-800"
                     >
                       <ExternalLink size={14} /> 打开后台
                     </button>

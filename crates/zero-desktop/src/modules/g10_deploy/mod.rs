@@ -95,41 +95,26 @@ pub struct ProbeResult {
     pub error: Option<String>,
 }
 
-/// 探一个服务的健康端点。失败不报错，而是把失败信息塞进结果（前端统一渲染红灯）。
-#[tauri::command]
-pub async fn g10_probe_service(
-    state: State<'_, AppState>,
-    name: String,
-) -> Result<ProbeResult, String> {
-    let svc = find_service(&state.g10_deploy, &name)?;
-    if svc.health_url.is_empty() {
-        return Ok(ProbeResult {
-            name,
+impl ProbeResult {
+    /// 构造一个「不可达 + 原因」的结果（探测失败不报错，前端统一渲染红灯）。
+    fn down(name: &str, latency_ms: Option<u64>, error: String) -> Self {
+        Self {
+            name: name.to_string(),
             reachable: false,
             status: None,
             remote_version: None,
             remote_commit: None,
-            latency_ms: None,
-            error: Some("未配置健康端点".into()),
-        });
+            latency_ms,
+            error: Some(error),
+        }
     }
 
-    // 接受自签证书：english 等服务 prod feature 跑 HTTPS（自签），健康端点是 https://…/health。
-    // 这是内网 G10 面板的连通性探测，放宽证书校验可让 https 自签服务也能探到绿灯。
-    let client = reqwest::Client::builder()
-        .timeout(Duration::from_secs(4))
-        .danger_accept_invalid_certs(true)
-        .build()
-        .map_err(err)?;
-
-    let started = std::time::Instant::now();
-    let resp = client.get(&svc.health_url).send().await;
-    let latency_ms = started.elapsed().as_millis() as u64;
-
-    let result = match resp {
-        Ok(r) if r.status().is_success() => match r.json::<serde_json::Value>().await {
-            Ok(v) => ProbeResult {
-                name: name.clone(),
+    /// 从健康响应正文解析 `{status, version, commit}`；正文非预期 JSON 时仍算可达
+    /// （在线），只是拿不到版本。
+    fn from_body(name: &str, body: &str, latency_ms: u64) -> Self {
+        match serde_json::from_str::<serde_json::Value>(body) {
+            Ok(v) => Self {
+                name: name.to_string(),
                 reachable: true,
                 status: v.get("status").and_then(|s| s.as_str()).map(String::from),
                 remote_version: v.get("version").and_then(|s| s.as_str()).map(String::from),
@@ -137,9 +122,8 @@ pub async fn g10_probe_service(
                 latency_ms: Some(latency_ms),
                 error: None,
             },
-            // 2xx 但响应不是预期 JSON：仍算可达（在线），只是拿不到版本。
-            Err(e) => ProbeResult {
-                name: name.clone(),
+            Err(e) => Self {
+                name: name.to_string(),
                 reachable: true,
                 status: None,
                 remote_version: None,
@@ -147,27 +131,152 @@ pub async fn g10_probe_service(
                 latency_ms: Some(latency_ms),
                 error: Some(format!("健康响应解析失败：{e}")),
             },
-        },
-        Ok(r) => ProbeResult {
-            name: name.clone(),
-            reachable: false,
-            status: None,
-            remote_version: None,
-            remote_commit: None,
-            latency_ms: Some(latency_ms),
-            error: Some(format!("HTTP {}", r.status())),
-        },
-        Err(e) => ProbeResult {
-            name: name.clone(),
-            reachable: false,
-            status: None,
-            remote_version: None,
-            remote_commit: None,
-            latency_ms: None,
-            error: Some(err(e)),
-        },
+        }
+    }
+}
+
+/// 把清单里的 `health_url` 规整成**给 G10 本机代发用的 loopback target**。
+///
+/// 清单内置值已是 `http://127.0.0.1:<port>/...`；但用户 workspace 里可能存着老的
+/// `g10-services.json` 覆盖文件（硬编码 `192.168.0.68`），那些 host 从 G10 本机看同样
+/// 是「另一台机器」，外网档必然探不到。故这里统一把**任何 host 换成 `127.0.0.1`**，
+/// 只保留 scheme / 端口 / 路径——反正探针的语义就是「在 G10 上探本机某端口」。
+fn probe_target(health_url: &str) -> Result<String, String> {
+    let (scheme, rest) = health_url
+        .split_once("://")
+        .ok_or_else(|| format!("健康端点缺少 scheme：{health_url}"))?;
+    let (authority, path) = match rest.find('/') {
+        Some(i) => (&rest[..i], &rest[i..]),
+        None => (rest, ""),
     };
-    Ok(result)
+    // 保留端口（IPv6 字面量按 `]` 之后取端口）。
+    let port = match authority.rsplit_once(']') {
+        Some((_, tail)) => tail.strip_prefix(':'),
+        None => authority.rsplit_once(':').map(|(_, p)| p),
+    };
+    Ok(match port {
+        Some(p) => format!("{scheme}://127.0.0.1:{p}{path}"),
+        None => format!("{scheme}://127.0.0.1{path}"),
+    })
+}
+
+/// 探一个服务的健康端点。失败不报错，而是把失败信息塞进结果（前端统一渲染红灯）。
+///
+/// **不再直连服务端口**（那要求局域网/外网各自能一一映射到每个端口，外网做不到），
+/// 而是统一经 toolkit-server 的 loopback 探针代理：
+/// `{g10_base}/api/web/probe?target=http://127.0.0.1:<port>/...`。`g10_base` 由
+/// [`NetResolver`](crate::shared::settings::NetResolver) 按设置里的网络模式解析，于是
+/// 面板的连通性天然跟随 局域网 / 外网 / 自动 三档，外网也只需 toolkit-server 一个入口。
+///
+/// 唯一例外是 **toolkit-server 自己**：代理探不了自身（它挂了代理也挂），直连
+/// `{g10_base}/api/web/health`。
+#[tauri::command]
+pub async fn g10_probe_service(
+    state: State<'_, AppState>,
+    name: String,
+) -> Result<ProbeResult, String> {
+    let svc = find_service(&state.g10_deploy, &name)?;
+    if svc.health_url.is_empty() {
+        return Ok(ProbeResult::down(&name, None, "未配置健康端点".into()));
+    }
+
+    let resolved = state.net.resolve(&state.workspace).await;
+    if !resolved.is_configured() {
+        return Ok(ProbeResult::down(
+            &name,
+            None,
+            "未配置 G10 地址（见设置页）".into(),
+        ));
+    }
+
+    // 探针 URL：自身直连 health，其余借 toolkit-server 的本机视角代发。
+    let (url, target) = if name == "toolkit-server" {
+        (
+            resolved
+                .endpoint("/api/web/health")
+                .ok_or("未配置 G10 地址")?,
+            None,
+        )
+    } else {
+        (
+            resolved
+                .endpoint("/api/web/probe")
+                .ok_or("未配置 G10 地址")?,
+            Some(probe_target(&svc.health_url)?),
+        )
+    };
+
+    // 接受自签证书：局域网档 toolkit-server 是明文 http，但保留放宽以兼容自定义 https 入口。
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(8))
+        .danger_accept_invalid_certs(true)
+        .build()
+        .map_err(err)?;
+    let mut req = client.get(&url);
+    if let Some(t) = target.as_deref() {
+        req = req.query(&[("target", t)]); // reqwest 负责 URL 编码
+    }
+    if let Some(t) = resolved.g10_token.as_deref() {
+        req = req.bearer_auth(t);
+    }
+
+    let started = std::time::Instant::now();
+    let resp = req.send().await;
+    let latency_ms = started.elapsed().as_millis() as u64;
+
+    let (status, text) = match resp {
+        Ok(r) => {
+            let code = r.status();
+            match r.text().await {
+                Ok(t) => (code, t),
+                Err(e) => {
+                    return Ok(ProbeResult::down(
+                        &name,
+                        Some(latency_ms),
+                        format!("读取响应失败：{e}"),
+                    ))
+                }
+            }
+        }
+        // 这里失败 = 连 toolkit-server 都没连上（或它自己不在线）。
+        Err(e) => return Ok(ProbeResult::down(&name, None, err(e))),
+    };
+    if !status.is_success() {
+        return Ok(ProbeResult::down(
+            &name,
+            Some(latency_ms),
+            format!("HTTP {status}"),
+        ));
+    }
+    if name == "toolkit-server" {
+        return Ok(ProbeResult::from_body(&name, &text, latency_ms));
+    }
+
+    // 代理响应：`{ok, status_code, latency_ms, body?, error?}`。上游耗时以代理测得的为准
+    // （不含桌面端到 G10 的这一跳，正是我们想看的「服务本身是否在线」）。
+    let env: serde_json::Value = serde_json::from_str(&text).map_err(|e| {
+        format!(
+            "探针响应解析失败：{e}；原文：{}",
+            text.chars().take(200).collect::<String>()
+        )
+    })?;
+    let upstream_ms = env
+        .get("latency_ms")
+        .and_then(|v| v.as_u64())
+        .unwrap_or(latency_ms);
+    if env.get("ok").and_then(|v| v.as_bool()) == Some(true) {
+        let body = env.get("body").and_then(|v| v.as_str()).unwrap_or("");
+        return Ok(ProbeResult::from_body(&name, body, upstream_ms));
+    }
+    let reason = match (
+        env.get("error").and_then(|v| v.as_str()),
+        env.get("status_code").and_then(|v| v.as_u64()),
+    ) {
+        (Some(e), _) => e.to_string(),
+        (None, Some(code)) => format!("HTTP {code}"),
+        _ => "不可达".into(),
+    };
+    Ok(ProbeResult::down(&name, Some(upstream_ms), reason))
 }
 
 // ============ 本地编译版（git 短哈希 + 是否有未提交改动） ============
@@ -458,4 +567,43 @@ async fn run_deploy(
     let _ = err_task.await;
 
     Ok(status.code())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::probe_target;
+
+    #[test]
+    fn keeps_scheme_port_and_path() {
+        assert_eq!(
+            probe_target("http://127.0.0.1:9120/health").unwrap(),
+            "http://127.0.0.1:9120/health"
+        );
+        assert_eq!(
+            probe_target("https://127.0.0.1:28080/health").unwrap(),
+            "https://127.0.0.1:28080/health"
+        );
+        assert_eq!(
+            probe_target("http://127.0.0.1:9001/console/api/health").unwrap(),
+            "http://127.0.0.1:9001/console/api/health"
+        );
+    }
+
+    #[test]
+    fn rewrites_any_host_to_loopback() {
+        // 老覆盖文件里的硬编码内网 IP：从 G10 本机看也是「另一台机器」，须改写。
+        assert_eq!(
+            probe_target("http://192.168.0.68:8788/api/web/health").unwrap(),
+            "http://127.0.0.1:8788/api/web/health"
+        );
+        assert_eq!(
+            probe_target("https://g10.local/health").unwrap(),
+            "https://127.0.0.1/health"
+        );
+    }
+
+    #[test]
+    fn missing_scheme_is_error() {
+        assert!(probe_target("192.168.0.68:8788/health").is_err());
+    }
 }

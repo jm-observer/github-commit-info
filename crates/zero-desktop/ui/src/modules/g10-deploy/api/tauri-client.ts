@@ -27,8 +27,13 @@ export interface ServiceDef {
   /** HTTP 健康端点（面板可编辑；https 自签也能探，探测已放宽证书校验）。 */
   health_url: string
   remote_service: string | null
-  /** 服务 web 后台地址；空串 = 无后台。 */
+  /** 服务 web 后台地址（局域网直连）；空串 = 无后台，不显示按钮。 */
   web_url: string
+  /**
+   * 同一后台的外网地址（caddy 子域名入口，形如 `https://<svc>.for-memory.site:38788`）。
+   * 空串 = 该服务没有外网入口 → 外网档「打开后台」置灰。
+   */
+  web_url_wan: string
   /** 安装时动态注入 systemd unit 的环境变量；部署时拼成 `-Env KEY=VAL,...` 传给脚本。 */
   env: EnvVar[]
   deploy: DeployDef | null
@@ -73,8 +78,23 @@ export interface DeployDone {
 
 // ── 命令封装 ────────────────────────────────────────────────────────────────
 
+/** 当前生效的网络路径（设置页同源命令 `net_resolve_status`）。 */
+export interface NetStatus {
+  mode: 'auto' | 'lan' | 'wan'
+  /** auto 探测后实际选中的路径。 */
+  picked: 'auto' | 'lan' | 'wan'
+  g10_base: string
+  configured: boolean
+  reachable: boolean | null
+}
+
 export const G10DeployAPI = {
   listServices: () => invoke<ServiceList>('g10_list_services'),
+  /**
+   * 当前生效的网络路径。面板用它做两件事：页头展示走的是局域网还是外网；
+   * 决定「打开后台」跳 `web_url`（局域网直连）还是 `web_url_wan`（caddy 子域名入口）。
+   */
+  netStatus: () => invoke<NetStatus>('net_resolve_status'),
   saveServices: (services: ServiceDef[]) =>
     invoke<void>('g10_save_services', { services }),
   probe: (name: string) => invoke<ProbeResult>('g10_probe_service', { name }),

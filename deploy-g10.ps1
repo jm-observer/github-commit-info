@@ -13,6 +13,11 @@
 .PARAMETER G10Host
     G10 的 ssh 目标，默认 fengqi@192.168.0.68。
 
+.PARAMETER SshPort
+    G10 的 ssh 端口，默认 22（局域网）。外网走 caddy 旁的 SSH 映射时传 `-SshPort 2222`
+    并把 `-G10Host` 换成公网域名，例：
+    `pwsh ./deploy-g10.ps1 -G10Host fengqi@spark.for-memory.site -SshPort 2222`。
+
 .PARAMETER DestDir
     G10 上的安装目录，默认 ~/.local/bin（与 custom-utils updater 自更新目标一致）。
 
@@ -55,6 +60,7 @@
 #>
 param(
     [string]$G10Host = "fengqi@192.168.0.68",
+    [int]$SshPort = 22,
     [string]$DestDir = "~/.local/bin",
     [string]$Service = "toolkit-server",
     [string]$Bind = "0.0.0.0:8788",
@@ -67,6 +73,9 @@ param(
 
 $ErrorActionPreference = "Stop"
 $RepoRoot = $PSScriptRoot
+# ssh 与 scp 的端口开关拼法不同（小写 -p / 大写 -P），统一在此备好，下面逐处 splat。
+$SshPortArgs = @("-p", "$SshPort")
+$ScpPortArgs = @("-P", "$SshPort")
 $Target = "aarch64-unknown-linux-gnu"
 $Image = "huangjiemin/rust_aarch64-gcc_openssl:1.94.0_9.4.0_1.1.0l_llvm12.0.1"
 
@@ -146,9 +155,9 @@ foreach ($b in $Bins) {
 }
 $ReleaseDir = $OutDir
 
-Write-Host "==> 部署到 ${G10Host}:${DestDir}" -ForegroundColor Cyan
+Write-Host "==> 部署到 ${G10Host}:${DestDir}（ssh 端口 $SshPort）" -ForegroundColor Cyan
 # 确保远端目录存在。
-ssh $G10Host "mkdir -p $DestDir"
+ssh @SshPortArgs $G10Host "mkdir -p $DestDir"
 if ($LASTEXITCODE -ne 0) { throw "无法在 G10 创建目录 $DestDir（检查 ssh 连通性）" }
 
 foreach ($b in $Bins) {
@@ -157,16 +166,16 @@ foreach ($b in $Bins) {
     Write-Host "    scp $($b.Bin)"
     # 先传到 .new 临时名，再 mv 覆盖：rename 即使旧二进制正在运行也能替换
     # （直接 scp 覆盖运行中的二进制会 ETXTBSY / dest open Failure）。
-    scp $local "${G10Host}:${dest}.new"
+    scp @ScpPortArgs $local "${G10Host}:${dest}.new"
     if ($LASTEXITCODE -ne 0) { throw "scp $($b.Bin) 失败" }
-    ssh $G10Host "chmod +x ${dest}.new && mv -f ${dest}.new ${dest}"
+    ssh @SshPortArgs $G10Host "chmod +x ${dest}.new && mv -f ${dest}.new ${dest}"
     if ($LASTEXITCODE -ne 0) { throw "替换 $($b.Bin) 失败（mv）" }
 }
 
 # 打印版本确认。
 Write-Host "==> 远端版本确认" -ForegroundColor Cyan
 foreach ($b in $Bins) {
-    ssh $G10Host "$DestDir/$($b.Bin) --version"
+    ssh @SshPortArgs $G10Host "$DestDir/$($b.Bin) --version"
 }
 
 # 重装 daemon unit：把 -Bind 写进 unit 的 Environment=<BIN>_BIND=<Bind>（各 daemon 的
@@ -189,7 +198,7 @@ if ($DaemonBins -contains $Service) {
     }
     $installCmd = 'export XDG_RUNTIME_DIR=/run/user/$(id -u); ' `
         + "$DestDir/$Service install --workspace $ws --bind $Bind $envArgs"
-    ssh $G10Host $installCmd
+    ssh @SshPortArgs $G10Host $installCmd
     if ($LASTEXITCODE -ne 0) { throw "$Service install 失败（重装 unit）" }
 }
 
@@ -202,7 +211,7 @@ if (-not $SkipRestart) {
         + "sleep 2 && " `
         + "systemctl --user is-active $Service && " `
         + "systemctl --user status $Service --no-pager -n 5"
-    ssh $G10Host $restartCmd
+    ssh @SshPortArgs $G10Host $restartCmd
     if ($LASTEXITCODE -ne 0) { throw "重启 $Service 失败（检查服务名 / 是否已 systemctl --user enable）" }
 } else {
     Write-Host "==> 跳过重启（-SkipRestart）" -ForegroundColor DarkGray
