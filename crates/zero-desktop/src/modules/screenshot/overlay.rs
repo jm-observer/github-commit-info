@@ -19,6 +19,26 @@ use tauri::{AppHandle, Manager};
 
 pub const OVERLAY_LABEL: &str = "screenshot-overlay";
 
+/// 叠加窗的用途。同一套框选交互服务两个功能，靠这个参数分流前端行为：
+/// 截图选完进标注、录屏选完直接开录。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Mode {
+    /// 截图：框选 → 标注 → 提交 PNG。
+    Shot,
+    /// 录屏：框选 → 开始录制（无标注环节）。
+    Record,
+}
+
+impl Mode {
+    /// 写进叠加窗 URL 查询串的值。
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Mode::Shot => "shot",
+            Mode::Record => "record",
+        }
+    }
+}
+
 /// watchdog 等待 ready ack 的时长。超过此值视为前端未就绪。
 const READY_WATCHDOG: Duration = Duration::from_millis(2500);
 /// 等待旧窗销毁的总时长（轮询 20ms 一次）。
@@ -74,6 +94,7 @@ pub fn open_overlay(
     rect: &super::monitor::MonitorRect,
     frame_path: &str,
     session_id: u64,
+    mode: Mode,
 ) -> anyhow::Result<()> {
     use anyhow::Context;
     use tauri::{PhysicalPosition, PhysicalSize, WebviewUrl, WebviewWindowBuilder};
@@ -95,17 +116,22 @@ pub fn open_overlay(
     }
 
     let url = format!(
-        "overlay.html?x={}&y={}&w={}&h={}&sid={}&frame={}",
+        "overlay.html?x={}&y={}&w={}&h={}&sid={}&mode={}&frame={}",
         rect.x,
         rect.y,
         rect.width,
         rect.height,
         session_id,
+        mode.as_str(),
         percent_encode(frame_path)
     );
 
     let win = WebviewWindowBuilder::new(app, OVERLAY_LABEL, WebviewUrl::App(url.into()))
-        .title("截图")
+        .title(if mode == Mode::Record {
+            "录屏选区"
+        } else {
+            "截图"
+        })
         .decorations(false)
         .resizable(false)
         .always_on_top(true)

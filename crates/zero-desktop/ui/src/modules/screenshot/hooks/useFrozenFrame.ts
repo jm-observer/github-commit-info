@@ -11,6 +11,8 @@ export interface FrozenFrame {
   geom: { x: number; y: number; w: number; h: number };
   /** Rust 侧分配的 session id，前端就绪时回传给 `screenshot_overlay_ready`。 */
   sessionId: number;
+  /** 叠加窗用途：`shot` = 框选后标注并提交 PNG；`record` = 框选后开始录屏。 */
+  mode: "shot" | "record";
   /** 解析失败原因；非空时 OverlayApp 走错误层路径，不要再进入正常截图流程。 */
   error?: string;
 }
@@ -25,11 +27,13 @@ export function useFrozenFrame(): FrozenFrame | null {
       const q = new URLSearchParams(window.location.search);
       const framePath = q.get("frame") ?? "";
       const sid = Number(q.get("sid") ?? 0);
+      const mode = q.get("mode") === "record" ? "record" : "shot";
       if (!framePath) {
         setFrame({
           src: "",
           framePath: "",
           sessionId: sid,
+          mode,
           geom: { x: 0, y: 0, w: 0, h: 0 },
           error: "缺少冻结帧参数（frame）",
         });
@@ -39,6 +43,7 @@ export function useFrozenFrame(): FrozenFrame | null {
         src: convertFileSrc(framePath),
         framePath,
         sessionId: sid,
+        mode,
         geom: {
           x: Number(q.get("x") ?? 0),
           y: Number(q.get("y") ?? 0),
@@ -51,6 +56,7 @@ export function useFrozenFrame(): FrozenFrame | null {
         src: "",
         framePath: "",
         sessionId: 0,
+        mode: "shot",
         geom: { x: 0, y: 0, w: 0, h: 0 },
         error: `解析叠加窗参数失败：${String(e)}`,
       });

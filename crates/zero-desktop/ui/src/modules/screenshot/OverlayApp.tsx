@@ -6,6 +6,7 @@ import { useFrozenFrame } from "./hooks/useFrozenFrame";
 import SelectionLayer from "./components/SelectionLayer";
 import AnnotateCanvas from "./components/AnnotateCanvas";
 import Toolbar from "./components/Toolbar";
+import RecordToolbar from "./components/RecordToolbar";
 
 type Phase = "selecting" | "annotating";
 
@@ -45,6 +46,9 @@ function OverlayInner() {
 
   const [imgError, setImgError] = useState<string | null>(null);
 
+  /** 录屏模式：同一套框选交互，选完不标注、直接开录（由 Rust 经 URL 的 mode 参数指定）。 */
+  const isRecord = frame?.mode === "record";
+
   // 拖拽状态与最新选区/草稿用 ref 读取，避免 window 事件闭包读到旧值。
   const dragRef = useRef<Drag>(null);
   const selRef = useRef<Rect | null>(null);
@@ -72,6 +76,31 @@ function OverlayInner() {
     void invoke("screenshot_cancel").catch(() => undefined);
   }, []);
 
+  // 录屏模式：框选完不进标注，直接把**物理像素**矩形交给后端开录。
+  // 叠加窗铺满整块屏，所以 CSS 像素 → 物理像素只是一个等比缩放（高 DPI 屏上两者不等）。
+  const startRecording = useCallback(() => {
+    const s = selRef.current;
+    const geom = frame?.geom;
+    if (!s || !geom || s.w < 2 || s.h < 2) {
+      cancel();
+      return;
+    }
+    const sx = geom.w / window.innerWidth;
+    const sy = geom.h / window.innerHeight;
+    const region = {
+      x: Math.round(geom.x + s.x * sx),
+      y: Math.round(geom.y + s.y * sy),
+      width: Math.round(s.w * sx),
+      height: Math.round(s.h * sy),
+    };
+    // 后端负责关掉本窗口（它要先关窗再开录，否则蒙版会被录进第一帧）。
+    invoke("recording_start", { region }).catch((e) => {
+      console.error("[overlay] start recording failed", e);
+      try { alert(`开始录制失败：${String(e)}`); } catch {}
+      cancel();
+    });
+  }, [frame, cancel]);
+
   const confirm = useCallback(() => {
     const img = imgRef.current;
     const s = selRef.current;
@@ -97,7 +126,8 @@ function OverlayInner() {
         cancel();
       } else if (e.key === "Enter") {
         e.preventDefault();
-        confirm();
+        if (isRecord) startRecording();
+        else confirm();
       } else if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === "z") {
         e.preventDefault();
         setShapes((arr) => arr.slice(0, -1));
@@ -105,7 +135,7 @@ function OverlayInner() {
     };
     window.addEventListener("keydown", onKey);
     return () => window.removeEventListener("keydown", onKey);
-  }, [confirm, cancel]);
+  }, [confirm, cancel, isRecord, startRecording]);
 
   // 全局 move/up：根据 dragRef 更新选区/草稿。仅挂一次。
   useEffect(() => {
@@ -206,7 +236,8 @@ function OverlayInner() {
       onMouseDown={onRootDown}
       onDoubleClick={(e) => {
         e.preventDefault();
-        confirm();
+        if (isRecord) startRecording();
+        else confirm();
       }}
     >
       <img
@@ -232,14 +263,28 @@ function OverlayInner() {
 
       <SelectionLayer sel={sel} annotating={phase === "annotating"} onHandleDown={onHandleDown} />
 
-      <AnnotateCanvas
-        shapes={shapes}
-        draft={draft}
-        width={window.innerWidth}
-        height={window.innerHeight}
-      />
+      {!isRecord && (
+        <AnnotateCanvas
+          shapes={shapes}
+          draft={draft}
+          width={window.innerWidth}
+          height={window.innerHeight}
+        />
+      )}
 
-      {phase === "annotating" && sel && (
+      {isRecord && phase === "annotating" && sel && frame && (
+        <RecordToolbar
+          physical={{
+            w: Math.round(sel.w * (frame.geom.w / window.innerWidth)),
+            h: Math.round(sel.h * (frame.geom.h / window.innerHeight)),
+          }}
+          onStart={startRecording}
+          onCancel={cancel}
+          style={toolbarStyle(sel)}
+        />
+      )}
+
+      {!isRecord && phase === "annotating" && sel && (
         <Toolbar
           tool={tool}
           onTool={setTool}

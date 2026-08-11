@@ -229,7 +229,13 @@ fn capture_now(app: &AppHandle, workspace: &Path, trace_path: &Path) -> Result<(
     }
     trace("frame-saved", &frame_path.to_string_lossy());
 
-    if let Err(e) = overlay::open_overlay(app, &rect, &frame_path.to_string_lossy(), session_id) {
+    if let Err(e) = overlay::open_overlay(
+        app,
+        &rect,
+        &frame_path.to_string_lossy(),
+        session_id,
+        overlay::Mode::Shot,
+    ) {
         let m = e.to_string();
         trace("overlay-fail", &m);
         notify_capture_failed(app, &m);
@@ -348,16 +354,32 @@ pub fn screenshot_save_settings(
     app: AppHandle,
     settings: ScreenshotSettings,
 ) -> Result<(), String> {
-    // 先按新热键注册（兼校验）：解析/注册失败则不落盘，保留旧热键，前端据错误提示用户。
-    super::register_hotkey(&app, &settings.hotkey)?;
+    // 先纯解析校验：热键串写错（比如 `Ctrl+`）不该落盘。
+    crate::modules::hotkeys::parse_shortcut(&settings.hotkey)?;
 
     let workspace = app.state::<AppState>().workspace.clone();
     let path = super::output::settings_path(&workspace);
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent).map_err(|e| format!("创建设置目录失败: {e}"))?;
     }
+    let old = std::fs::read_to_string(&path).ok();
     let json = serde_json::to_string_pretty(&settings).map_err(|e| e.to_string())?;
     std::fs::write(&path, json).map_err(|e| format!("写设置失败: {e}"))?;
+
+    // 重注册从磁盘读热键，所以必须写在前面。注册失败（多为被别的软件占用）→ 回滚设置
+    // 并按旧值重注册，避免「设置显示新热键、实际按了没反应」。
+    if let Err(e) = super::reregister(&app) {
+        match old {
+            Some(prev) => {
+                let _ = std::fs::write(&path, prev);
+            }
+            None => {
+                let _ = std::fs::remove_file(&path);
+            }
+        }
+        let _ = super::reregister(&app);
+        return Err(e);
+    }
     Ok(())
 }
 

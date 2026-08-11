@@ -123,6 +123,13 @@ fn run_gui(workspace: PathBuf) -> Result<()> {
                 tauri::WindowEvent::CloseRequested { .. } if window.label() == "main" => {
                     let app = window.app_handle();
                     modules::screenshot::overlay::close_overlay(app);
+                    // 录制中直接退进程会留下一个没写完 moov 的 mp4（播放器打不开）+ 一个
+                    // 孤儿 ffmpeg。这里先正常收尾，宁可退出慢半秒。
+                    if modules::recording::session::is_active() {
+                        if let Err(e) = modules::recording::recording_stop(app.clone()) {
+                            log::warn!(target: "recording", "退出前停止录制失败: {e}");
+                        }
+                    }
                     app.exit(0);
                 }
                 _ => {}
@@ -243,6 +250,22 @@ fn run_gui(workspace: PathBuf) -> Result<()> {
             modules::screenshot::screenshot_copy_to_clipboard,
             modules::screenshot::screenshot_reveal_in_folder,
             modules::screenshot::screenshot_save_as,
+            // 录屏模块
+            modules::recording::recording_get_settings,
+            modules::recording::recording_save_settings,
+            modules::recording::recording_detect_ffmpeg,
+            modules::recording::recording_status,
+            modules::recording::recording_start,
+            modules::recording::recording_start_region,
+            modules::recording::recording_set_paused,
+            modules::recording::recording_stop,
+            modules::recording::recording_discard,
+            modules::recording::recording_list,
+            modules::recording::recording_delete,
+            modules::recording::recording_open_folder,
+            modules::recording::recording_open_file,
+            modules::recording::recording_reveal_in_folder,
+            modules::recording::recording_save_as,
         ])
         .setup(move |app| {
             modules::english::setup(app.handle(), state.english.clone())
