@@ -134,10 +134,10 @@ enum Command {
         #[arg(short, long, help = "即使版本未升级也强制更新")]
         force: bool,
     },
-    /// 列出本机网卡 IP,辅助挑选 `run --local-address <IP>`。仅 Linux 提供
-    /// (Windows 上源 IP 绑定选不了出口,这个清单没有意义)。
-    #[cfg(target_os = "linux")]
-    List,
+    // `List`(列本机网卡 IP,辅助挑 `run --local-address`)已随 net-policy 拆仓退役:
+    // 实现函数当时一并删掉,只剩这条 Linux-only 的变体与调用,Windows 上 cfg 门控使其
+    // 永不编译,直到交叉编译 aarch64-linux 才暴露为「找不到 list_egress」。换出口现在
+    // 一律走独立仓 net-policy,故直接删掉空壳而非补实现。
     /// 启动 HTTP 转发代理:浏览器/App 把代理指向它,流量就从本 worker 的出口发出
     /// (整体换 IP 场景,如 THS headless Chrome、手机 App)。支持 `CONNECT`(HTTPS 隧道)
     /// 与明文 HTTP(absolute-form)两种请求。
@@ -984,8 +984,6 @@ async fn main() -> Result<()> {
                 .context("自更新失败")?;
             Ok(())
         }
-        #[cfg(target_os = "linux")]
-        Command::List => list_egress(),
         Command::Proxy {
             listen,
             interface,
