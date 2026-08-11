@@ -607,6 +607,116 @@ pub async fn speech_export_homophone_candidates(
     Ok(out_path.to_string_lossy().to_string())
 }
 
+/// 拉取编排器现有的 `asr.hotwords` 词面集合。取不到（未配 base / 网络失败）返回 None——
+/// 与「拿到了但是空表」区分开：前者不能声称候选都是新词。
+async fn fetch_existing_hotwords(base: Option<&str>) -> Option<HashSet<String>> {
+    let base = base?;
+    let client = reqwest::Client::builder()
+        .timeout(CONFIG_TIMEOUT)
+        .build()
+        .ok()?;
+    let resp = client.get(format!("{base}/api/config")).send().await.ok()?;
+    if !resp.status().is_success() {
+        warn!(target: "speech", "[hotword] get config status {}", resp.status());
+        return None;
+    }
+    let v = resp.json::<serde_json::Value>().await.ok()?;
+    let text = v.get(HOTWORDS_KEY).and_then(|x| x.as_str()).unwrap_or("");
+    Some(parse_existing_hotwords(text))
+}
+
+/// 热词候选导出（P1.5）：两路挖掘（纠错样本 Y' 侧 + 场景记录新词发现），去掉已在
+/// `asr.hotwords` 里的词，写 JSON 供人工审读，返回文件路径。
+///
+/// **只导出，不改任何配置**——热词入表沿用既定取舍「不自动上线」（design §10 取舍 1）。
+/// 与同音候选导出是两条线：那条治「选字错」（有过纠风险，卡在负样本量上），
+/// 这条治「词表缺口」（热词是提示不是替换，无过纠风险，见 design §4.2/§4.3）。
+#[tauri::command]
+pub async fn speech_export_hotword_candidates(
+    state: State<'_, AppState>,
+) -> Result<String, String> {
+    use crate::modules::speech::{homophone, hotword_mine};
+
+    let workspace = state.workspace.clone();
+    let db = {
+        let guard = state
+            .speech
+            .db
+            .lock()
+            .map_err(|_| "speech db mutex poisoned".to_string())?;
+        guard
+            .clone()
+            .ok_or_else(|| "speech db 未初始化".to_string())?
+    };
+
+    let samples = db.list_samples().await.map_err(|e| e.to_string())?;
+    let pairs: Vec<(i64, String, String)> = samples
+        .iter()
+        .filter_map(|r| {
+            let correction = r.correction.as_deref().filter(|s| !s.trim().is_empty())?;
+            // O = 实际交付的文本（优化文，缺则原文），与同音挖掘同口径。
+            let delivered = r
+                .text_optimized
+                .as_deref()
+                .filter(|s| !s.trim().is_empty())
+                .unwrap_or(&r.text_raw);
+            Some((r.id, delivered.to_string(), correction.to_string()))
+        })
+        .collect();
+    let scene_texts = db.list_scene_texts().await.map_err(|e| e.to_string())?;
+
+    let base = remote_http_base_from_state(&state.speech.remote_url);
+    let existing = fetch_existing_hotwords(base.as_deref()).await;
+    let existing_known = existing.is_some();
+    let existing = existing.unwrap_or_default();
+
+    let from_corrections =
+        hotword_mine::drop_existing(hotword_mine::mine_corrections(&pairs), &existing);
+    // 双字中文单独分组：没有通用词词典兜底，双字里混的通用词最多（数据/文档/分析…），
+    // 混进主列表会把真专名淹掉。分开放，人工先看主列表，想看再翻 bigram 那组。
+    let (from_scenes_bigram, from_scenes): (Vec<_>, Vec<_>) =
+        hotword_mine::drop_existing(hotword_mine::mine_scenes(&scene_texts), &existing)
+            .into_iter()
+            .partition(|c| {
+                let chars: Vec<char> = c.term.chars().collect();
+                chars.len() == 2 && chars.iter().all(|&ch| homophone::is_han(ch))
+            });
+
+    let doc = serde_json::json!({
+        "generated_at": now_str(),
+        "samples_total": samples.len(),
+        "samples_with_correction": pairs.len(),
+        "scenes_total": scene_texts.len(),
+        "existing_hotwords_known": existing_known,
+        "existing_hotwords_count": existing.len(),
+        "note": "候选仅供人工审读; 勾中的词自行加进 asr.hotwords。热词是声学/润色提示, 不是替换规则, 不要写 wrong→right(该语法已被 extract_hotword_term 占用)。from_corrections 可信度最高(用户手改出来的); from_scenes_bigram 是双字中文, 通用词最多, 最后看。",
+        "from_corrections": from_corrections,
+        "from_scenes": from_scenes,
+        "from_scenes_bigram": from_scenes_bigram,
+    });
+
+    let dir = workspace.join("speech_samples");
+    tokio::fs::create_dir_all(&dir)
+        .await
+        .map_err(|e| format!("创建 speech_samples 目录失败: {e}"))?;
+    let ts = Local::now().format("%Y%m%d-%H%M%S").to_string();
+    let out_path = dir.join(format!("hotword-candidates-{ts}.json"));
+    let json = serde_json::to_string_pretty(&doc).map_err(|e| e.to_string())?;
+    tokio::fs::write(&out_path, json)
+        .await
+        .map_err(|e| format!("写导出文件失败 {}: {e}", out_path.display()))?;
+    info!(
+        target: "speech",
+        "[hotword] exported {} correction candidate(s) + {} scene candidate(s) from {} sample(s)/{} scene(s) -> {}",
+        from_corrections.len(),
+        from_scenes.len(),
+        pairs.len(),
+        scene_texts.len(),
+        out_path.display()
+    );
+    Ok(out_path.to_string_lossy().to_string())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

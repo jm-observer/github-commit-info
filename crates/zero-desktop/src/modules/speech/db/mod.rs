@@ -203,6 +203,20 @@ impl SpeechDatabase {
         Ok(stats)
     }
 
+    /// 全部场景记录的交付文本（热词候选挖掘的输入）。
+    pub async fn list_scene_texts(&self) -> Result<Vec<String>> {
+        let conn = Arc::clone(&self.conn);
+        let rows = tokio::task::spawn_blocking(move || {
+            let guard = conn
+                .lock()
+                .map_err(|_| anyhow::anyhow!("db mutex poisoned"))?;
+            repository::list_scene_texts(&guard)
+        })
+        .await
+        .map_err(|e| anyhow::anyhow!("spawn_blocking join error: {e}"))??;
+        Ok(rows)
+    }
+
     /// 列出全部样本（marked_at 倒序）。
     pub async fn list_samples(&self) -> Result<Vec<repository::SampleRow>> {
         let conn = Arc::clone(&self.conn);

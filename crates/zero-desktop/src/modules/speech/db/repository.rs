@@ -199,6 +199,22 @@ pub fn list_samples(conn: &Connection) -> Result<Vec<SampleRow>> {
     Ok(out)
 }
 
+/// 全部场景记录的交付文本（P1.5 热词候选挖掘的输入）。只取 `text` 一列——挖掘只看
+/// 文本内容，不需要应用上下文（分组结论见 design §4.1：不分组）。
+pub fn list_scene_texts(conn: &Connection) -> Result<Vec<String>> {
+    let mut stmt = conn
+        .prepare("SELECT text FROM speech_scenes WHERE text <> '' ORDER BY id")
+        .context("failed to prepare list_scene_texts")?;
+    let rows = stmt
+        .query_map([], |row| row.get::<_, String>(0))
+        .context("failed to query list_scene_texts")?;
+    let mut out = Vec::new();
+    for r in rows {
+        out.push(r.context("failed to read scene text row")?);
+    }
+    Ok(out)
+}
+
 // ---- 场景记录（speech_scenes）----
 
 /// 一次交付的落库入参。应用上下文可能全空（抓拍失败 / 非 Windows），留空不猜。

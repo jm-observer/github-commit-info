@@ -358,6 +358,7 @@ mod tests {
                 source: "copy".into(),
                 segment_ids: Some("[1,2]".into()),
                 app: SampleAppContext::default(),
+                speaker: None,
             },
         )
         .unwrap();
@@ -615,6 +616,7 @@ mod tests {
             source: "copy".into(),
             segment_ids: Some(ids.into()),
             app: SampleAppContext::default(),
+            speaker: None,
         };
         let sid =
             repository::insert_sample(&conn, &sample(1, "[1,2]", "other", Some("改好的"))).unwrap();

@@ -612,6 +612,7 @@ export default function SpeechPage() {
 
   const [exporting, setExporting] = useState(false);
   const [exportingHomophone, setExportingHomophone] = useState(false);
+  const [exportingHotword, setExportingHotword] = useState(false);
 
   const handleExportSamples = async () => {
     setExporting(true);
@@ -637,6 +638,20 @@ export default function SpeechPage() {
       store.setErrorMessage(typeof err === 'string' ? err : (err as Error)?.message || String(err));
     } finally {
       setExportingHomophone(false);
+    }
+  };
+
+  // P1.5：两路挖热词候选（纠错样本 + 场景记录），导出 JSON 供人工审读（不改任何配置）。
+  const handleExportHotword = async () => {
+    setExportingHotword(true);
+    try {
+      const path = await SpeechAPI.exportHotwordCandidates();
+      await SpeechAPI.openInFolder(path);
+    } catch (err) {
+      console.error('export hotword candidates failed', err);
+      store.setErrorMessage(typeof err === 'string' ? err : (err as Error)?.message || String(err));
+    } finally {
+      setExportingHotword(false);
     }
   };
 
@@ -749,6 +764,15 @@ export default function SpeechPage() {
             />
 
             <div className="flex justify-end gap-1">
+              <button
+                onClick={handleExportHotword}
+                disabled={exportingHotword}
+                className="inline-flex items-center gap-1.5 h-7 px-2.5 text-[11px] rounded-md text-[var(--ink-4)] hover:text-[var(--ink-2)] hover:bg-[var(--bg-soft)] transition-colors disabled:opacity-50"
+                title="从纠错样本与场景记录挖掘热词候选，导出 JSON 供人工审读（热词是提示不是替换，无过纠风险）"
+              >
+                <Icon name={exportingHotword ? 'refresh' : 'wand'} size={12} className={exportingHotword ? 'animate-spin' : undefined} />
+                {exportingHotword ? '挖掘中...' : '导出热词候选'}
+              </button>
               <button
                 onClick={handleExportHomophone}
                 disabled={exportingHomophone}

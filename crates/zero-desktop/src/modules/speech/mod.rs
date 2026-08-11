@@ -2,6 +2,7 @@ pub mod capture;
 pub mod commands;
 pub mod db;
 pub mod homophone;
+pub mod hotword_mine;
 pub mod legacy;
 pub mod llm_settings;
 pub mod lock_utils;

@@ -76,6 +76,7 @@ pub fn mine(o: &str, y: &str) -> Vec<Candidate> {
             del,
             ins,
             del_start,
+            ..
         } = block
         else {
             continue;
@@ -234,12 +235,12 @@ fn fuzzy_key(plain: &str) -> String {
     format!("{initial}{final_part}")
 }
 
-fn is_han(c: char) -> bool {
+pub(crate) fn is_han(c: char) -> bool {
     matches!(c, '\u{4E00}'..='\u{9FFF}' | '\u{3400}'..='\u{4DBF}')
 }
 
 /// O 侧命中位置前后各 5 字的上下文，命中词用〔〕括出。
-fn context_snippet(a: &[char], start: usize, len: usize) -> String {
+pub(crate) fn context_snippet(a: &[char], start: usize, len: usize) -> String {
     const CTX: usize = 5;
     let lo = start.saturating_sub(CTX);
     let hi = (start + len + CTX).min(a.len());
@@ -254,7 +255,10 @@ fn context_snippet(a: &[char], start: usize, len: usize) -> String {
 
 /// 字符级 diff 块。equal / change 严格交替（构造保证），change 内 del/ins 是同一
 /// 变更区里两侧的原始字符序列。
-enum Block {
+///
+/// `pub(crate)`：热词候选挖掘（[`super::hotword_mine`]）复用同一套 diff，避免两处各写一份
+/// 对齐逻辑而结论不一致。
+pub(crate) enum Block {
     /// 内容不需要，只需存在性（§6.1 条件 4 的前后 equal 判断）。
     Equal,
     Change {
@@ -262,11 +266,13 @@ enum Block {
         ins: Vec<char>,
         /// del 在 a 中的起始下标（取上下文用）。
         del_start: usize,
+        /// ins 在 b 中的起始下标（取 Y' 侧上下文用；同音挖掘不需要，热词挖掘要）。
+        ins_start: usize,
     },
 }
 
 /// 经典 LCS DP + 回走，把对齐结果合并成 equal/change 交替的块序列。
-fn diff_blocks(a: &[char], b: &[char]) -> Vec<Block> {
+pub(crate) fn diff_blocks(a: &[char], b: &[char]) -> Vec<Block> {
     let n = a.len();
     let m = b.len();
     // dp[i][j] = a[i..] 与 b[j..] 的 LCS 长度。
@@ -286,6 +292,7 @@ fn diff_blocks(a: &[char], b: &[char]) -> Vec<Block> {
     let mut del: Vec<char> = Vec::new();
     let mut ins: Vec<char> = Vec::new();
     let mut del_start = 0usize;
+    let mut ins_start = 0usize;
     let (mut i, mut j) = (0usize, 0usize);
 
     macro_rules! flush_eq {
@@ -303,6 +310,7 @@ fn diff_blocks(a: &[char], b: &[char]) -> Vec<Block> {
                     del: std::mem::take(&mut del),
                     ins: std::mem::take(&mut ins),
                     del_start,
+                    ins_start,
                 });
             }
         };
@@ -318,6 +326,7 @@ fn diff_blocks(a: &[char], b: &[char]) -> Vec<Block> {
             if del.is_empty() && ins.is_empty() {
                 flush_eq!();
                 del_start = i;
+                ins_start = j;
             }
             // 已到某一侧末尾时只能走另一侧；否则按 DP 选保留更长 LCS 的方向。
             if j >= m || (i < n && dp[i + 1][j] >= dp[i][j + 1]) {

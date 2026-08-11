@@ -158,6 +158,7 @@ fn run_gui(workspace: PathBuf) -> Result<()> {
             modules::speech::commands::samples::speech_list_samples,
             modules::speech::commands::samples::speech_export_samples,
             modules::speech::commands::samples::speech_export_homophone_candidates,
+            modules::speech::commands::samples::speech_export_hotword_candidates,
             modules::speech::commands::samples::speech_scene_stats,
             modules::speech::commands::export::speech_copy_text_to_clipboard,
             modules::speech::commands::init::speech_get_init_status,

@@ -196,6 +196,12 @@ export const SpeechAPI = {
   /** 同音候选挖掘导出（P2a）：对纠错样本跑挖掘，写 JSON 供人工审读，返回文件路径。 */
   exportHomophoneCandidates: () =>
     invoke<string>('speech_export_homophone_candidates'),
+  /**
+   * 热词候选挖掘导出（P1.5）：纠错样本 Y' 侧 + 场景记录新词发现两路挖掘，去掉已在
+   * `asr.hotwords` 里的词，写 JSON 供人工审读，返回文件路径。只导出，不改配置。
+   */
+  exportHotwordCandidates: () =>
+    invoke<string>('speech_export_hotword_candidates'),
   sceneStats: () => invoke<SceneStats>('speech_scene_stats'),
   openInFolder: (path: string) => invoke('speech_open_in_folder', { path }),
 };
